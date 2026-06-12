@@ -8,15 +8,20 @@ package main
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 type pendingTracker struct {
-	lock    sync.Mutex
-	waiters map[string]chan response
+	lock      sync.Mutex
+	waiters   map[string]chan response
+	submitted map[string]time.Time
 }
 
 func newPendingTracker() *pendingTracker {
-	return &pendingTracker{waiters: make(map[string]chan response)}
+	return &pendingTracker{
+		waiters:   make(map[string]chan response),
+		submitted: make(map[string]time.Time),
+	}
 }
 
 func (p *pendingTracker) register(req request) (<-chan response, func()) {
@@ -25,6 +30,7 @@ func (p *pendingTracker) register(req request) (<-chan response, func()) {
 
 	p.lock.Lock()
 	p.waiters[key] = ch
+	p.submitted[key] = time.Now()
 	p.lock.Unlock()
 
 	cancel := func() {
@@ -59,4 +65,17 @@ func (p *pendingTracker) fail(req request, err error) {
 		Status:   statusSystemError,
 		Error:    fmt.Sprintf("submit failed: %v", err),
 	})
+}
+
+func (p *pendingTracker) latencyFor(req request, now time.Time) (time.Duration, bool) {
+	key := requestKey(req.ClientID, req.ID)
+
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	submitted, exists := p.submitted[key]
+	if !exists {
+		return 0, false
+	}
+	return now.Sub(submitted), true
 }

@@ -23,10 +23,19 @@ func main() {
 		requestTimeout = flag.Duration("request-timeout", 30*time.Second, "timeout waiting for a request to be delivered")
 		create         = flag.Bool("create", false, "create initial SmallBank accounts before executing")
 		execute        = flag.Bool("execute", false, "execute workload phases")
-		createWorkers  = flag.Int("create-workers", 32, "number of account creation workers")
+		createWorkers  = flag.Int("create-workers", 0, "number of account creation workers; 0 uses the first workload phase terminals")
 		startUnixMS    = flag.Int64("start-unix-ms", 0, "absolute Unix epoch time in ms for benchmark start")
 		failureSpec    = flag.String("failure-spec", "", "failure_spec.xml path; only pbft/proposalDelay is applied")
 		failureStartMS = flag.Int64("failure-start-unix-ms", -1, "absolute Unix epoch time in ms for failure schedule start")
+		learning       = flag.Bool("learning", false, "enable PBFT learning-agent reports and recommendation polling")
+		learningNodeID = flag.Uint64("learning-node-id", 1, "SmartBFT node ID that sends learning reports")
+		agentTarget    = flag.String("agent-target", "", "learning agent gRPC target, for example 127.0.0.1:50051")
+		initialTimeout = flag.Duration("learning-initial-election-timeout", 5*time.Second, "initial PBFT timeout value reported to the learning agent")
+		reportTicks    = flag.Uint64("learning-report-tick-interval", defaultLearningReportTickInterval, "consensus ticks between learning report checks")
+		reportTrigger  = flag.Duration("learning-report-trigger", defaultLearningReportTrigger, "minimum elapsed time before the first learning report")
+		maxReportLen   = flag.Uint64("learning-max-report-length", defaultLearningMaxReportLength, "maximum consensus ticks in one learning report window")
+		pollInterval   = flag.Duration("learning-poll-interval", defaultLearningPollInterval, "interval for polling the learning agent for timeout recommendations")
+		rpcTimeout     = flag.Duration("learning-rpc-timeout", defaultLearningRPCTimeout, "timeout for learning agent RPCs")
 		dataDir        = flag.String("data-dir", "", "directory for SmartBFT WAL data; defaults to a temporary directory")
 		keepData       = flag.Bool("keep-data", false, "keep generated WAL data when using a temporary data directory")
 		verbose        = flag.Bool("verbose", false, "enable SmartBFT logs")
@@ -77,6 +86,17 @@ func main() {
 		BatchSize:    *batchSize,
 		BatchTimeout: *batchTimeout,
 		Failures:     failures,
+		LearningOptions: learningOptions{
+			Enabled:            *learning,
+			NodeID:             *learningNodeID,
+			AgentTarget:        *agentTarget,
+			InitialTimeout:     *initialTimeout,
+			ReportTickInterval: *reportTicks,
+			ReportTrigger:      *reportTrigger,
+			MaxReportLength:    *maxReportLen,
+			PollInterval:       *pollInterval,
+			RPCTimeout:         *rpcTimeout,
+		},
 	}, dir, *verbose)
 	if err != nil {
 		fatalf("start cluster: %v", err)
@@ -89,7 +109,7 @@ func main() {
 
 	bench := newBenchmarker(cluster, cfg, *requestTimeout)
 	if *create {
-		if err := bench.createAccounts(*createWorkers); err != nil {
+		if err := bench.createAccounts(accountCreationWorkers(*createWorkers, cfg)); err != nil {
 			fatalf("create accounts: %v", err)
 		}
 	}
@@ -117,6 +137,13 @@ func printConfig(cfg *workloadConfig) {
 		}
 		fmt.Printf("Weights: %v\n", phase.Weights)
 	}
+}
+
+func accountCreationWorkers(configuredWorkers int, cfg *workloadConfig) int {
+	if configuredWorkers > 0 {
+		return configuredWorkers
+	}
+	return cfg.Phases[0].Terminals
 }
 
 func printChecksums(checksums map[uint64]string) {

@@ -44,13 +44,16 @@ type node struct {
 	logger        smart.Logger
 	configuration bft.Configuration
 	failures      *proposalDelayController
+	learning      *learningManager
 }
 
 type nodeOptions struct {
-	NumNodes     int
-	BatchSize    uint64
-	BatchTimeout time.Duration
-	Failures     *proposalDelayController
+	NumNodes        int
+	BatchSize       uint64
+	BatchTimeout    time.Duration
+	Failures        *proposalDelayController
+	LearningOptions learningOptions
+	Learning        *learningManager
 }
 
 func newNode(
@@ -81,6 +84,7 @@ func newNode(
 		viewClock: time.NewTicker(100 * time.Millisecond),
 		logger:    logger,
 		failures:  opts.Failures,
+		learning:  opts.Learning,
 	}
 
 	config := bft.DefaultConfig
@@ -156,6 +160,7 @@ func (n *node) stop() {
 	n.clock.Stop()
 	n.viewClock.Stop()
 	n.consensus.Stop()
+	n.learning.close()
 	n.doneWG.Wait()
 }
 
@@ -262,21 +267,52 @@ func (n *node) Deliver(proposal bft.Proposal, _ []bft.Signature) bft.Reconfig {
 		return bft.Reconfig{}
 	}
 
-	n.stateLock.Lock()
-	defer n.stateLock.Unlock()
+	md := &smartbftprotos.ViewMetadata{}
+	if err := proto.Unmarshal(proposal.Metadata, md); err != nil {
+		n.logger.Errorf("node %d failed to decode proposal metadata: %v", n.id, err)
+	}
 
+	decisionTime := time.Now()
+	latencies := make([]time.Duration, 0, len(data.Requests))
+	decoded := make([]request, 0, len(data.Requests))
+	decodeErrors := make([]error, 0)
 	for _, rawReq := range data.Requests {
 		req, err := decodeRequest(rawReq)
 		if err != nil {
-			n.pending.complete(response{
-				Status: statusSystemError,
-				Error:  err.Error(),
-			})
+			decodeErrors = append(decodeErrors, err)
 			continue
 		}
+		decoded = append(decoded, req)
+		if latency, exists := n.pending.latencyFor(req, decisionTime); exists {
+			latencies = append(latencies, latency)
+		}
+	}
+
+	postDecisionStart := time.Now()
+	n.stateLock.Lock()
+	for _, err := range decodeErrors {
+		n.pending.complete(response{
+			Status: statusSystemError,
+			Error:  err.Error(),
+		})
+	}
+	for _, req := range decoded {
 		n.pending.complete(n.state.apply(req))
 	}
 	n.prevHash = proposal.Digest()
+	n.stateLock.Unlock()
+	postDecision := time.Since(postDecisionStart)
+
+	n.learning.recordConsensus(learningSample{
+		Sequence:     md.GetLatestSequence(),
+		View:         md.GetViewId(),
+		LeaderID:     n.consensus.GetLeaderID(),
+		BatchSize:    len(data.Requests),
+		DecisionTime: decisionTime,
+		Latencies:    latencies,
+		PostDecision: postDecision,
+		Timeout:      n.learning.currentTimeoutValue(),
+	})
 
 	return bft.Reconfig{InLatestDecision: false}
 }

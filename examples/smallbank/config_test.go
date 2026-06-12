@@ -52,6 +52,24 @@ func TestSmallBankStateApply(t *testing.T) {
 	}
 }
 
+func TestAccountCreationWorkersDefaultsToFirstPhaseTerminals(t *testing.T) {
+	cfg := &workloadConfig{
+		Phases: []phaseConfig{
+			{Terminals: 7},
+			{Terminals: 11},
+		},
+	}
+	if workers := accountCreationWorkers(0, cfg); workers != 7 {
+		t.Fatalf("workers = %d, want 7", workers)
+	}
+	if workers := accountCreationWorkers(-1, cfg); workers != 7 {
+		t.Fatalf("workers = %d, want 7", workers)
+	}
+	if workers := accountCreationWorkers(3, cfg); workers != 3 {
+		t.Fatalf("workers = %d, want 3", workers)
+	}
+}
+
 func TestProposalDelayController(t *testing.T) {
 	ctrl, err := loadProposalDelayController("testdata/failure_spec.xml", time.Now().Add(-500*time.Millisecond).UnixMilli())
 	if err != nil {
@@ -81,5 +99,60 @@ func TestProposalDelayControllerExplicitReplica(t *testing.T) {
 	delay := ctrl.delayForProposal(3, 1, []uint64{1, 2, 3, 4})
 	if delay != 75*time.Millisecond {
 		t.Fatalf("explicit replica delay = %s, want 75ms", delay)
+	}
+}
+
+func TestLearningMetricsBuildPBFTReport(t *testing.T) {
+	metrics := newLearningWindowMetrics()
+	start := time.Now()
+	metrics.record(learningSample{
+		Sequence:     10,
+		View:         1,
+		LeaderID:     1,
+		BatchSize:    2,
+		DecisionTime: start,
+		Latencies:    []time.Duration{10 * time.Millisecond, 20 * time.Millisecond},
+		PostDecision: 2 * time.Millisecond,
+		Timeout:      15 * time.Millisecond,
+	})
+	metrics.record(learningSample{
+		Sequence:     11,
+		View:         1,
+		LeaderID:     2,
+		BatchSize:    3,
+		DecisionTime: start.Add(100 * time.Millisecond),
+		Latencies:    []time.Duration{30 * time.Millisecond},
+		PostDecision: 4 * time.Millisecond,
+		Timeout:      15 * time.Millisecond,
+	})
+
+	report := metrics.buildReport()
+	if report == nil {
+		t.Fatalf("report is nil")
+	}
+	if report.TotalTransactions != 5 {
+		t.Fatalf("TotalTransactions = %d, want 5", report.TotalTransactions)
+	}
+	if report.TotalConsensusInstances != 2 {
+		t.Fatalf("TotalConsensusInstances = %d, want 2", report.TotalConsensusInstances)
+	}
+	if report.LeaderChangeCount != 1 {
+		t.Fatalf("LeaderChangeCount = %d, want 1", report.LeaderChangeCount)
+	}
+	if report.TimeoutViolationRate < 0.66 || report.TimeoutViolationRate > 0.67 {
+		t.Fatalf("TimeoutViolationRate = %f, want about 0.67", report.TimeoutViolationRate)
+	}
+	if report.PhasePostDecisionAvgDelayMs != 3 {
+		t.Fatalf("PhasePostDecisionAvgDelayMs = %f, want 3", report.PhasePostDecisionAvgDelayMs)
+	}
+}
+
+func TestLearningEpisodeWindow(t *testing.T) {
+	window := newLearningEpisodeWindow(10, 30, 20)
+	if window.applyTick != 40 {
+		t.Fatalf("applyTick = %d, want 40", window.applyTick)
+	}
+	if window.rewardTick != 50 {
+		t.Fatalf("rewardTick = %d, want 50", window.rewardTick)
 	}
 }

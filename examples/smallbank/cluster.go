@@ -30,6 +30,12 @@ func newCluster(numNodes int, opts nodeOptions, testDir string, verbose bool) (*
 	if opts.Failures == nil {
 		opts.Failures = disabledProposalDelayController()
 	}
+	if opts.Learning != nil {
+		return nil, fmt.Errorf("nodeOptions.Learning must be constructed per node")
+	}
+	if opts.NumNodes == 0 {
+		opts.NumNodes = numNodes
+	}
 
 	level := zap.NewAtomicLevelAt(zapcore.PanicLevel)
 	if verbose {
@@ -67,8 +73,17 @@ func newCluster(numNodes int, opts nodeOptions, testDir string, verbose bool) (*
 			}
 			out[targetID] = ch
 		}
-		n, err := newNode(uint64(id), channels[uint64(id)], out, c.pending, logger, walMet, bftMet, opts, testDir)
+
+		nodeOpts := opts
+		learning, err := newLearningManager(optsLearningForNode(opts, uint64(id)))
 		if err != nil {
+			c.stop()
+			return nil, fmt.Errorf("create learning manager for node %d: %w", id, err)
+		}
+		nodeOpts.Learning = learning
+		n, err := newNode(uint64(id), channels[uint64(id)], out, c.pending, logger, walMet, bftMet, nodeOpts, testDir)
+		if err != nil {
+			nodeOpts.Learning.close()
 			c.stop()
 			return nil, err
 		}
@@ -76,6 +91,21 @@ func newCluster(numNodes int, opts nodeOptions, testDir string, verbose bool) (*
 	}
 
 	return c, nil
+}
+
+func optsLearningForNode(opts nodeOptions, nodeID uint64) learningOptions {
+	learning := opts.LearningOptions
+	if !learning.Enabled {
+		return learning
+	}
+	if learning.NodeID == 0 {
+		learning.NodeID = 1
+	}
+	if learning.NodeID != nodeID {
+		return learningOptions{}
+	}
+	learning.NodeID = nodeID
+	return learning
 }
 
 func (c *cluster) stop() {
