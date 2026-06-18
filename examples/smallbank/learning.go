@@ -32,6 +32,7 @@ type learningOptions struct {
 	MaxReportLength    uint64
 	PollInterval       time.Duration
 	RPCTimeout         time.Duration
+	ApplyTimeout       func(time.Duration) error
 }
 
 type learningDecision struct {
@@ -91,6 +92,8 @@ type learningManager struct {
 	pollerDecision *learningDecision
 
 	pendingReward *pendingLearningReward
+
+	applyTimeout func(time.Duration) error
 }
 
 func newLearningManager(opts learningOptions) (*learningManager, error) {
@@ -137,6 +140,7 @@ func newLearningManager(opts learningOptions) (*learningManager, error) {
 		rpcTimeout:         opts.RPCTimeout,
 		currentTimeout:     opts.InitialTimeout,
 		lastTimeout:        opts.InitialTimeout,
+		applyTimeout:       opts.ApplyTimeout,
 	}
 	fmt.Printf("[learning] node %d target %s protocol=PBFT initial_timeout_ms=%d\n",
 		opts.NodeID, opts.AgentTarget, opts.InitialTimeout.Milliseconds())
@@ -249,8 +253,12 @@ func (m *learningManager) maybeHandleApplyDeadlineLocked(sequence uint64) {
 		}
 		applied := false
 		if sequence == m.selectedWindow.applyTick && m.pollerDecision != nil {
-			m.currentTimeout = m.pollerDecision.timeout
-			applied = true
+			if err := m.applyRecommendedTimeoutLocked(m.pollerDecision.timeout); err != nil {
+				fmt.Printf("[learning] failed to apply recommendation: episode=%d report_seq=%d apply_tick=%d current_seq=%d timeout_ms=%d err=%v\n",
+					m.currentEpisode, m.selectedWindow.reportSeq, m.selectedWindow.applyTick, sequence, m.pollerDecision.timeout.Milliseconds(), err)
+			} else {
+				applied = true
+			}
 		}
 		m.applyHandledForEpisode = true
 		m.lastTimeout = m.currentTimeout
@@ -271,6 +279,19 @@ func (m *learningManager) maybeHandleApplyDeadlineLocked(sequence uint64) {
 		fmt.Printf("[learning] recommendation unavailable at cap apply deadline: episode=%d cap_apply_tick=%d current_seq=%d timeout_ms=%d\n",
 			m.currentEpisode, m.capApplyDeadlineTick, sequence, m.currentTimeout.Milliseconds())
 	}
+}
+
+func (m *learningManager) applyRecommendedTimeoutLocked(timeout time.Duration) error {
+	if timeout <= 0 {
+		return fmt.Errorf("non-positive timeout: %s", timeout)
+	}
+	if m.applyTimeout != nil {
+		if err := m.applyTimeout(timeout); err != nil {
+			return err
+		}
+	}
+	m.currentTimeout = timeout
+	return nil
 }
 
 func (m *learningManager) maybeHandleRewardDeadlineLocked(sequence uint64) {

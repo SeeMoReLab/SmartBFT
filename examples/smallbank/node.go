@@ -37,6 +37,11 @@ type node struct {
 	state         *smallBankState
 	stateLock     sync.Mutex
 	prevHash      string
+	lastLock      sync.Mutex
+	lastDelivered bool
+	lastView      uint64
+	lastIndex     uint64
+	lastLeaderID  uint64
 	stopChan      chan struct{}
 	doneWG        sync.WaitGroup
 	clock         *time.Ticker
@@ -45,6 +50,8 @@ type node struct {
 	configuration bft.Configuration
 	failures      *proposalDelayController
 	learning      *learningManager
+	network       *networkTransport
+	replies       *clientReplyDispatcher
 }
 
 type nodeOptions struct {
@@ -54,6 +61,8 @@ type nodeOptions struct {
 	Failures        *proposalDelayController
 	LearningOptions learningOptions
 	Learning        *learningManager
+	Network         *networkTransport
+	Replies         *clientReplyDispatcher
 }
 
 func newNode(
@@ -85,6 +94,8 @@ func newNode(
 		logger:    logger,
 		failures:  opts.Failures,
 		learning:  opts.Learning,
+		network:   opts.Network,
+		replies:   opts.Replies,
 	}
 
 	config := bft.DefaultConfig
@@ -92,8 +103,8 @@ func newNode(
 	config.RequestBatchMaxCount = opts.BatchSize
 	config.RequestBatchMaxInterval = opts.BatchTimeout
 	config.RequestPoolSize = max(2*opts.BatchSize, 1024)
-	config.RequestForwardTimeout = 500 * time.Millisecond
-	config.RequestComplainTimeout = 5 * time.Second
+	config.RequestForwardTimeout = 100 * time.Millisecond
+	config.RequestComplainTimeout = 100 * time.Millisecond
 	config.ViewChangeTimeout = 10 * time.Second
 	config.LeaderHeartbeatTimeout = 30 * time.Second
 	config.LeaderRotation = false
@@ -149,6 +160,39 @@ func (n *node) start() {
 			}
 		}
 	}()
+	n.startFailureObserver()
+}
+
+func (n *node) startFailureObserver() {
+	if n.failures == nil || !n.failures.enabled {
+		return
+	}
+
+	n.doneWG.Add(1)
+	go func() {
+		defer n.doneWG.Done()
+
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		observe := func() {
+			leaderID := n.consensus.GetLeaderID()
+			if leaderID == 0 {
+				return
+			}
+			n.failures.observeLeader(leaderID, n.Nodes())
+		}
+
+		observe()
+		for {
+			select {
+			case <-n.stopChan:
+				return
+			case <-ticker.C:
+				observe()
+			}
+		}
+	}()
 }
 
 func (n *node) stop() {
@@ -161,10 +205,37 @@ func (n *node) stop() {
 	n.viewClock.Stop()
 	n.consensus.Stop()
 	n.learning.close()
+	n.replies.close()
 	n.doneWG.Wait()
+	n.printLastDelivered()
+}
+
+func (n *node) recordLastDelivered(md *smartbftprotos.ViewMetadata) {
+	n.lastLock.Lock()
+	defer n.lastLock.Unlock()
+
+	n.lastDelivered = true
+	n.lastView = md.GetViewId()
+	n.lastIndex = md.GetLatestSequence()
+	n.lastLeaderID = n.consensus.GetLeaderID()
+}
+
+func (n *node) printLastDelivered() {
+	n.lastLock.Lock()
+	defer n.lastLock.Unlock()
+
+	if !n.lastDelivered {
+		fmt.Printf("SmartBFT SmallBank shutdown: node=%d last_delivered=false\n", n.id)
+		return
+	}
+	fmt.Printf("SmartBFT SmallBank shutdown: node=%d last_view=%d last_index=%d leader=%d\n",
+		n.id, n.lastView, n.lastIndex, n.lastLeaderID)
 }
 
 func (n *node) Nodes() []uint64 {
+	if n.network != nil {
+		return n.network.nodeIDs()
+	}
 	nodes := make([]uint64, 0, len(n.out)+1)
 	nodes = append(nodes, n.id)
 	for id := range n.out {
@@ -174,11 +245,19 @@ func (n *node) Nodes() []uint64 {
 }
 
 func (n *node) SendConsensus(targetID uint64, message *smartbftprotos.Message) {
+	if n.network != nil {
+		n.network.sendConsensus(targetID, proto.Clone(message).(*smartbftprotos.Message))
+		return
+	}
 	n.out[targetID] <- wireMessage{from: n.id, msg: proto.Clone(message)}
 }
 
 func (n *node) SendTransaction(targetID uint64, request []byte) {
 	reqCopy := append([]byte(nil), request...)
+	if n.network != nil {
+		n.network.sendTransaction(targetID, reqCopy)
+		return
+	}
 	n.out[targetID] <- wireMessage{from: n.id, msg: forwardedRequest{payload: reqCopy}}
 }
 
@@ -270,6 +349,8 @@ func (n *node) Deliver(proposal bft.Proposal, _ []bft.Signature) bft.Reconfig {
 	md := &smartbftprotos.ViewMetadata{}
 	if err := proto.Unmarshal(proposal.Metadata, md); err != nil {
 		n.logger.Errorf("node %d failed to decode proposal metadata: %v", n.id, err)
+	} else {
+		n.recordLastDelivered(md)
 	}
 
 	decisionTime := time.Now()
@@ -297,7 +378,9 @@ func (n *node) Deliver(proposal bft.Proposal, _ []bft.Signature) bft.Reconfig {
 		})
 	}
 	for _, req := range decoded {
-		n.pending.complete(n.state.apply(req))
+		resp := n.state.apply(req)
+		n.pending.complete(resp)
+		n.replies.reply(resp)
 	}
 	n.prevHash = proposal.Digest()
 	n.stateLock.Unlock()

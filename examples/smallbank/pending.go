@@ -15,12 +15,14 @@ type pendingTracker struct {
 	lock      sync.Mutex
 	waiters   map[string]chan response
 	submitted map[string]time.Time
+	completed map[string]response
 }
 
 func newPendingTracker() *pendingTracker {
 	return &pendingTracker{
 		waiters:   make(map[string]chan response),
 		submitted: make(map[string]time.Time),
+		completed: make(map[string]response),
 	}
 }
 
@@ -29,6 +31,12 @@ func (p *pendingTracker) register(req request) (<-chan response, func()) {
 	ch := make(chan response, 1)
 
 	p.lock.Lock()
+	if resp, exists := p.completed[key]; exists {
+		ch <- resp
+		close(ch)
+		p.lock.Unlock()
+		return ch, func() {}
+	}
 	p.waiters[key] = ch
 	p.submitted[key] = time.Now()
 	p.lock.Unlock()
@@ -42,13 +50,30 @@ func (p *pendingTracker) register(req request) (<-chan response, func()) {
 	return ch, cancel
 }
 
+func (p *pendingTracker) markSubmitted(req request) {
+	key := requestKey(req.ClientID, req.ID)
+
+	p.lock.Lock()
+	if _, exists := p.submitted[key]; !exists {
+		p.submitted[key] = time.Now()
+	}
+	p.lock.Unlock()
+}
+
 func (p *pendingTracker) complete(resp response) {
+	p.completeInternal(resp, true)
+}
+
+func (p *pendingTracker) completeInternal(resp response, cache bool) {
 	key := requestKey(resp.ClientID, resp.ID)
 
 	p.lock.Lock()
 	ch, exists := p.waiters[key]
 	if exists {
 		delete(p.waiters, key)
+	}
+	if cache {
+		p.completed[key] = resp
 	}
 	p.lock.Unlock()
 
@@ -59,12 +84,12 @@ func (p *pendingTracker) complete(resp response) {
 }
 
 func (p *pendingTracker) fail(req request, err error) {
-	p.complete(response{
+	p.completeInternal(response{
 		ClientID: req.ClientID,
 		ID:       req.ID,
 		Status:   statusSystemError,
 		Error:    fmt.Sprintf("submit failed: %v", err),
-	})
+	}, false)
 }
 
 func (p *pendingTracker) latencyFor(req request, now time.Time) (time.Duration, bool) {

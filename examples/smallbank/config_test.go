@@ -70,6 +70,25 @@ func TestAccountCreationWorkersDefaultsToFirstPhaseTerminals(t *testing.T) {
 	}
 }
 
+func TestPendingTrackerReplaysCompletedResponse(t *testing.T) {
+	pending := newPendingTracker()
+	req := request{ClientID: "client", ID: "1", Type: txBalance}
+	want := response{ClientID: "client", ID: "1", Status: statusSuccess}
+
+	pending.complete(want)
+	respCh, cancel := pending.register(req)
+	defer cancel()
+
+	select {
+	case got := <-respCh:
+		if got != want {
+			t.Fatalf("response = %#v, want %#v", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for cached response")
+	}
+}
+
 func TestProposalDelayController(t *testing.T) {
 	ctrl, err := loadProposalDelayController("testdata/failure_spec.xml", time.Now().Add(-500*time.Millisecond).UnixMilli())
 	if err != nil {
@@ -78,6 +97,7 @@ func TestProposalDelayController(t *testing.T) {
 
 	// Failure spec IDs are 0-based, while SmartBFT node IDs are 1-based.
 	// With leader node 1 and f=1 for a 4-node cluster, the leader token targets replica 0 / node 1.
+	ctrl.observeLeader(1, []uint64{1, 2, 3, 4})
 	delay := ctrl.delayForProposal(1, 1, []uint64{1, 2, 3, 4})
 	if delay != 25*time.Millisecond {
 		t.Fatalf("leader delay = %s, want 25ms", delay)
@@ -86,6 +106,32 @@ func TestProposalDelayController(t *testing.T) {
 	delay = ctrl.delayForProposal(2, 1, []uint64{1, 2, 3, 4})
 	if delay != 0 {
 		t.Fatalf("non-leader delay = %s, want 0", delay)
+	}
+}
+
+func TestProposalDelayControllerPinsLeaderWindowPerPhase(t *testing.T) {
+	ctrl, err := loadProposalDelayController("testdata/failure_spec.xml", time.Now().Add(-500*time.Millisecond).UnixMilli())
+	if err != nil {
+		t.Fatalf("load failure spec: %v", err)
+	}
+
+	nodes := []uint64{1, 2, 3, 4}
+	ctrl.observeLeader(2, nodes)
+
+	delay := ctrl.delayForProposal(2, 2, nodes)
+	if delay != 25*time.Millisecond {
+		t.Fatalf("pinned leader delay = %s, want 25ms", delay)
+	}
+
+	ctrl.observeLeader(3, nodes)
+	delay = ctrl.delayForProposal(3, 3, nodes)
+	if delay != 0 {
+		t.Fatalf("new leader delay = %s, want 0", delay)
+	}
+
+	delay = ctrl.delayForProposal(2, 3, nodes)
+	if delay != 25*time.Millisecond {
+		t.Fatalf("original pinned leader delay = %s, want 25ms", delay)
 	}
 }
 
@@ -154,5 +200,26 @@ func TestLearningEpisodeWindow(t *testing.T) {
 	}
 	if window.rewardTick != 50 {
 		t.Fatalf("rewardTick = %d, want 50", window.rewardTick)
+	}
+}
+
+func TestLearningApplyRecommendedTimeoutCallsCallback(t *testing.T) {
+	var applied time.Duration
+	manager := &learningManager{
+		currentTimeout: 5 * time.Second,
+		applyTimeout: func(timeout time.Duration) error {
+			applied = timeout
+			return nil
+		},
+	}
+
+	if err := manager.applyRecommendedTimeoutLocked(400 * time.Millisecond); err != nil {
+		t.Fatalf("apply timeout: %v", err)
+	}
+	if applied != 400*time.Millisecond {
+		t.Fatalf("applied = %s, want 400ms", applied)
+	}
+	if manager.currentTimeout != 400*time.Millisecond {
+		t.Fatalf("currentTimeout = %s, want 400ms", manager.currentTimeout)
 	}
 }

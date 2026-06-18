@@ -313,6 +313,60 @@ func (c *Consensus) SubmitRequest(req []byte) error {
 	return c.controller.SubmitRequest(req)
 }
 
+// ApplyRequestTimeout updates the request timeout budget at runtime.
+//
+// SmartBFT uses a two-step request timeout: first it forwards the request to
+// the leader, then it complains about the leader. The supplied timeout is
+// treated as the total submit-to-complaint budget and split across those two
+// intervals.
+func (c *Consensus) ApplyRequestTimeout(timeout time.Duration) (types.Configuration, error) {
+	if timeout <= 0 {
+		return c.Config, fmt.Errorf("request timeout must be positive: %s", timeout)
+	}
+
+	c.consensusLock.Lock()
+	defer c.consensusLock.Unlock()
+
+	if c.Pool == nil || c.controller == nil {
+		return c.Config, errors.New("consensus is not started")
+	}
+
+	next := c.Config
+	next.RequestForwardTimeout, next.RequestComplainTimeout = splitRequestTimeout(timeout)
+	if next.RequestAutoRemoveTimeout < next.RequestComplainTimeout {
+		next.RequestAutoRemoveTimeout = next.RequestComplainTimeout
+	}
+	if err := next.Validate(); err != nil {
+		return c.Config, fmt.Errorf("recommended timeout creates invalid configuration: %w", err)
+	}
+
+	c.Config = next
+	opts := algorithm.PoolOptions{
+		ForwardTimeout:    next.RequestForwardTimeout,
+		ComplainTimeout:   next.RequestComplainTimeout,
+		AutoRemoveTimeout: next.RequestAutoRemoveTimeout,
+		RequestMaxBytes:   next.RequestMaxBytes,
+		SubmitTimeout:     next.RequestPoolSubmitTimeout,
+	}
+	c.Pool.StopTimers()
+	c.Pool.ChangeOptions(c.controller, opts)
+	c.Pool.RestartTimers()
+
+	return next, nil
+}
+
+func splitRequestTimeout(timeout time.Duration) (forward, complain time.Duration) {
+	forward = timeout / 2
+	if forward <= 0 {
+		forward = timeout
+	}
+	complain = timeout - forward
+	if complain <= 0 {
+		complain = timeout
+	}
+	return forward, complain
+}
+
 func (c *Consensus) proposalMaker() *algorithm.ProposalMaker {
 	return &algorithm.ProposalMaker{
 		DecisionsPerLeader: c.Config.DecisionsPerLeader,

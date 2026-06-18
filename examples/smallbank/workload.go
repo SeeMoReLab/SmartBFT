@@ -15,16 +15,20 @@ import (
 )
 
 type benchmarker struct {
-	cluster        *cluster
+	client         smallBankInvoker
 	config         *workloadConfig
 	metrics        *benchmarkMetrics
 	requestTimeout time.Duration
 	requestSeq     atomic.Uint64
 }
 
-func newBenchmarker(c *cluster, cfg *workloadConfig, requestTimeout time.Duration) *benchmarker {
+type smallBankInvoker interface {
+	invoke(ctx context.Context, req request) (response, error)
+}
+
+func newBenchmarker(client smallBankInvoker, cfg *workloadConfig, requestTimeout time.Duration) *benchmarker {
 	return &benchmarker{
-		cluster:        c,
+		client:         client,
 		config:         cfg,
 		metrics:        newBenchmarkMetrics(),
 		requestTimeout: requestTimeout,
@@ -198,7 +202,7 @@ func (b *benchmarker) nextRequest(terminalID int, rnd *rand.Rand, accountRnd *ra
 func (b *benchmarker) invoke(req request) (response, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), b.requestTimeout)
 	defer cancel()
-	return b.cluster.invoke(ctx, req)
+	return b.client.invoke(ctx, req)
 }
 
 func (b *benchmarker) startMonitor() chan struct{} {

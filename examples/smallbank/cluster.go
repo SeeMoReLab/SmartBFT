@@ -37,19 +37,7 @@ func newCluster(numNodes int, opts nodeOptions, testDir string, verbose bool) (*
 		opts.NumNodes = numNodes
 	}
 
-	level := zap.NewAtomicLevelAt(zapcore.PanicLevel)
-	if verbose {
-		level.SetLevel(zapcore.InfoLevel)
-	}
-	zapLogger := zap.New(zapcore.NewCore(
-		zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()),
-		zapcore.AddSync(zapcore.Lock(zapcore.AddSync(discardWriter{}))),
-		level,
-	))
-	if verbose {
-		zapLogger, _ = zap.NewDevelopment()
-	}
-	logger := zapLogger.Sugar()
+	logger := newSmallBankLogger(verbose)
 
 	channels := make(map[uint64]chan wireMessage)
 	for id := 1; id <= numNodes; id++ {
@@ -75,7 +63,7 @@ func newCluster(numNodes int, opts nodeOptions, testDir string, verbose bool) (*
 		}
 
 		nodeOpts := opts
-		learning, err := newLearningManager(optsLearningForNode(opts, uint64(id)))
+		learning, err := newLearningManager(c.optsLearningForNode(opts, uint64(id)))
 		if err != nil {
 			c.stop()
 			return nil, fmt.Errorf("create learning manager for node %d: %w", id, err)
@@ -93,7 +81,7 @@ func newCluster(numNodes int, opts nodeOptions, testDir string, verbose bool) (*
 	return c, nil
 }
 
-func optsLearningForNode(opts nodeOptions, nodeID uint64) learningOptions {
+func (c *cluster) optsLearningForNode(opts nodeOptions, nodeID uint64) learningOptions {
 	learning := opts.LearningOptions
 	if !learning.Enabled {
 		return learning
@@ -105,7 +93,25 @@ func optsLearningForNode(opts nodeOptions, nodeID uint64) learningOptions {
 		return learningOptions{}
 	}
 	learning.NodeID = nodeID
+	learning.ApplyTimeout = c.applyRecommendedPBFTTimeout
 	return learning
+}
+
+func (c *cluster) applyRecommendedPBFTTimeout(timeout time.Duration) error {
+	var firstErr error
+	for id, n := range c.nodes {
+		config, err := n.consensus.ApplyRequestTimeout(timeout)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("node %d: %w", id, err)
+			}
+			continue
+		}
+		n.configuration = config
+		fmt.Printf("[learning] applied SmartBFT request timeout: node=%d total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d\n",
+			id, timeout.Milliseconds(), config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds())
+	}
+	return firstErr
 }
 
 func (c *cluster) stop() {
@@ -216,4 +222,20 @@ type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (int, error) {
 	return len(p), nil
+}
+
+func newSmallBankLogger(verbose bool) smart.Logger {
+	level := zap.NewAtomicLevelAt(zapcore.PanicLevel)
+	if verbose {
+		level.SetLevel(zapcore.InfoLevel)
+	}
+	zapLogger := zap.New(zapcore.NewCore(
+		zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()),
+		zapcore.AddSync(zapcore.Lock(zapcore.AddSync(discardWriter{}))),
+		level,
+	))
+	if verbose {
+		zapLogger, _ = zap.NewDevelopment()
+	}
+	return zapLogger.Sugar()
 }

@@ -28,9 +28,8 @@ type proposalDelayController struct {
 
 	lastLoggedPhase atomic.Int64
 
-	lock                sync.Mutex
-	lastResolvedPhase   int
-	lastResolvedReplica map[uint64]time.Duration
+	lock           sync.Mutex
+	pinnedReplicas map[int]map[uint64]time.Duration
 }
 
 type failurePhase struct {
@@ -81,8 +80,7 @@ type replicaXML struct {
 
 func disabledProposalDelayController() *proposalDelayController {
 	c := &proposalDelayController{
-		lastResolvedPhase:   -2,
-		lastResolvedReplica: make(map[uint64]time.Duration),
+		pinnedReplicas: make(map[int]map[uint64]time.Duration),
 	}
 	c.lastLoggedPhase.Store(-2)
 	return c
@@ -107,13 +105,12 @@ func loadProposalDelayController(specPath string, startUnixMS int64) (*proposalD
 	}
 
 	ctrl := &proposalDelayController{
-		enabled:             true,
-		specPath:            specPath,
-		startUnixMS:         startUnixMS,
-		warmUp:              failureWarmUp(spec),
-		phases:              make([]failurePhase, 0, len(spec.Phases)),
-		lastResolvedPhase:   -2,
-		lastResolvedReplica: make(map[uint64]time.Duration),
+		enabled:        true,
+		specPath:       specPath,
+		startUnixMS:    startUnixMS,
+		warmUp:         failureWarmUp(spec),
+		phases:         make([]failurePhase, 0, len(spec.Phases)),
+		pinnedReplicas: make(map[int]map[uint64]time.Duration),
 	}
 	ctrl.lastLoggedPhase.Store(-2)
 
@@ -237,6 +234,22 @@ func nonNegativeDurationSeconds(value float64) time.Duration {
 	return time.Duration(value * float64(time.Second))
 }
 
+func (c *proposalDelayController) observeLeader(leaderID uint64, nodeIDs []uint64) {
+	if c == nil || !c.enabled || leaderID == 0 {
+		return
+	}
+
+	elapsedSinceStart := time.Since(time.UnixMilli(c.startUnixMS))
+	elapsedSinceWarmUp := elapsedSinceStart - c.warmUp
+	activePhase := c.activePhase(elapsedSinceWarmUp)
+	c.logPhaseChange(activePhase, elapsedSinceStart, elapsedSinceWarmUp)
+	if activePhase < 0 {
+		return
+	}
+
+	c.pinLeaderWindow(activePhase, leaderID, nodeIDs)
+}
+
 func (c *proposalDelayController) delayForProposal(nodeID uint64, leaderID uint64, nodeIDs []uint64) time.Duration {
 	if c == nil || !c.enabled {
 		return 0
@@ -259,8 +272,7 @@ func (c *proposalDelayController) delayForProposal(nodeID uint64, leaderID uint6
 		return 0
 	}
 
-	resolved := c.resolveLeaderWindow(activePhase, leaderID, nodeIDs)
-	return resolved[replicaID]
+	return c.pinnedLeaderWindow(activePhase)[replicaID]
 }
 
 func (c *proposalDelayController) activePhase(elapsedSinceWarmUp time.Duration) int {
@@ -296,26 +308,35 @@ func (c *proposalDelayController) logPhaseChange(activePhase int, elapsedSinceSt
 		activePhase, phase.startOffset.Milliseconds(), elapsedSinceStart.Milliseconds(), elapsedSinceWarmUp.Milliseconds())
 }
 
-func (c *proposalDelayController) resolveLeaderWindow(activePhase int, leaderID uint64, nodeIDs []uint64) map[uint64]time.Duration {
+func (c *proposalDelayController) pinnedLeaderWindow(activePhase int) map[uint64]time.Duration {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if c.lastResolvedPhase == activePhase {
-		return c.lastResolvedReplica
+	pinned := c.pinnedReplicas[activePhase]
+	if len(pinned) == 0 {
+		return nil
 	}
+	copied := make(map[uint64]time.Duration, len(pinned))
+	for replicaID, delay := range pinned {
+		copied[replicaID] = delay
+	}
+	return copied
+}
 
-	resolved := make(map[uint64]time.Duration)
+func (c *proposalDelayController) pinLeaderWindow(activePhase int, leaderID uint64, nodeIDs []uint64) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if len(c.pinnedReplicas[activePhase]) > 0 {
+		return
+	}
 	if activePhase < 0 || activePhase >= len(c.phases) {
-		c.lastResolvedPhase = activePhase
-		c.lastResolvedReplica = resolved
-		return resolved
+		return
 	}
 
 	rule := c.phases[activePhase].rule
 	if !rule.hasLeaderWindowRule {
-		c.lastResolvedPhase = activePhase
-		c.lastResolvedReplica = resolved
-		return resolved
+		return
 	}
 
 	nodes := append([]uint64(nil), nodeIDs...)
@@ -328,11 +349,10 @@ func (c *proposalDelayController) resolveLeaderWindow(activePhase int, leaderID 
 		}
 	}
 	if leaderPos < 0 {
-		c.lastResolvedPhase = activePhase
-		c.lastResolvedReplica = resolved
-		return resolved
+		return
 	}
 
+	resolved := make(map[uint64]time.Duration)
 	windowSize := max(0, min((len(nodes)-1)/3, len(nodes)))
 	targets := make([]uint64, 0, windowSize)
 	for offset := 0; offset < windowSize; offset++ {
@@ -342,14 +362,12 @@ func (c *proposalDelayController) resolveLeaderWindow(activePhase int, leaderID 
 		targets = append(targets, replicaID)
 	}
 
-	c.lastResolvedPhase = activePhase
-	c.lastResolvedReplica = resolved
+	c.pinnedReplicas[activePhase] = resolved
 	fmt.Printf("Resolved leader proposal delay window: phase=%d leader_replica=%d delay_ms=%d targets=%v\n",
 		c.phases[activePhase].order,
 		smartNodeIDToFailureReplicaID(leaderID),
 		rule.leaderWindowDelay.Milliseconds(),
 		targets)
-	return resolved
 }
 
 func smartNodeIDToFailureReplicaID(nodeID uint64) uint64 {
