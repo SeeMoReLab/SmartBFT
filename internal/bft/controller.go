@@ -375,10 +375,6 @@ func (c *Controller) dropStaleConsensusMessage(sender uint64, m *protos.Message)
 	currentView := c.currViewNumber
 	c.currViewLock.RUnlock()
 	if msgView < currentView {
-		logViewDiag(
-			"event=consensus_message_drop_stale node=%d sender=%d message=%s current_view=%d",
-			c.ID, sender, internalMessageSummary(m), currentView,
-		)
 		return true
 	}
 	return false
@@ -470,51 +466,22 @@ func (c *Controller) changeView(newViewNumber uint64, newProposalSequence uint64
 }
 
 func (c *Controller) abortView(view uint64) bool {
-	start := time.Now()
 	currView := c.getCurrentViewNumber()
 	c.Logger.Debugf("view for abort %d, current view %d", view, currView)
-	logViewDiag(
-		"event=controller_abort_inner_start node=%d requested_view=%d current_view=%d",
-		c.ID, view, currView,
-	)
 
 	if view < currView {
 		c.Logger.Debugf("Was asked to abort view %d but the current view with number %d", view, currView)
-		logViewDiag(
-			"event=controller_abort_inner_done node=%d requested_view=%d current_view=%d result=stale duration_ms=%d",
-			c.ID, view, currView, time.Since(start).Milliseconds(),
-		)
 		return false
 	}
 
 	// Drain the leader token in case we held it,
 	// so we won't start proposing after view change.
-	logViewDiag(
-		"event=controller_abort_inner_relinquish_start node=%d requested_view=%d current_view=%d",
-		c.ID, view, currView,
-	)
 	c.relinquishLeaderToken()
-	logViewDiag(
-		"event=controller_abort_inner_relinquish_done node=%d requested_view=%d current_view=%d",
-		c.ID, view, currView,
-	)
 
 	// Kill current view
 	c.Logger.Debugf("Aborting current view with number %d", c.currViewNumber)
-	logViewDiag(
-		"event=controller_abort_inner_curr_view_abort_start node=%d requested_view=%d current_view=%d",
-		c.ID, view, currView,
-	)
 	c.currView.Abort()
-	logViewDiag(
-		"event=controller_abort_inner_curr_view_abort_done node=%d requested_view=%d current_view=%d",
-		c.ID, view, currView,
-	)
 
-	logViewDiag(
-		"event=controller_abort_inner_done node=%d requested_view=%d current_view=%d result=aborted duration_ms=%d",
-		c.ID, view, currView, time.Since(start).Milliseconds(),
-	)
 	return true
 }
 
@@ -530,29 +497,9 @@ func (c *Controller) Sync() {
 func (c *Controller) AbortView(view uint64) {
 	c.Logger.Debugf("AbortView, the current view num is %d", c.getCurrentViewNumber())
 
-	logViewDiag(
-		"event=controller_abort_view_start node=%d requested_view=%d current_view=%d abort_queue_len=%d abort_queue_cap=%d",
-		c.ID, view, c.getCurrentViewNumber(), len(c.abortViewChan), cap(c.abortViewChan),
-	)
-	logViewDiag(
-		"event=controller_abort_view_batcher_close_start node=%d requested_view=%d current_view=%d",
-		c.ID, view, c.getCurrentViewNumber(),
-	)
 	c.Batcher.Close()
-	logViewDiag(
-		"event=controller_abort_view_batcher_close_done node=%d requested_view=%d current_view=%d",
-		c.ID, view, c.getCurrentViewNumber(),
-	)
 
-	logViewDiag(
-		"event=controller_abort_view_send_start node=%d requested_view=%d current_view=%d abort_queue_len=%d abort_queue_cap=%d",
-		c.ID, view, c.getCurrentViewNumber(), len(c.abortViewChan), cap(c.abortViewChan),
-	)
 	c.abortViewChan <- view
-	logViewDiag(
-		"event=controller_abort_view_send_done node=%d requested_view=%d current_view=%d abort_queue_len=%d abort_queue_cap=%d",
-		c.ID, view, c.getCurrentViewNumber(), len(c.abortViewChan), cap(c.abortViewChan),
-	)
 }
 
 // ViewChanged makes the controller abort the current view and start a new one with the given numbers
@@ -591,76 +538,17 @@ func (c *Controller) run() {
 	for {
 		select {
 		case d := <-c.decisionChan:
-			branchStart := time.Now()
-			proposalForLog := &protos.Proposal{
-				Header:               d.proposal.Header,
-				Payload:              d.proposal.Payload,
-				Metadata:             d.proposal.Metadata,
-				VerificationSequence: uint64(d.proposal.VerificationSequence),
-			}
-			logViewDiag(
-				"event=controller_branch_start node=%d branch=decision current_view=%d proposal={%s}",
-				c.ID, c.getCurrentViewNumber(), proposalMetadataSummary(proposalForLog),
-			)
 			c.decide(d)
-			logViewDiag(
-				"event=controller_branch_done node=%d branch=decision current_view=%d duration_ms=%d",
-				c.ID, c.getCurrentViewNumber(), time.Since(branchStart).Milliseconds(),
-			)
 		case newView := <-c.viewChange:
-			branchStart := time.Now()
-			logViewDiag(
-				"event=controller_branch_start node=%d branch=view_change current_view=%d target_view=%d target_seq=%d",
-				c.ID, c.getCurrentViewNumber(), newView.viewNumber, newView.proposalSeq,
-			)
 			c.Logger.Debugf("get newView from viewChange")
 			c.changeView(newView.viewNumber, newView.proposalSeq, 0)
-			logViewDiag(
-				"event=controller_branch_done node=%d branch=view_change current_view=%d target_view=%d target_seq=%d duration_ms=%d",
-				c.ID, c.getCurrentViewNumber(), newView.viewNumber, newView.proposalSeq, time.Since(branchStart).Milliseconds(),
-			)
 		case view := <-c.abortViewChan:
-			branchStart := time.Now()
-			logViewDiag(
-				"event=controller_branch_start node=%d branch=abort current_view=%d requested_view=%d abort_queue_len=%d abort_queue_cap=%d",
-				c.ID, c.getCurrentViewNumber(), view, len(c.abortViewChan), cap(c.abortViewChan),
-			)
-			logViewDiag(
-				"event=controller_abort_view_recv node=%d requested_view=%d current_view=%d abort_queue_len=%d abort_queue_cap=%d",
-				c.ID, view, c.getCurrentViewNumber(), len(c.abortViewChan), cap(c.abortViewChan),
-			)
 			c.abortView(view)
-			logViewDiag(
-				"event=controller_abort_view_done node=%d requested_view=%d current_view=%d abort_queue_len=%d abort_queue_cap=%d",
-				c.ID, view, c.getCurrentViewNumber(), len(c.abortViewChan), cap(c.abortViewChan),
-			)
-			logViewDiag(
-				"event=controller_branch_done node=%d branch=abort current_view=%d requested_view=%d duration_ms=%d abort_queue_len=%d abort_queue_cap=%d",
-				c.ID, c.getCurrentViewNumber(), view, time.Since(branchStart).Milliseconds(), len(c.abortViewChan), cap(c.abortViewChan),
-			)
 		case <-c.stopChan:
-			logViewDiag(
-				"event=controller_branch_start node=%d branch=stop current_view=%d",
-				c.ID, c.getCurrentViewNumber(),
-			)
 			return
 		case <-c.leaderToken:
-			branchStart := time.Now()
-			logViewDiag(
-				"event=controller_branch_start node=%d branch=propose current_view=%d batcher_closed=%t stopped=%t",
-				c.ID, c.getCurrentViewNumber(), c.Batcher.Closed(), c.stopped(),
-			)
 			c.propose()
-			logViewDiag(
-				"event=controller_branch_done node=%d branch=propose current_view=%d duration_ms=%d batcher_closed=%t stopped=%t",
-				c.ID, c.getCurrentViewNumber(), time.Since(branchStart).Milliseconds(), c.Batcher.Closed(), c.stopped(),
-			)
 		case <-c.syncChan:
-			branchStart := time.Now()
-			logViewDiag(
-				"event=controller_branch_start node=%d branch=sync current_view=%d",
-				c.ID, c.getCurrentViewNumber(),
-			)
 			c.Logger.Debugf("get msg from syncChan")
 			view, seq, dec := c.sync()
 			c.MaybePruneRevokedRequests()
@@ -674,10 +562,6 @@ func (c *Controller) run() {
 				}
 				c.changeView(c.getCurrentViewNumber(), vs.(ViewSequence).ProposalSeq, c.getCurrentDecisionsInView())
 			}
-			logViewDiag(
-				"event=controller_branch_done node=%d branch=sync current_view=%d sync_view=%d sync_seq=%d sync_decisions=%d duration_ms=%d",
-				c.ID, c.getCurrentViewNumber(), view, seq, dec, time.Since(branchStart).Milliseconds(),
-			)
 		}
 	}
 }

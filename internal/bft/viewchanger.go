@@ -242,13 +242,12 @@ func (v *ViewChanger) HandleMessage(sender uint64, m *protos.Message) {
 	if !coalesce {
 		return
 	}
-	msg := &incMsg{sender: sender, Message: m, enqueuedAt: time.Now(), coalesce: key}
+	msg := &incMsg{sender: sender, Message: m, coalesce: key}
 	select {
 	case <-v.stopChan:
 		v.releasePendingViewMessage(key)
 		return
 	case v.incMsgs <- msg:
-		logInternalQueueEnqueue("viewchanger", v.SelfID, sender, m, len(v.incMsgs), cap(v.incMsgs))
 	}
 }
 
@@ -258,17 +257,9 @@ func (v *ViewChanger) dropStaleViewMessage(sender uint64, m *protos.Message) boo
 		return false
 	}
 	if kind == "view_change" && target <= v.realView {
-		logViewDiag(
-			"event=view_message_drop_stale node=%d sender=%d kind=%s target_view=%d current_view=%d next_view=%d real_view=%d",
-			v.SelfID, sender, kind, target, v.currView, v.nextView, v.realView,
-		)
 		return true
 	}
 	if kind != "view_change" && target < v.currView {
-		logViewDiag(
-			"event=view_message_drop_stale node=%d sender=%d kind=%s target_view=%d current_view=%d next_view=%d real_view=%d",
-			v.SelfID, sender, kind, target, v.currView, v.nextView, v.realView,
-		)
 		return true
 	}
 	return false
@@ -283,10 +274,6 @@ func (v *ViewChanger) reservePendingViewMessage(sender uint64, m *protos.Message
 	v.pendingViewMsgsLock.Lock()
 	defer v.pendingViewMsgsLock.Unlock()
 	if _, exists := v.pendingViewMsgs[key]; exists {
-		logViewDiag(
-			"event=view_message_drop_coalesced node=%d sender=%d kind=%s target_view=%d current_view=%d next_view=%d real_view=%d",
-			v.SelfID, sender, kind, target, v.currView, v.nextView, v.realView,
-		)
 		return nil, false
 	}
 	v.pendingViewMsgs[key] = struct{}{}
@@ -308,36 +295,15 @@ func (v *ViewChanger) run() {
 		case <-v.stopChan:
 			return
 		case changeMsg := <-v.startChangeChan:
-			logViewDiag(
-				"event=start_change_dequeue node=%d current_view=%d next_view=%d request_view=%d request_next_view=%d stop_view=%t catch_up=%t queue_len=%d queue_cap=%d",
-				v.SelfID, v.currView, v.nextView, changeMsg.view, changeMsg.nextView, changeMsg.stopView, changeMsg.catchUp, len(v.startChangeChan), cap(v.startChangeChan),
-			)
 			v.startViewChange(changeMsg)
 		case msg := <-v.incMsgs:
 			v.releasePendingViewMessage(msg.coalesce)
-			start := time.Now()
-			queueAge := time.Duration(0)
-			if !msg.enqueuedAt.IsZero() {
-				queueAge = start.Sub(msg.enqueuedAt)
-			}
-			logViewDiag(
-				"event=process_msg_start node=%d sender=%d message=%s kind=%s current_view=%d next_view=%d real_view=%d queue_len=%d queue_cap=%d queue_age_ms=%d",
-				v.SelfID, msg.sender, internalMessageSummary(msg.Message), messageKind(msg.Message), v.currView, v.nextView, v.realView, len(v.incMsgs), cap(v.incMsgs), queueAge.Milliseconds(),
-			)
 			v.processMsg(msg.sender, msg.Message)
-			logViewDiag(
-				"event=process_msg_done node=%d sender=%d message=%s kind=%s current_view=%d next_view=%d real_view=%d duration_ms=%d queue_len=%d queue_cap=%d",
-				v.SelfID, msg.sender, internalMessageSummary(msg.Message), messageKind(msg.Message), v.currView, v.nextView, v.realView, time.Since(start).Milliseconds(), len(v.incMsgs), cap(v.incMsgs),
-			)
 		case now := <-v.Ticker:
 			v.lastTick = now
 			v.checkIfResendViewChange(now)
 			v.checkIfTimeout(now)
 		case info := <-v.informChan:
-			logViewDiag(
-				"event=inform_new_view_dequeue node=%d current_view=%d next_view=%d informed_view=%d queue_len=%d queue_cap=%d",
-				v.SelfID, v.currView, v.nextView, info, len(v.informChan), cap(v.informChan),
-			)
 			v.informNewView(info)
 		case <-v.Restore:
 			v.processViewChangeMsg(true)
@@ -727,16 +693,8 @@ func (v *ViewChanger) processMsg(sender uint64, m *protos.Message) {
 
 // InformNewView tells the view changer to advance to a new view number
 func (v *ViewChanger) InformNewView(view uint64) {
-	logViewDiag(
-		"event=inform_new_view_enqueue_start node=%d current_view=%d next_view=%d informed_view=%d queue_len=%d queue_cap=%d",
-		v.SelfID, v.currView, v.nextView, view, len(v.informChan), cap(v.informChan),
-	)
 	select {
 	case v.informChan <- view:
-		logViewDiag(
-			"event=inform_new_view_enqueue_done node=%d current_view=%d next_view=%d informed_view=%d queue_len=%d queue_cap=%d",
-			v.SelfID, v.currView, v.nextView, view, len(v.informChan), cap(v.informChan),
-		)
 	case <-v.stopChan:
 		return
 	}
@@ -789,15 +747,7 @@ func (v *ViewChanger) StartViewChange(view uint64, stopView bool) {
 	changeMsg := &change{view: view, stopView: stopView}
 	select {
 	case v.startChangeChan <- changeMsg:
-		logViewDiag(
-			"event=start_change_enqueue node=%d current_view=%d next_view=%d request_view=%d request_next_view=%d stop_view=%t catch_up=%t queue_len=%d queue_cap=%d",
-			v.SelfID, v.currView, v.nextView, changeMsg.view, changeMsg.nextView, changeMsg.stopView, changeMsg.catchUp, len(v.startChangeChan), cap(v.startChangeChan),
-		)
 	default:
-		logViewDiag(
-			"event=start_change_drop node=%d current_view=%d next_view=%d request_view=%d stop_view=%t queue_len=%d queue_cap=%d",
-			v.SelfID, v.currView, v.nextView, view, stopView, len(v.startChangeChan), cap(v.startChangeChan),
-		)
 	}
 }
 
@@ -861,15 +811,7 @@ func (v *ViewChanger) startViewChange(change *change) {
 		detail = fmt.Sprintf("%s catch_up=true old_next_view=%d", detail, oldNextView)
 	}
 	v.emitViewEvent("start_view_change", v.currView, v.nextView, 0, detail)
-	logViewDiag(
-		"event=start_view_change_stop_timers_start node=%d current_view=%d next_view=%d request_view=%d stop_view=%t",
-		v.SelfID, v.currView, v.nextView, change.view, change.stopView,
-	)
 	v.RequestsTimer.StopTimers()
-	logViewDiag(
-		"event=start_view_change_stop_timers_done node=%d current_view=%d next_view=%d request_view=%d stop_view=%t",
-		v.SelfID, v.currView, v.nextView, change.view, change.stopView,
-	)
 	msg := &protos.Message{
 		Content: &protos.Message_ViewChange{
 			ViewChange: &protos.ViewChange{
@@ -877,28 +819,12 @@ func (v *ViewChanger) startViewChange(change *change) {
 			},
 		},
 	}
-	logViewDiag(
-		"event=start_view_change_broadcast_start node=%d current_view=%d next_view=%d request_view=%d stop_view=%t",
-		v.SelfID, v.currView, v.nextView, change.view, change.stopView,
-	)
 	v.Comm.BroadcastConsensus(msg)
-	logViewDiag(
-		"event=start_view_change_broadcast_done node=%d current_view=%d next_view=%d request_view=%d stop_view=%t",
-		v.SelfID, v.currView, v.nextView, change.view, change.stopView,
-	)
 	v.lastResend = v.lastTick
 	v.resendViewChange = true
 	v.Logger.Debugf("Node %d started view change, last view is %d", v.SelfID, v.currView)
 	if change.stopView {
-		logViewDiag(
-			"event=start_view_change_abort_start node=%d current_view=%d next_view=%d request_view=%d stop_view=%t",
-			v.SelfID, v.currView, v.nextView, change.view, change.stopView,
-		)
 		v.Controller.AbortView(v.currView) // abort the current view when joining view change
-		logViewDiag(
-			"event=start_view_change_abort_done node=%d current_view=%d next_view=%d request_view=%d stop_view=%t",
-			v.SelfID, v.currView, v.nextView, change.view, change.stopView,
-		)
 	}
 }
 
@@ -913,40 +839,16 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 	)
 	if ((uint64(len(v.viewChangeMsgs.voted)) == uint64(v.f+1)) && v.SpeedUpViewChange) || restore { // join view change
 		v.Logger.Debugf("Node %d is joining view change, last view is %d", v.SelfID, v.currView)
-		logViewDiag(
-			"event=view_change_join_start node=%d current_view=%d next_view=%d target=%d restore=%t speedup=%t votes=%d",
-			v.SelfID, v.currView, v.nextView, target, restore, v.SpeedUpViewChange, len(v.viewChangeMsgs.voted),
-		)
 		v.startViewChange(&change{view: v.currView, nextView: target, stopView: true})
-		logViewDiag(
-			"event=view_change_join_done node=%d current_view=%d next_view=%d target=%d restore=%t speedup=%t votes=%d",
-			v.SelfID, v.currView, v.nextView, target, restore, v.SpeedUpViewChange, len(v.viewChangeMsgs.voted),
-		)
 	}
 	if (len(v.viewChangeMsgs.voted) < v.quorum-1) && !restore {
 		return
 	}
-	logViewDiag(
-		"event=view_change_timeout_start_request node=%d current_view=%d next_view=%d target=%d restore=%t votes=%d required=%d",
-		v.SelfID, v.currView, v.nextView, target, restore, len(v.viewChangeMsgs.voted), v.quorum-1,
-	)
 	v.startViewChangeTimeout()
-	logViewDiag(
-		"event=view_change_timeout_started node=%d current_view=%d next_view=%d target=%d restore=%t check_timeout=%t votes=%d required=%d",
-		v.SelfID, v.currView, v.nextView, target, restore, v.checkTimeout, len(v.viewChangeMsgs.voted), v.quorum-1,
-	)
 	// send view data
 	if !v.SpeedUpViewChange {
 		v.Logger.Debugf("Node %d is joining view change, last view is %d", v.SelfID, v.currView)
-		logViewDiag(
-			"event=view_change_join_start node=%d current_view=%d next_view=%d target=%d restore=%t speedup=%t votes=%d",
-			v.SelfID, v.currView, v.nextView, target, restore, v.SpeedUpViewChange, len(v.viewChangeMsgs.voted),
-		)
 		v.startViewChange(&change{view: v.currView, nextView: target, stopView: true})
-		logViewDiag(
-			"event=view_change_join_done node=%d current_view=%d next_view=%d target=%d restore=%t speedup=%t votes=%d",
-			v.SelfID, v.currView, v.nextView, target, restore, v.SpeedUpViewChange, len(v.viewChangeMsgs.voted),
-		)
 	}
 	if !restore {
 		msgToSave := &protos.SavedMessage{
@@ -956,27 +858,11 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 				},
 			},
 		}
-		logViewDiag(
-			"event=view_change_state_save_start node=%d current_view=%d next_view=%d target=%d restore=%t",
-			v.SelfID, v.currView, v.nextView, target, restore,
-		)
 		if err := v.State.Save(msgToSave); err != nil {
 			v.Logger.Panicf("Failed to save message to state, error: %v", err)
 		}
-		logViewDiag(
-			"event=view_change_state_save_done node=%d current_view=%d next_view=%d target=%d restore=%t",
-			v.SelfID, v.currView, v.nextView, target, restore,
-		)
 	}
-	logViewDiag(
-		"event=view_change_abort_before_data_start node=%d current_view=%d next_view=%d target=%d restore=%t",
-		v.SelfID, v.currView, v.nextView, target, restore,
-	)
 	v.Controller.AbortView(v.currView) // before preparing the view data message abort the current view
-	logViewDiag(
-		"event=view_change_abort_before_data_done node=%d current_view=%d next_view=%d target=%d restore=%t",
-		v.SelfID, v.currView, v.nextView, target, restore,
-	)
 	oldCurrView := v.currView
 	v.currView = v.nextView
 	v.viewChangeQuorumView = v.currView
@@ -991,36 +877,12 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 	v.viewChangeMsgs.clear(v.N)
 	v.viewDataMsgs.clear(v.N) // clear because currView changed
 	v.pruneFutureViewChanges(v.currView)
-	logViewDiag(
-		"event=view_change_prepare_data_start node=%d current_view=%d next_view=%d target=%d restore=%t leader=%d",
-		v.SelfID, v.currView, v.nextView, target, restore, v.getLeader(),
-	)
 	msg := v.prepareViewDataMsg()
 	leader := v.getLeader()
-	logViewDiag(
-		"event=view_change_prepare_data_done node=%d current_view=%d next_view=%d target=%d restore=%t leader=%d %s",
-		v.SelfID, v.currView, v.nextView, target, restore, leader, signedViewDataDetail(msg.GetViewData()),
-	)
 	if leader == v.SelfID {
-		logViewDiag(
-			"event=view_change_register_own_data_start node=%d current_view=%d next_view=%d target=%d restore=%t leader=%d votes=%d",
-			v.SelfID, v.currView, v.nextView, target, restore, leader, len(v.viewDataMsgs.voted),
-		)
 		v.viewDataMsgs.registerVote(v.SelfID, msg)
-		logViewDiag(
-			"event=view_change_register_own_data_done node=%d current_view=%d next_view=%d target=%d restore=%t leader=%d votes=%d",
-			v.SelfID, v.currView, v.nextView, target, restore, leader, len(v.viewDataMsgs.voted),
-		)
 	} else {
-		logViewDiag(
-			"event=view_change_send_data_start node=%d current_view=%d next_view=%d target=%d restore=%t leader=%d",
-			v.SelfID, v.currView, v.nextView, target, restore, leader,
-		)
 		v.Comm.SendConsensus(leader, msg)
-		logViewDiag(
-			"event=view_change_send_data_done node=%d current_view=%d next_view=%d target=%d restore=%t leader=%d",
-			v.SelfID, v.currView, v.nextView, target, restore, leader,
-		)
 	}
 	v.Logger.Debugf("Node %d sent view data msg, with next view %d, to the new leader %d", v.SelfID, v.currView, leader)
 	v.emitViewEvent("send_view_data", v.currView, v.nextView, 0, fmt.Sprintf("leader=%d restore=%t %s", leader, restore, signedViewDataDetail(msg.GetViewData())))
@@ -1725,22 +1587,8 @@ func (v *ViewChanger) extractViewDataMessages(msg *protos.NewView) []*protos.Vie
 }
 
 func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
-	processStart := time.Now()
 	signers := signedViewDataSigners(msg.GetSignedViewData())
-	logViewDiag(
-		"event=new_view_process_start node=%d current_view=%d next_view=%d signers=%v",
-		v.SelfID, v.currView, v.nextView, signers,
-	)
-	validateStart := time.Now()
-	logViewDiag(
-		"event=new_view_validate_start node=%d current_view=%d next_view=%d signers=%v",
-		v.SelfID, v.currView, v.nextView, signers,
-	)
 	valid, calledSync, calledDeliver := v.validateNewViewMsg(msg)
-	logViewDiag(
-		"event=new_view_validate_done node=%d current_view=%d next_view=%d signers=%v valid=%t called_sync=%t called_deliver=%t duration_ms=%d",
-		v.SelfID, v.currView, v.nextView, signers, valid, calledSync, calledDeliver, time.Since(validateStart).Milliseconds(),
-	)
 	for calledDeliver {
 		v.Logger.Debugf("Node %d is processing a newView message, and delivered a proposal", v.SelfID)
 		v.emitViewEvent(
@@ -1750,16 +1598,7 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 			0,
 			fmt.Sprintf("signers=%v", signers),
 		)
-		validateStart = time.Now()
-		logViewDiag(
-			"event=new_view_validate_start node=%d current_view=%d next_view=%d signers=%v after_deliver=true",
-			v.SelfID, v.currView, v.nextView, signers,
-		)
 		valid, calledSync, calledDeliver = v.validateNewViewMsg(msg)
-		logViewDiag(
-			"event=new_view_validate_done node=%d current_view=%d next_view=%d signers=%v valid=%t called_sync=%t called_deliver=%t duration_ms=%d after_deliver=true",
-			v.SelfID, v.currView, v.nextView, signers, valid, calledSync, calledDeliver, time.Since(validateStart).Milliseconds(),
-		)
 	}
 	if !valid {
 		v.Logger.Warnf("Node %d is processing a newView message, but the message is invalid", v.SelfID)
@@ -1769,10 +1608,6 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 			v.nextView,
 			0,
 			fmt.Sprintf("reason=validation_failed signers=%v", signers),
-		)
-		logViewDiag(
-			"event=new_view_process_done node=%d current_view=%d next_view=%d signers=%v result=invalid duration_ms=%d",
-			v.SelfID, v.currView, v.nextView, signers, time.Since(processStart).Milliseconds(),
 		)
 		return
 	}
@@ -1785,25 +1620,12 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 			0,
 			fmt.Sprintf("signers=%v", signers),
 		)
-		logViewDiag(
-			"event=new_view_process_done node=%d current_view=%d next_view=%d signers=%v result=sync_requested duration_ms=%d",
-			v.SelfID, v.currView, v.nextView, signers, time.Since(processStart).Milliseconds(),
-		)
 		return
 	}
-	checkStart := time.Now()
-	logViewDiag(
-		"event=new_view_check_inflight_start node=%d current_view=%d next_view=%d signers=%v",
-		v.SelfID, v.currView, v.nextView, signers,
-	)
 	ok, noInFlight, inFlightProposal, err := CheckInFlight(v.extractViewDataMessages(msg), v.f, v.quorum, v.N, v.Verifier)
 	if err != nil {
 		v.Logger.Panicf("The check of the in flight proposal by node %d returned an error: %v", v.SelfID, err)
 	}
-	logViewDiag(
-		"event=new_view_check_inflight_done node=%d current_view=%d next_view=%d signers=%v ok=%t no_inflight=%t in_flight={%s} duration_ms=%d",
-		v.SelfID, v.currView, v.nextView, signers, ok, noInFlight, proposalMetadataSummary(inFlightProposal), time.Since(checkStart).Milliseconds(),
-	)
 	if !ok {
 		v.Logger.Debugf("The check of the in flight proposal by node %d did not pass", v.SelfID)
 		v.emitViewEvent(
@@ -1813,24 +1635,11 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 			0,
 			fmt.Sprintf("reason=check_inflight_failed signers=%v", signers),
 		)
-		logViewDiag(
-			"event=new_view_process_done node=%d current_view=%d next_view=%d signers=%v result=check_inflight_failed duration_ms=%d",
-			v.SelfID, v.currView, v.nextView, signers, time.Since(processStart).Milliseconds(),
-		)
 		return
 	}
 
 	if !noInFlight {
-		commitStart := time.Now()
-		logViewDiag(
-			"event=new_view_commit_inflight_start node=%d current_view=%d next_view=%d signers=%v in_flight={%s}",
-			v.SelfID, v.currView, v.nextView, signers, proposalMetadataSummary(inFlightProposal),
-		)
 		committed := v.commitInFlightProposal(inFlightProposal)
-		logViewDiag(
-			"event=new_view_commit_inflight_done node=%d current_view=%d next_view=%d signers=%v in_flight={%s} committed=%t duration_ms=%d",
-			v.SelfID, v.currView, v.nextView, signers, proposalMetadataSummary(inFlightProposal), committed, time.Since(commitStart).Milliseconds(),
-		)
 		if !committed {
 			v.Logger.Warnf("Node %d was unable to commit the in flight proposal, not changing the view", v.SelfID)
 			v.emitViewEvent(
@@ -1839,10 +1648,6 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 				v.nextView,
 				0,
 				fmt.Sprintf("reason=commit_inflight_failed in_flight={%s}", proposalMetadataSummary(inFlightProposal)),
-			)
-			logViewDiag(
-				"event=new_view_process_done node=%d current_view=%d next_view=%d signers=%v result=commit_inflight_failed duration_ms=%d",
-				v.SelfID, v.currView, v.nextView, signers, time.Since(processStart).Milliseconds(),
 			)
 			return
 		}
@@ -1880,25 +1685,13 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 		mySequence+1,
 		fmt.Sprintf("signers=%v no_inflight=%t", signers, noInFlight),
 	)
-	logViewDiag(
-		"event=new_view_install_start node=%d current_view=%d next_view=%d signers=%v proposal_seq=%d no_inflight=%t",
-		v.SelfID, v.currView, v.nextView, signers, mySequence+1, noInFlight,
-	)
 	v.Controller.ViewChanged(v.currView, mySequence+1)
-	logViewDiag(
-		"event=new_view_install_done node=%d current_view=%d next_view=%d signers=%v proposal_seq=%d no_inflight=%t duration_ms=%d",
-		v.SelfID, v.currView, v.nextView, signers, mySequence+1, noInFlight, time.Since(processStart).Milliseconds(),
-	)
 
 	v.checkTimeout = false
 	v.resendViewChange = false
 	if !v.ExternalBackoff {
 		v.backOffFactor = 1 // reset
 	}
-	logViewDiag(
-		"event=new_view_process_done node=%d current_view=%d next_view=%d signers=%v result=installed duration_ms=%d",
-		v.SelfID, v.currView, v.nextView, signers, time.Since(processStart).Milliseconds(),
-	)
 }
 
 func (v *ViewChanger) deliverDecision(proposal types.Proposal, signatures []types.Signature) {
@@ -1919,11 +1712,6 @@ func (v *ViewChanger) deliverDecision(proposal types.Proposal, signatures []type
 }
 
 func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success bool) {
-	start := time.Now()
-	logViewDiag(
-		"event=commit_inflight_enter node=%d current_view=%d next_view=%d proposal={%s}",
-		v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposal),
-	)
 	myLastDecision, _ := v.Checkpoint.Get()
 	if proposal == nil {
 		v.Logger.Panicf("The in flight proposal is nil")
@@ -1944,32 +1732,16 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 			v.Logger.Debugf("Node %d is comparing its last decision with the in flight proposal with the same sequence %d", v.SelfID, lastDecisionMD.LatestSequence)
 			if !proto.Equal(myLastDecision, proposal) {
 				v.Logger.Warnf("Node %d compared its last decision with the in flight proposal, which has the same sequence, but they are not equal", v.SelfID)
-				logViewDiag(
-					"event=commit_inflight_done node=%d current_view=%d next_view=%d proposal={%s} result=already_decided_mismatch duration_ms=%d",
-					v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposal), time.Since(start).Milliseconds(),
-				)
 				return false
 			}
-			logViewDiag(
-				"event=commit_inflight_done node=%d current_view=%d next_view=%d proposal={%s} result=already_decided duration_ms=%d",
-				v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposal), time.Since(start).Milliseconds(),
-			)
 			return true // I already decided on the in flight proposal
 		}
 		if proposalMD.LatestSequence < lastDecisionMD.LatestSequence {
 			v.Logger.Warnf("Node %d got a stale in flight proposal with sequence %d while its last decision was on sequence %d, rejecting new view", v.SelfID, proposalMD.LatestSequence, lastDecisionMD.LatestSequence)
-			logViewDiag(
-				"event=commit_inflight_done node=%d current_view=%d next_view=%d proposal={%s} result=stale_inflight last_sequence=%d duration_ms=%d",
-				v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposal), lastDecisionMD.LatestSequence, time.Since(start).Milliseconds(),
-			)
 			return false
 		}
 		if proposalMD.LatestSequence > lastDecisionMD.LatestSequence+1 {
 			v.Logger.Warnf("Node %d got a future in flight proposal with sequence %d while its last decision was on sequence %d, rejecting new view", v.SelfID, proposalMD.LatestSequence, lastDecisionMD.LatestSequence)
-			logViewDiag(
-				"event=commit_inflight_done node=%d current_view=%d next_view=%d proposal={%s} result=future_inflight_gap last_sequence=%d duration_ms=%d",
-				v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposal), lastDecisionMD.LatestSequence, time.Since(start).Milliseconds(),
-			)
 			return false
 		}
 	}
@@ -1979,10 +1751,6 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 	inFlightViewNum := proposalMD.ViewId
 	inFlightViewLatestSeq := proposalMD.LatestSequence
 
-	logViewDiag(
-		"event=commit_inflight_lock_start node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d",
-		v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq,
-	)
 	v.inFlightViewLock.Lock()
 	v.inFlightAttemptSeq++
 	attempt := &inFlightAttempt{
@@ -2052,36 +1820,11 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 	}
 
 	v.Logger.Debugf("Waiting two ticks before starting in-flight view")
-	waitTicksStart := time.Now()
-	logViewDiag(
-		"event=commit_inflight_wait_two_ticks_start node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d",
-		v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq,
-	)
 	<-v.Ticker
 	<-v.Ticker
-	logViewDiag(
-		"event=commit_inflight_wait_two_ticks_done node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d duration_ms=%d",
-		v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq, time.Since(waitTicksStart).Milliseconds(),
-	)
-	logViewDiag(
-		"event=commit_inflight_view_start node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d",
-		v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq,
-	)
 	inFlightView.Start()
-	logViewDiag(
-		"event=commit_inflight_view_started node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d",
-		v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq,
-	)
 	defer func() {
-		logViewDiag(
-			"event=commit_inflight_view_abort_start node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d",
-			v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq,
-		)
 		inFlightView.Abort()
-		logViewDiag(
-			"event=commit_inflight_view_abort_done node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d",
-			v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq,
-		)
 		v.inFlightViewLock.Lock()
 		if v.inFlightAttempt == attempt {
 			v.inFlightAttempt = nil
@@ -2093,10 +1836,6 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 	}()
 
 	v.inFlightViewLock.Unlock()
-	logViewDiag(
-		"event=commit_inflight_lock_released node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d",
-		v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq,
-	)
 
 	v.Logger.Debugf("Node %d started a view %d for the in flight proposal", v.SelfID, v.inFlightView.Number)
 	inFlightTimeoutFactor := v.backOffFactor
@@ -2105,11 +1844,6 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 	}
 	inFlightTimeout := v.ViewChangeTimeout * time.Duration(inFlightTimeoutFactor)
 	inFlightWaitStart := time.Now()
-	logViewDiag(
-		"event=commit_inflight_wait_event_start node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d local_timeout_ms=%d backoff_factor=%d",
-		v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq, inFlightTimeout.Milliseconds(), inFlightTimeoutFactor,
-	)
-	lastWaitLog := time.Now()
 
 	// wait for view to finish or time out
 	for {
@@ -2122,46 +1856,16 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 			return false
 		case now := <-v.Ticker:
 			v.lastTick = now
-			shouldLogTick := time.Since(lastWaitLog) >= time.Second
-			if shouldLogTick {
-				logViewDiag(
-					"event=commit_inflight_wait_event_tick node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d elapsed_ms=%d check_timeout=%t backoff_factor=%d",
-					v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq, time.Since(start).Milliseconds(), v.checkTimeout, v.backOffFactor,
-				)
-				logViewDiag(
-					"event=commit_inflight_timeout_check_start node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d elapsed_ms=%d",
-					v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq, time.Since(start).Milliseconds(),
-				)
-			}
 			if v.checkIfTimeout(now) {
 				v.Logger.Infof("Timeout expired waiting on In-flight %d with latest sequence view to commit %d", inFlightViewNum, inFlightViewLatestSeq)
-				logViewDiag(
-					"event=commit_inflight_wait_event_done node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d result=timeout duration_ms=%d",
-					v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq, time.Since(start).Milliseconds(),
-				)
 				return false
 			}
 			if inFlightTimeout > 0 && time.Since(inFlightWaitStart) >= inFlightTimeout {
 				v.Logger.Warnf("Node %d timed out waiting on in-flight view %d with latest sequence %d to commit", v.SelfID, inFlightViewNum, inFlightViewLatestSeq)
-				logViewDiag(
-					"event=commit_inflight_wait_event_done node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d result=local_timeout timeout_ms=%d duration_ms=%d",
-					v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq, inFlightTimeout.Milliseconds(), time.Since(start).Milliseconds(),
-				)
 				return false
-			}
-			if shouldLogTick {
-				logViewDiag(
-					"event=commit_inflight_timeout_check_done node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d elapsed_ms=%d",
-					v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq, time.Since(start).Milliseconds(),
-				)
-				lastWaitLog = time.Now()
 			}
 		case <-v.stopChan:
 			v.Logger.Infof("View changer was instructed to stop")
-			logViewDiag(
-				"event=commit_inflight_wait_event_done node=%d current_view=%d next_view=%d inflight_view=%d inflight_seq=%d result=stop duration_ms=%d",
-				v.SelfID, v.currView, v.nextView, inFlightViewNum, inFlightViewLatestSeq, time.Since(start).Milliseconds(),
-			)
 			return false
 		}
 	}
@@ -2180,42 +1884,11 @@ func (v *ViewChanger) Decide(proposal types.Proposal, signatures []types.Signatu
 }
 
 func (v *ViewChanger) decideInFlight(attempt *inFlightAttempt, proposal types.Proposal, signatures []types.Signature, requests []types.RequestInfo) {
-	proposalForLog := &protos.Proposal{
-		Header:               proposal.Header,
-		Payload:              proposal.Payload,
-		Metadata:             proposal.Metadata,
-		VerificationSequence: uint64(proposal.VerificationSequence),
-	}
-	logViewDiag(
-		"event=commit_inflight_decide_callback node=%d current_view=%d next_view=%d proposal={%s} signatures=%d requests=%d",
-		v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposalForLog), len(signatures), len(requests),
-	)
-	logViewDiag(
-		"event=commit_inflight_decide_stop_view_start node=%d current_view=%d next_view=%d proposal={%s}",
-		v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposalForLog),
-	)
 	if attempt != nil && attempt.viewRef != nil {
 		attempt.viewRef.stop()
-	} else {
-		logViewDiag(
-			"event=commit_inflight_decide_stop_view_skipped node=%d current_view=%d next_view=%d proposal={%s} reason=no_inflight_view",
-			v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposalForLog),
-		)
 	}
-	logViewDiag(
-		"event=commit_inflight_decide_stop_view_done node=%d current_view=%d next_view=%d proposal={%s}",
-		v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposalForLog),
-	)
 	v.Logger.Debugf("Delivering to app from Decide the last decision proposal")
-	logViewDiag(
-		"event=commit_inflight_decide_deliver_start node=%d current_view=%d next_view=%d proposal={%s}",
-		v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposalForLog),
-	)
 	reconfig := v.Application.Deliver(proposal, signatures)
-	logViewDiag(
-		"event=commit_inflight_decide_deliver_done node=%d current_view=%d next_view=%d proposal={%s} reconfig_in_latest=%t",
-		v.SelfID, v.currView, v.nextView, proposalMetadataSummary(proposalForLog), reconfig.InLatestDecision,
-	)
 	if reconfig.InLatestDecision {
 		v.close()
 	}
@@ -2255,14 +1928,6 @@ func (v *ViewChanger) Sync() {
 func (v *ViewChanger) syncInFlight(attempt *inFlightAttempt) {
 	// the in flight proposal view asked to sync
 	v.Logger.Debugf("Node %d is calling sync because the in flight proposal view has asked to sync", v.SelfID)
-	logViewDiag(
-		"event=commit_inflight_sync_callback node=%d current_view=%d next_view=%d",
-		v.SelfID, v.currView, v.nextView,
-	)
-	logViewDiag(
-		"event=commit_inflight_sync_call_start node=%d current_view=%d next_view=%d",
-		v.SelfID, v.currView, v.nextView,
-	)
 	v.Synchronizer.Sync()
 	if attempt == nil {
 		return

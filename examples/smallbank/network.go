@@ -406,7 +406,6 @@ type networkTransport struct {
 
 type networkOutbound struct {
 	method   string
-	summary  string
 	request  any
 	coalesce *networkCoalesceKey
 }
@@ -414,58 +413,6 @@ type networkOutbound struct {
 type networkCoalesceKey struct {
 	kind string
 	view uint64
-}
-
-func logSmallBankQueueEnqueue(side string, queueName string, from uint64, to uint64, method string, summary string, queueLen int, queueCap int) {
-	if queueLen <= 0 || queueLen%10 != 0 {
-		return
-	}
-	fmt.Printf("%s side=%s queue=%s from=%d to=%d method=%s message=%s queue_len=%d queue_cap=%d\n",
-		timestampedLogTag("queue"), side, queueName, from, to, shortGRPCMethod(method), summary, queueLen, queueCap)
-}
-
-func shortGRPCMethod(method string) string {
-	if method == "" {
-		return ""
-	}
-	if i := strings.LastIndex(method, "/"); i >= 0 && i+1 < len(method) {
-		return method[i+1:]
-	}
-	return method
-}
-
-func smartBFTMessageSummary(message *smartbftprotos.Message) string {
-	if message == nil {
-		return "nil"
-	}
-	return smartBFTContentSummary(message)
-}
-
-func smartBFTContentSummary(message *smartbftprotos.Message) string {
-	switch msg := message.GetContent().(type) {
-	case *smartbftprotos.Message_PrePrepare:
-		return fmt.Sprintf("pre_prepare view=%d seq=%d", msg.PrePrepare.GetView(), msg.PrePrepare.GetSeq())
-	case *smartbftprotos.Message_Prepare:
-		return fmt.Sprintf("prepare view=%d seq=%d", msg.Prepare.GetView(), msg.Prepare.GetSeq())
-	case *smartbftprotos.Message_Commit:
-		return fmt.Sprintf("commit view=%d seq=%d", msg.Commit.GetView(), msg.Commit.GetSeq())
-	case *smartbftprotos.Message_ViewChange:
-		return fmt.Sprintf("view_change next_view=%d", msg.ViewChange.GetNextView())
-	case *smartbftprotos.Message_ViewData:
-		return "view_data"
-	case *smartbftprotos.Message_NewView:
-		return fmt.Sprintf("new_view signatures=%d", len(msg.NewView.GetSignedViewData()))
-	case *smartbftprotos.Message_HeartBeat:
-		return fmt.Sprintf("heartbeat view=%d seq=%d", msg.HeartBeat.GetView(), msg.HeartBeat.GetSeq())
-	case *smartbftprotos.Message_HeartBeatResponse:
-		return "heartbeat_response"
-	case *smartbftprotos.Message_StateTransferRequest:
-		return "state_transfer_request"
-	case *smartbftprotos.Message_StateTransferResponse:
-		return fmt.Sprintf("state_transfer_response view=%d seq=%d", msg.StateTransferResponse.GetViewNum(), msg.StateTransferResponse.GetSequence())
-	default:
-		return "unknown"
-	}
 }
 
 func smartBFTNetworkCoalesceKey(message *smartbftprotos.Message) *networkCoalesceKey {
@@ -585,7 +532,6 @@ func (t *networkTransport) sendConsensus(targetID uint64, message *smartbftproto
 	key := smartBFTNetworkCoalesceKey(message)
 	t.enqueue(targetID, networkOutbound{
 		method:   methodConsensus,
-		summary:  smartBFTMessageSummary(message),
 		coalesce: key,
 		request: &grpcConsensusRequest{
 			From:    t.selfID,
@@ -596,8 +542,7 @@ func (t *networkTransport) sendConsensus(targetID uint64, message *smartbftproto
 
 func (t *networkTransport) sendTransaction(targetID uint64, payload []byte) {
 	t.enqueue(targetID, networkOutbound{
-		method:  methodTransaction,
-		summary: "transaction",
+		method: methodTransaction,
 		request: &grpcTransactionRequest{
 			From:    t.selfID,
 			Payload: append([]byte(nil), payload...),
@@ -615,7 +560,6 @@ func (t *networkTransport) enqueue(targetID uint64, outbound networkOutbound) {
 	}
 	select {
 	case queue <- outbound:
-		logSmallBankQueueEnqueue("sender", "network_outbound", t.selfID, targetID, outbound.method, outbound.summary, len(queue), cap(queue))
 	case <-t.stop:
 		t.releasePending(targetID, outbound.coalesce)
 	}

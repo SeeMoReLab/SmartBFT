@@ -295,7 +295,6 @@ func (n *node) SendConsensus(targetID uint64, message *smartbftprotos.Message) {
 	out := n.out[targetID]
 	clone := proto.Clone(message)
 	out <- wireMessage{from: n.id, msg: clone}
-	logSmallBankQueueEnqueue("sender", "local_inbound", n.id, targetID, "Consensus", smartBFTMessageSummary(message), len(out), cap(out))
 }
 
 func (n *node) SendTransaction(targetID uint64, request []byte) {
@@ -306,7 +305,6 @@ func (n *node) SendTransaction(targetID uint64, request []byte) {
 	}
 	out := n.out[targetID]
 	out <- wireMessage{from: n.id, msg: forwardedRequest{payload: reqCopy}}
-	logSmallBankQueueEnqueue("sender", "local_inbound", n.id, targetID, "Transaction", "transaction", len(out), cap(out))
 }
 
 func (n *node) RequestID(raw []byte) bft.RequestInfo {
@@ -557,8 +555,6 @@ func (n *node) applyEffectiveTimeouts(state requestTimeoutBackoffState, source s
 
 func (n *node) onViewEvent(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string) {
 	n.recordObservedView(currentView, nextView, proposalSeq)
-	fmt.Printf("%s event=%s node=%d current_view=%d next_view=%d proposal_seq=%d backoff_factor=%d detail=%s\n",
-		timestampedLogTag("view"), event, nodeID, currentView, nextView, proposalSeq, backoffFactor, detail)
 	if event == "start_view_change" {
 		n.onNoProgressViewChangeBackoff(nextView)
 	}
