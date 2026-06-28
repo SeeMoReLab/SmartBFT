@@ -29,29 +29,36 @@ type forwardedRequest struct {
 }
 
 type node struct {
-	id            uint64
-	in            <-chan wireMessage
-	out           map[uint64]chan<- wireMessage
-	consensus     *smartbft.Consensus
-	pending       *pendingTracker
-	state         *smallBankState
-	stateLock     sync.Mutex
-	prevHash      string
-	lastLock      sync.Mutex
-	lastDelivered bool
-	lastView      uint64
-	lastIndex     uint64
-	lastLeaderID  uint64
-	stopChan      chan struct{}
-	doneWG        sync.WaitGroup
-	clock         *time.Ticker
-	viewClock     *time.Ticker
-	logger        smart.Logger
-	configuration bft.Configuration
-	failures      *proposalDelayController
-	learning      *learningManager
-	network       *networkTransport
-	replies       *clientReplyDispatcher
+	id             uint64
+	in             <-chan wireMessage
+	out            map[uint64]chan<- wireMessage
+	consensus      *smartbft.Consensus
+	pending        *pendingTracker
+	state          *smallBankState
+	stateLock      sync.Mutex
+	prevHash       string
+	lastLock       sync.Mutex
+	viewObserved   bool
+	currentView    uint64
+	nextView       uint64
+	proposalSeq    uint64
+	lastDelivered  bool
+	lastView       uint64
+	lastIndex      uint64
+	lastLeaderID   uint64
+	lastDecision   bft.Decision
+	shutdownLogged bool
+	stopChan       chan struct{}
+	doneWG         sync.WaitGroup
+	clock          *time.Ticker
+	viewClock      *time.Ticker
+	logger         smart.Logger
+	configuration  bft.Configuration
+	failures       *proposalDelayController
+	learning       *learningManager
+	network        *networkTransport
+	replies        *clientReplyDispatcher
+	timeoutBackoff *requestTimeoutBackoff
 }
 
 type nodeOptions struct {
@@ -61,6 +68,7 @@ type nodeOptions struct {
 	Failures        *proposalDelayController
 	LearningOptions learningOptions
 	Learning        *learningManager
+	Backoff         requestTimeoutBackoffOptions
 	Network         *networkTransport
 	Replies         *clientReplyDispatcher
 }
@@ -103,29 +111,43 @@ func newNode(
 	config.RequestBatchMaxCount = opts.BatchSize
 	config.RequestBatchMaxInterval = opts.BatchTimeout
 	config.RequestPoolSize = max(2*opts.BatchSize, 1024)
-	config.RequestForwardTimeout = 100 * time.Millisecond
-	config.RequestComplainTimeout = 100 * time.Millisecond
+	config.RequestPoolSubmitTimeout = 5 * time.Millisecond
+	config.RequestForwardTimeout = 50 * time.Millisecond
+	config.RequestComplainTimeout = 50 * time.Millisecond
 	config.ViewChangeTimeout = 10 * time.Second
+	if opts.Backoff.Enabled {
+		config.ViewChangeTimeout = config.RequestForwardTimeout + config.RequestComplainTimeout
+		config.ViewChangeResendInterval = config.ViewChangeTimeout
+	}
 	config.LeaderHeartbeatTimeout = 30 * time.Second
 	config.LeaderRotation = false
 	config.DecisionsPerLeader = 0
 	n.configuration = config
+	timeoutBackoff, err := newRequestTimeoutBackoff(config.RequestForwardTimeout+config.RequestComplainTimeout, opts.Backoff)
+	if err != nil {
+		writeAheadLog.Close()
+		return nil, fmt.Errorf("create request timeout backoff for node %d: %w", id, err)
+	}
+	n.timeoutBackoff = timeoutBackoff
 
 	n.consensus = &smartbft.Consensus{
-		Config:             config,
-		ViewChangerTicker:  n.viewClock.C,
-		Scheduler:          n.clock.C,
-		Logger:             logger,
-		Metrics:            bftmet,
-		Comm:               n,
-		Signer:             n,
-		MembershipNotifier: n,
-		Verifier:           n,
-		Application:        n,
-		Assembler:          n,
-		RequestInspector:   n,
-		Synchronizer:       n,
-		WAL:                writeAheadLog,
+		Config:                    config,
+		ViewChangerTicker:         n.viewClock.C,
+		Scheduler:                 n.clock.C,
+		Logger:                    logger,
+		Metrics:                   bftmet,
+		Comm:                      n,
+		Signer:                    n,
+		MembershipNotifier:        n,
+		Verifier:                  n,
+		Application:               n,
+		Assembler:                 n,
+		RequestInspector:          n,
+		Synchronizer:              n,
+		WAL:                       writeAheadLog,
+		RequestTimeout:            n.onRequestTimeoutBackoff,
+		ViewEvent:                 n.onViewEvent,
+		ExternalViewChangeBackoff: opts.Backoff.Enabled,
 		Metadata: &smartbftprotos.ViewMetadata{
 			LatestSequence: 0,
 			ViewId:         0,
@@ -207,10 +229,10 @@ func (n *node) stop() {
 	n.learning.close()
 	n.replies.close()
 	n.doneWG.Wait()
-	n.printLastDelivered()
+	n.printShutdownState()
 }
 
-func (n *node) recordLastDelivered(md *smartbftprotos.ViewMetadata) {
+func (n *node) recordLastDecision(md *smartbftprotos.ViewMetadata, proposal bft.Proposal, signatures []bft.Signature) {
 	n.lastLock.Lock()
 	defer n.lastLock.Unlock()
 
@@ -218,18 +240,39 @@ func (n *node) recordLastDelivered(md *smartbftprotos.ViewMetadata) {
 	n.lastView = md.GetViewId()
 	n.lastIndex = md.GetLatestSequence()
 	n.lastLeaderID = n.consensus.GetLeaderID()
+	n.lastDecision = bft.Decision{
+		Proposal:   cloneProposal(proposal),
+		Signatures: cloneSignatures(signatures),
+	}
 }
 
-func (n *node) printLastDelivered() {
+func (n *node) recordObservedView(currentView uint64, nextView uint64, proposalSeq uint64) {
 	n.lastLock.Lock()
 	defer n.lastLock.Unlock()
 
-	if !n.lastDelivered {
-		fmt.Printf("SmartBFT SmallBank shutdown: node=%d last_delivered=false\n", n.id)
+	n.viewObserved = true
+	n.currentView = currentView
+	n.nextView = nextView
+	n.proposalSeq = proposalSeq
+}
+
+func (n *node) printShutdownState() {
+	n.lastLock.Lock()
+	defer n.lastLock.Unlock()
+
+	if n.shutdownLogged {
 		return
 	}
-	fmt.Printf("SmartBFT SmallBank shutdown: node=%d last_view=%d last_index=%d leader=%d\n",
-		n.id, n.lastView, n.lastIndex, n.lastLeaderID)
+	n.shutdownLogged = true
+
+	if !n.lastDelivered {
+		fmt.Printf("%s SmartBFT SmallBank shutdown: node=%d current_view_known=%t current_view=%d next_view=%d proposal_seq=%d last_committed=false\n",
+			timestampedLogTag("shutdown"), n.id, n.viewObserved, n.currentView, n.nextView, n.proposalSeq)
+		return
+	}
+	fmt.Printf("%s SmartBFT SmallBank shutdown: node=%d current_view_known=%t current_view=%d next_view=%d proposal_seq=%d last_committed_view=%d last_committed_seq=%d last_committed_leader=%d\n",
+		timestampedLogTag("shutdown"), n.id, n.viewObserved, n.currentView, n.nextView, n.proposalSeq,
+		n.lastView, n.lastIndex, n.lastLeaderID)
 }
 
 func (n *node) Nodes() []uint64 {
@@ -249,7 +292,10 @@ func (n *node) SendConsensus(targetID uint64, message *smartbftprotos.Message) {
 		n.network.sendConsensus(targetID, proto.Clone(message).(*smartbftprotos.Message))
 		return
 	}
-	n.out[targetID] <- wireMessage{from: n.id, msg: proto.Clone(message)}
+	out := n.out[targetID]
+	clone := proto.Clone(message)
+	out <- wireMessage{from: n.id, msg: clone}
+	logSmallBankQueueEnqueue("sender", "local_inbound", n.id, targetID, "Consensus", smartBFTMessageSummary(message), len(out), cap(out))
 }
 
 func (n *node) SendTransaction(targetID uint64, request []byte) {
@@ -258,7 +304,9 @@ func (n *node) SendTransaction(targetID uint64, request []byte) {
 		n.network.sendTransaction(targetID, reqCopy)
 		return
 	}
-	n.out[targetID] <- wireMessage{from: n.id, msg: forwardedRequest{payload: reqCopy}}
+	out := n.out[targetID]
+	out <- wireMessage{from: n.id, msg: forwardedRequest{payload: reqCopy}}
+	logSmallBankQueueEnqueue("sender", "local_inbound", n.id, targetID, "Transaction", "transaction", len(out), cap(out))
 }
 
 func (n *node) RequestID(raw []byte) bft.RequestInfo {
@@ -339,7 +387,7 @@ func (n *node) AssembleProposal(metadata []byte, requests [][]byte) bft.Proposal
 	}
 }
 
-func (n *node) Deliver(proposal bft.Proposal, _ []bft.Signature) bft.Reconfig {
+func (n *node) Deliver(proposal bft.Proposal, signatures []bft.Signature) bft.Reconfig {
 	data, err := decodeBlockData(proposal.Payload)
 	if err != nil {
 		n.logger.Errorf("node %d failed to decode proposal payload: %v", n.id, err)
@@ -347,10 +395,11 @@ func (n *node) Deliver(proposal bft.Proposal, _ []bft.Signature) bft.Reconfig {
 	}
 
 	md := &smartbftprotos.ViewMetadata{}
+	metadataOK := false
 	if err := proto.Unmarshal(proposal.Metadata, md); err != nil {
 		n.logger.Errorf("node %d failed to decode proposal metadata: %v", n.id, err)
 	} else {
-		n.recordLastDelivered(md)
+		metadataOK = true
 	}
 
 	decisionTime := time.Now()
@@ -383,6 +432,9 @@ func (n *node) Deliver(proposal bft.Proposal, _ []bft.Signature) bft.Reconfig {
 		n.replies.reply(resp)
 	}
 	n.prevHash = proposal.Digest()
+	if metadataOK {
+		n.recordLastDecision(md, proposal, signatures)
+	}
 	n.stateLock.Unlock()
 	postDecision := time.Since(postDecisionStart)
 
@@ -396,12 +448,154 @@ func (n *node) Deliver(proposal bft.Proposal, _ []bft.Signature) bft.Reconfig {
 		PostDecision: postDecision,
 		Timeout:      n.learning.currentTimeoutValue(),
 	})
+	n.onCommitBackoff(md.GetViewId(), md.GetLatestSequence())
+	if md.GetLatestSequence() == 1 || md.GetLatestSequence()%500 == 0 || postDecision > 100*time.Millisecond {
+		fmt.Printf("%s delivered: node=%d view=%d seq=%d batch=%d post_decision_ms=%d state_accounts=%d\n",
+			timestampedLogTag("sync"), n.id, md.GetViewId(), md.GetLatestSequence(), len(data.Requests),
+			postDecision.Milliseconds(), n.stateAccountCount())
+	}
 
 	return bft.Reconfig{InLatestDecision: false}
 }
 
-func (n *node) Sync() bft.SyncResponse {
-	return bft.SyncResponse{}
+func (n *node) applyBaseRequestTimeout(timeout time.Duration, source string) (bft.Configuration, error) {
+	if n.timeoutBackoff != nil && n.timeoutBackoff.state().Enabled {
+		update, err := n.timeoutBackoff.setBaseTimeout(timeout)
+		if err != nil {
+			return n.configuration, err
+		}
+		return n.applyEffectiveTimeouts(update.State, source)
+	}
+
+	config, err := n.consensus.ApplyRequestTimeout(timeout)
+	if err != nil {
+		return config, err
+	}
+	n.configuration = config
+	fmt.Printf("[learning] applied SmartBFT request timeout: node=%d source=%s total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d\n",
+		n.id, source, timeout.Milliseconds(), config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds())
+	return config, nil
+}
+
+func (n *node) onRequestTimeoutBackoff(view uint64) {
+	update := n.timeoutBackoff.onRequestTimeout(view)
+	if !update.Log {
+		return
+	}
+	fmt.Printf("%s request timeout: node=%d view=%d base_timeout_ms=%d multiplier=%d effective_timeout_ms=%d max_timeout_ms=%d applied=%t\n",
+		timestampedLogTag("backoff"), n.id, view, update.State.BaseTimeout.Milliseconds(), update.State.Multiplier,
+		update.State.EffectiveTimeout.Milliseconds(), update.State.MaxTimeout.Milliseconds(), update.Apply)
+}
+
+func (n *node) onNoProgressViewChangeBackoff(targetView uint64) {
+	update := n.timeoutBackoff.onNoProgressViewChange(targetView)
+	if !update.Log {
+		return
+	}
+	if update.Apply {
+		if _, err := n.applyEffectiveTimeouts(update.State, "backoff-view-change"); err != nil {
+			n.logger.Errorf("node %d failed to apply timeout backoff after view change to %d: %v", n.id, targetView, err)
+			return
+		}
+	}
+	fmt.Printf("%s no-progress view change: node=%d target_view=%d base_timeout_ms=%d multiplier=%d effective_timeout_ms=%d effective_view_change_timeout_ms=%d effective_view_change_resend_ms=%d max_timeout_ms=%d applied=%t\n",
+		timestampedLogTag("backoff"), n.id, targetView, update.State.BaseTimeout.Milliseconds(), update.State.Multiplier,
+		update.State.EffectiveTimeout.Milliseconds(), update.State.EffectiveViewChangeTimeout.Milliseconds(),
+		update.State.EffectiveViewChangeResendInterval.Milliseconds(), update.State.MaxTimeout.Milliseconds(), update.Apply)
+}
+
+func (n *node) onCommitBackoff(view uint64, sequence uint64) {
+	update := n.timeoutBackoff.onCommit(view, sequence)
+	if !update.Log {
+		return
+	}
+	if update.Apply {
+		if _, err := n.applyEffectiveTimeouts(update.State, "backoff-commit"); err != nil {
+			n.logger.Errorf("node %d failed to apply request timeout backoff after commit view=%d seq=%d: %v", n.id, view, sequence, err)
+			return
+		}
+	}
+	if update.Decayed {
+		fmt.Printf("%s decay: node=%d view=%d seq=%d base_timeout_ms=%d previous_multiplier=%d multiplier=%d previous_effective_timeout_ms=%d effective_timeout_ms=%d previous_effective_view_change_timeout_ms=%d effective_view_change_timeout_ms=%d previous_effective_view_change_resend_ms=%d effective_view_change_resend_ms=%d max_timeout_ms=%d applied=%t\n",
+			timestampedLogTag("backoff"), n.id, view, sequence, update.State.BaseTimeout.Milliseconds(),
+			update.Previous.Multiplier, update.State.Multiplier,
+			update.Previous.EffectiveTimeout.Milliseconds(), update.State.EffectiveTimeout.Milliseconds(),
+			update.Previous.EffectiveViewChangeTimeout.Milliseconds(), update.State.EffectiveViewChangeTimeout.Milliseconds(),
+			update.Previous.EffectiveViewChangeResendInterval.Milliseconds(), update.State.EffectiveViewChangeResendInterval.Milliseconds(),
+			update.State.MaxTimeout.Milliseconds(), update.Apply)
+	}
+	fmt.Printf("%s committed: node=%d view=%d seq=%d base_timeout_ms=%d multiplier=%d effective_timeout_ms=%d effective_view_change_timeout_ms=%d effective_view_change_resend_ms=%d max_timeout_ms=%d applied=%t\n",
+		timestampedLogTag("backoff"), n.id, view, sequence, update.State.BaseTimeout.Milliseconds(), update.State.Multiplier,
+		update.State.EffectiveTimeout.Milliseconds(), update.State.EffectiveViewChangeTimeout.Milliseconds(),
+		update.State.EffectiveViewChangeResendInterval.Milliseconds(), update.State.MaxTimeout.Milliseconds(), update.Apply)
+}
+
+func (n *node) applyEffectiveTimeouts(state requestTimeoutBackoffState, source string) (bft.Configuration, error) {
+	config, err := n.consensus.ApplyViewChangeTimeout(state.BaseTimeout)
+	if err != nil {
+		return config, err
+	}
+	if err := n.consensus.ApplyViewChangeBackoffFactor(uint64(state.Multiplier)); err != nil {
+		return config, err
+	}
+	if err := n.consensus.ApplyViewChangeResendInterval(state.EffectiveViewChangeResendInterval); err != nil {
+		return config, err
+	}
+	config, err = n.consensus.ApplyRequestTimeout(state.EffectiveTimeout)
+	if err != nil {
+		return config, err
+	}
+	n.configuration = config
+	fmt.Printf("%s applied SmartBFT timeouts: node=%d source=%s base_timeout_ms=%d multiplier=%d effective_timeout_ms=%d effective_view_change_timeout_ms=%d effective_view_change_resend_ms=%d max_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d view_change_timeout_ms=%d view_change_backoff_factor=%d\n",
+		timestampedLogTag("backoff"), n.id, source, state.BaseTimeout.Milliseconds(), state.Multiplier,
+		state.EffectiveTimeout.Milliseconds(), state.EffectiveViewChangeTimeout.Milliseconds(),
+		state.EffectiveViewChangeResendInterval.Milliseconds(), state.MaxTimeout.Milliseconds(),
+		config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds(),
+		config.ViewChangeTimeout.Milliseconds(), state.Multiplier)
+	return config, nil
+}
+
+func (n *node) onViewEvent(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string) {
+	n.recordObservedView(currentView, nextView, proposalSeq)
+	fmt.Printf("%s event=%s node=%d current_view=%d next_view=%d proposal_seq=%d backoff_factor=%d detail=%s\n",
+		timestampedLogTag("view"), event, nodeID, currentView, nextView, proposalSeq, backoffFactor, detail)
+	if event == "start_view_change" {
+		n.onNoProgressViewChangeBackoff(nextView)
+	}
+}
+
+func timestampedLogTag(component string) string {
+	return fmt.Sprintf("[%s %s]", component, time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
+}
+
+func (n *node) stateAccountCount() int {
+	n.stateLock.Lock()
+	defer n.stateLock.Unlock()
+	return len(n.state.accounts)
+}
+
+func cloneProposal(proposal bft.Proposal) bft.Proposal {
+	return bft.Proposal{
+		Payload:              append([]byte(nil), proposal.Payload...),
+		Header:               append([]byte(nil), proposal.Header...),
+		Metadata:             append([]byte(nil), proposal.Metadata...),
+		VerificationSequence: proposal.VerificationSequence,
+	}
+}
+
+func cloneSignatures(signatures []bft.Signature) []bft.Signature {
+	if len(signatures) == 0 {
+		return nil
+	}
+	cloned := make([]bft.Signature, 0, len(signatures))
+	for _, signature := range signatures {
+		cloned = append(cloned, bft.Signature{
+			ID:    signature.ID,
+			Value: append([]byte(nil), signature.Value...),
+			Msg:   append([]byte(nil), signature.Msg...),
+		})
+	}
+	return cloned
 }
 
 func (n *node) MembershipChange() bool {

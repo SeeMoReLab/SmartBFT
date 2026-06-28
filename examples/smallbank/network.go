@@ -34,6 +34,8 @@ import (
 
 const (
 	defaultNetworkSendTimeout = 2 * time.Second
+	consensusQueueSize        = 4096
+	asyncForwardLimit         = 256
 	smallBankNetworkService   = "smallbank.SmallBankNetwork"
 	methodConsensus           = "/" + smallBankNetworkService + "/Consensus"
 	methodTransaction         = "/" + smallBankNetworkService + "/Transaction"
@@ -41,6 +43,7 @@ const (
 	methodSubmitStream        = "/" + smallBankNetworkService + "/SubmitStream"
 	methodStatus              = "/" + smallBankNetworkService + "/Status"
 	methodChecksum            = "/" + smallBankNetworkService + "/Checksum"
+	methodStateSnapshot       = "/" + smallBankNetworkService + "/StateSnapshot"
 	methodApplyTimeout        = "/" + smallBankNetworkService + "/ApplyTimeout"
 	smallBankClientService    = "smallbank.SmallBankClient"
 	methodClientReply         = "/" + smallBankClientService + "/Reply"
@@ -159,6 +162,8 @@ type grpcChecksumResponse struct {
 	Checksum string
 }
 
+type grpcStateSnapshotRequest struct{}
+
 type grpcApplyTimeoutRequest struct {
 	TimeoutMS int64
 }
@@ -175,6 +180,7 @@ type smallBankNetworkServiceServer interface {
 	SubmitStream(smallBankSubmitStreamServer) error
 	Status(context.Context, *grpcStatusRequest) (*grpcStatusResponse, error)
 	Checksum(context.Context, *grpcChecksumRequest) (*grpcChecksumResponse, error)
+	StateSnapshot(context.Context, *grpcStateSnapshotRequest) (*stateSyncSnapshot, error)
 	ApplyTimeout(context.Context, *grpcApplyTimeoutRequest) (*grpcAck, error)
 }
 
@@ -192,6 +198,7 @@ var smallBankNetworkServiceDesc = grpc.ServiceDesc{
 		{MethodName: "Submit", Handler: smallBankSubmitHandler},
 		{MethodName: "Status", Handler: smallBankStatusHandler},
 		{MethodName: "Checksum", Handler: smallBankChecksumHandler},
+		{MethodName: "StateSnapshot", Handler: smallBankStateSnapshotHandler},
 		{MethodName: "ApplyTimeout", Handler: smallBankApplyTimeoutHandler},
 	},
 	Streams: []grpc.StreamDesc{
@@ -354,6 +361,21 @@ func smallBankChecksumHandler(srv any, ctx context.Context, dec func(any) error,
 	return interceptor(ctx, in, info, handler)
 }
 
+func smallBankStateSnapshotHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+	in := new(grpcStateSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(smallBankNetworkServiceServer).StateSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: methodStateSnapshot}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(smallBankNetworkServiceServer).StateSnapshot(ctx, req.(*grpcStateSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func smallBankApplyTimeoutHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 	in := new(grpcApplyTimeoutRequest)
 	if err := dec(in); err != nil {
@@ -370,17 +392,122 @@ func smallBankApplyTimeoutHandler(srv any, ctx context.Context, dec func(any) er
 }
 
 type networkTransport struct {
-	selfID uint64
-	hosts  map[uint64]hostEntry
-	peers  map[uint64]*grpc.ClientConn
-	queues map[uint64]chan networkOutbound
-	stop   chan struct{}
-	wg     sync.WaitGroup
+	selfID          uint64
+	hosts           map[uint64]hostEntry
+	peers           map[uint64]*grpc.ClientConn
+	queues          map[uint64]chan networkOutbound
+	pending         map[uint64]map[networkCoalesceKey]struct{}
+	pendingLock     sync.Mutex
+	forwardInflight map[uint64]chan struct{}
+	stop            chan struct{}
+	workerWG        sync.WaitGroup
+	asyncWG         sync.WaitGroup
 }
 
 type networkOutbound struct {
-	method  string
-	request any
+	method   string
+	summary  string
+	request  any
+	coalesce *networkCoalesceKey
+}
+
+type networkCoalesceKey struct {
+	kind string
+	view uint64
+}
+
+func logSmallBankQueueEnqueue(side string, queueName string, from uint64, to uint64, method string, summary string, queueLen int, queueCap int) {
+	if queueLen <= 0 || queueLen%10 != 0 {
+		return
+	}
+	fmt.Printf("%s side=%s queue=%s from=%d to=%d method=%s message=%s queue_len=%d queue_cap=%d\n",
+		timestampedLogTag("queue"), side, queueName, from, to, shortGRPCMethod(method), summary, queueLen, queueCap)
+}
+
+func shortGRPCMethod(method string) string {
+	if method == "" {
+		return ""
+	}
+	if i := strings.LastIndex(method, "/"); i >= 0 && i+1 < len(method) {
+		return method[i+1:]
+	}
+	return method
+}
+
+func smartBFTMessageSummary(message *smartbftprotos.Message) string {
+	if message == nil {
+		return "nil"
+	}
+	return smartBFTContentSummary(message)
+}
+
+func smartBFTContentSummary(message *smartbftprotos.Message) string {
+	switch msg := message.GetContent().(type) {
+	case *smartbftprotos.Message_PrePrepare:
+		return fmt.Sprintf("pre_prepare view=%d seq=%d", msg.PrePrepare.GetView(), msg.PrePrepare.GetSeq())
+	case *smartbftprotos.Message_Prepare:
+		return fmt.Sprintf("prepare view=%d seq=%d", msg.Prepare.GetView(), msg.Prepare.GetSeq())
+	case *smartbftprotos.Message_Commit:
+		return fmt.Sprintf("commit view=%d seq=%d", msg.Commit.GetView(), msg.Commit.GetSeq())
+	case *smartbftprotos.Message_ViewChange:
+		return fmt.Sprintf("view_change next_view=%d", msg.ViewChange.GetNextView())
+	case *smartbftprotos.Message_ViewData:
+		return "view_data"
+	case *smartbftprotos.Message_NewView:
+		return fmt.Sprintf("new_view signatures=%d", len(msg.NewView.GetSignedViewData()))
+	case *smartbftprotos.Message_HeartBeat:
+		return fmt.Sprintf("heartbeat view=%d seq=%d", msg.HeartBeat.GetView(), msg.HeartBeat.GetSeq())
+	case *smartbftprotos.Message_HeartBeatResponse:
+		return "heartbeat_response"
+	case *smartbftprotos.Message_StateTransferRequest:
+		return "state_transfer_request"
+	case *smartbftprotos.Message_StateTransferResponse:
+		return fmt.Sprintf("state_transfer_response view=%d seq=%d", msg.StateTransferResponse.GetViewNum(), msg.StateTransferResponse.GetSequence())
+	default:
+		return "unknown"
+	}
+}
+
+func smartBFTNetworkCoalesceKey(message *smartbftprotos.Message) *networkCoalesceKey {
+	kind, view, ok := smartBFTViewMessageTarget(message)
+	if !ok {
+		return nil
+	}
+	return &networkCoalesceKey{kind: kind, view: view}
+}
+
+func smartBFTViewMessageTarget(message *smartbftprotos.Message) (string, uint64, bool) {
+	if message == nil {
+		return "", 0, false
+	}
+	if vc := message.GetViewChange(); vc != nil {
+		return "view_change", vc.GetNextView(), true
+	}
+	if vd := message.GetViewData(); vd != nil {
+		target, ok := smartBFTSignedViewDataTarget(vd)
+		return "view_data", target, ok
+	}
+	if nv := message.GetNewView(); nv != nil {
+		for _, svd := range nv.GetSignedViewData() {
+			target, ok := smartBFTSignedViewDataTarget(svd)
+			if ok {
+				return "new_view", target, true
+			}
+		}
+		return "new_view", 0, false
+	}
+	return "", 0, false
+}
+
+func smartBFTSignedViewDataTarget(svd *smartbftprotos.SignedViewData) (uint64, bool) {
+	if svd == nil {
+		return 0, false
+	}
+	vd := &smartbftprotos.ViewData{}
+	if err := proto.Unmarshal(svd.GetRawViewData(), vd); err != nil {
+		return 0, false
+	}
+	return vd.GetNextView(), true
 }
 
 func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, error) {
@@ -389,11 +516,13 @@ func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, e
 		hostMap[host.ID] = host
 	}
 	t := &networkTransport{
-		selfID: selfID,
-		hosts:  hostMap,
-		peers:  make(map[uint64]*grpc.ClientConn),
-		queues: make(map[uint64]chan networkOutbound),
-		stop:   make(chan struct{}),
+		selfID:          selfID,
+		hosts:           hostMap,
+		peers:           make(map[uint64]*grpc.ClientConn),
+		queues:          make(map[uint64]chan networkOutbound),
+		pending:         make(map[uint64]map[networkCoalesceKey]struct{}),
+		forwardInflight: make(map[uint64]chan struct{}),
+		stop:            make(chan struct{}),
 	}
 	for _, host := range hosts {
 		if host.ID == selfID {
@@ -404,10 +533,12 @@ func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, e
 			t.close()
 			return nil, fmt.Errorf("connect to node %d at %s: %w", host.ID, host.address(), err)
 		}
-		queue := make(chan networkOutbound, 4096)
+		queue := make(chan networkOutbound, consensusQueueSize)
 		t.peers[host.ID] = conn
 		t.queues[host.ID] = queue
-		t.wg.Add(1)
+		t.pending[host.ID] = make(map[networkCoalesceKey]struct{})
+		t.forwardInflight[host.ID] = make(chan struct{}, asyncForwardLimit)
+		t.workerWG.Add(1)
 		go t.worker(host, conn, queue)
 	}
 	return t, nil
@@ -430,7 +561,8 @@ func (t *networkTransport) close() {
 	default:
 		close(t.stop)
 	}
-	t.wg.Wait()
+	t.workerWG.Wait()
+	t.asyncWG.Wait()
 	for _, conn := range t.peers {
 		_ = conn.Close()
 	}
@@ -448,11 +580,13 @@ func (t *networkTransport) nodeIDs() []uint64 {
 func (t *networkTransport) sendConsensus(targetID uint64, message *smartbftprotos.Message) {
 	raw, err := proto.Marshal(message)
 	if err != nil {
-		fmt.Printf("[network] marshal consensus message failed: target=%d err=%v\n", targetID, err)
 		return
 	}
+	key := smartBFTNetworkCoalesceKey(message)
 	t.enqueue(targetID, networkOutbound{
-		method: methodConsensus,
+		method:   methodConsensus,
+		summary:  smartBFTMessageSummary(message),
+		coalesce: key,
 		request: &grpcConsensusRequest{
 			From:    t.selfID,
 			Message: raw,
@@ -462,7 +596,8 @@ func (t *networkTransport) sendConsensus(targetID uint64, message *smartbftproto
 
 func (t *networkTransport) sendTransaction(targetID uint64, payload []byte) {
 	t.enqueue(targetID, networkOutbound{
-		method: methodTransaction,
+		method:  methodTransaction,
+		summary: "transaction",
 		request: &grpcTransactionRequest{
 			From:    t.selfID,
 			Payload: append([]byte(nil), payload...),
@@ -473,48 +608,108 @@ func (t *networkTransport) sendTransaction(targetID uint64, payload []byte) {
 func (t *networkTransport) enqueue(targetID uint64, outbound networkOutbound) {
 	queue, exists := t.queues[targetID]
 	if !exists {
-		fmt.Printf("[network] no route to target node %d\n", targetID)
+		return
+	}
+	if !t.reservePending(targetID, outbound.coalesce) {
 		return
 	}
 	select {
 	case queue <- outbound:
+		logSmallBankQueueEnqueue("sender", "network_outbound", t.selfID, targetID, outbound.method, outbound.summary, len(queue), cap(queue))
 	case <-t.stop:
+		t.releasePending(targetID, outbound.coalesce)
 	}
 }
 
 func (t *networkTransport) worker(host hostEntry, conn *grpc.ClientConn, queue <-chan networkOutbound) {
-	defer t.wg.Done()
+	defer t.workerWG.Done()
 	for {
 		select {
 		case <-t.stop:
 			return
 		case outbound := <-queue:
-			t.invokeWithRetry(host, conn, outbound)
+			t.releasePending(host.ID, outbound.coalesce)
+			if outbound.method == methodTransaction {
+				t.invokeForwardAsync(host, conn, outbound)
+				continue
+			}
+			t.invokeOnce(host, conn, outbound)
 		}
 	}
 }
 
-func (t *networkTransport) invokeWithRetry(host hostEntry, conn *grpc.ClientConn, outbound networkOutbound) {
-	for {
-		select {
-		case <-t.stop:
-			return
-		default:
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
-		err := conn.Invoke(ctx, outbound.method, outbound.request, &grpcAck{})
-		cancel()
-		if err == nil {
-			return
-		}
-		fmt.Printf("[network] send failed: target=%d method=%s err=%v\n", host.ID, outbound.method, err)
-		select {
-		case <-t.stop:
-			return
-		case <-time.After(100 * time.Millisecond):
-		}
+func (t *networkTransport) reservePending(targetID uint64, key *networkCoalesceKey) bool {
+	if key == nil {
+		return true
 	}
+	t.pendingLock.Lock()
+	defer t.pendingLock.Unlock()
+	pending := t.pending[targetID]
+	if pending == nil {
+		pending = make(map[networkCoalesceKey]struct{})
+		t.pending[targetID] = pending
+	}
+	if _, exists := pending[*key]; exists {
+		return false
+	}
+	pending[*key] = struct{}{}
+	return true
+}
+
+func (t *networkTransport) releasePending(targetID uint64, key *networkCoalesceKey) {
+	if key == nil {
+		return
+	}
+	t.pendingLock.Lock()
+	if pending := t.pending[targetID]; pending != nil {
+		delete(pending, *key)
+	}
+	t.pendingLock.Unlock()
+}
+
+func (t *networkTransport) invokeForwardAsync(host hostEntry, conn *grpc.ClientConn, outbound networkOutbound) {
+	inflight, exists := t.forwardInflight[host.ID]
+	if !exists {
+		return
+	}
+	select {
+	case inflight <- struct{}{}:
+	case <-t.stop:
+		return
+	default:
+		return
+	}
+
+	t.asyncWG.Add(1)
+	go func() {
+		defer t.asyncWG.Done()
+		defer func() { <-inflight }()
+		t.invokeOnce(host, conn, outbound)
+	}()
+}
+
+func (t *networkTransport) invokeOnce(host hostEntry, conn *grpc.ClientConn, outbound networkOutbound) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
+	err := conn.Invoke(ctx, outbound.method, outbound.request, &grpcAck{})
+	cancel()
+	if err == nil {
+		return
+	}
+}
+
+func (t *networkTransport) fetchStateSnapshot(targetID uint64) (stateSyncSnapshot, error) {
+	conn, exists := t.peers[targetID]
+	if !exists {
+		return stateSyncSnapshot{}, fmt.Errorf("no route to target node %d", targetID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
+	defer cancel()
+
+	var snapshot stateSyncSnapshot
+	if err := conn.Invoke(ctx, methodStateSnapshot, &grpcStateSnapshotRequest{}, &snapshot); err != nil {
+		return stateSyncSnapshot{}, err
+	}
+	return snapshot, nil
 }
 
 type replyTracker struct {
@@ -684,7 +879,6 @@ func (d *clientReplyDispatcher) reply(resp response) {
 		var err error
 		sender, err = newReplySender(address, d.selfID)
 		if err != nil {
-			fmt.Printf("[network] create client reply sender failed: address=%s err=%v\n", address, err)
 		} else {
 			d.senders[address] = sender
 		}
@@ -737,7 +931,6 @@ func (s *replySender) enqueue(resp response) {
 	case s.queue <- resp:
 	case <-s.stop:
 	default:
-		fmt.Printf("[network] client reply queue full: address=%s client=%s request=%s\n", s.address, resp.ClientID, resp.ID)
 	}
 }
 
@@ -759,15 +952,11 @@ func (s *replySender) worker(selfID uint64) {
 				var err error
 				stream, cancel, err = s.openStream()
 				if err != nil {
-					fmt.Printf("[network] open client reply stream failed: address=%s err=%v\n", s.address, err)
 					s.sendUnary(selfID, resp)
 					continue
 				}
 			}
 			if err := stream.SendMsg(&grpcReplyRequest{From: selfID, Response: resp}); err != nil {
-				if err != io.EOF && err != context.Canceled {
-					fmt.Printf("[network] stream client reply failed: address=%s client=%s request=%s err=%v\n", s.address, resp.ClientID, resp.ID, err)
-				}
 				cancel()
 				stream = nil
 				cancel = nil
@@ -789,14 +978,11 @@ func (s *replySender) openStream() (grpc.ClientStream, context.CancelFunc, error
 
 func (s *replySender) sendUnary(selfID uint64, resp response) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
-	err := s.conn.Invoke(ctx, methodClientReply, &grpcReplyRequest{
+	_ = s.conn.Invoke(ctx, methodClientReply, &grpcReplyRequest{
 		From:     selfID,
 		Response: resp,
 	}, &grpcAck{})
 	cancel()
-	if err != nil {
-		fmt.Printf("[network] send client reply failed: address=%s client=%s request=%s err=%v\n", s.address, resp.ClientID, resp.ID, err)
-	}
 }
 
 func (s *replySender) close() {
@@ -834,7 +1020,6 @@ func (s *submitSender) enqueue(req request, raw []byte) {
 	case s.queue <- submit:
 	case <-s.stop:
 	default:
-		fmt.Printf("[network] broadcast submit queue full: node=%d client=%s request=%s\n", s.host.ID, req.ClientID, req.ID)
 	}
 }
 
@@ -856,7 +1041,6 @@ func (s *submitSender) worker() {
 				var err error
 				stream, cancel, err = s.openStream()
 				if err != nil {
-					fmt.Printf("[network] open broadcast submit stream failed: node=%d err=%v\n", s.host.ID, err)
 					s.sendUnary(submit)
 					continue
 				}
@@ -867,10 +1051,6 @@ func (s *submitSender) worker() {
 				ReplyAddress: s.replyAddress,
 			})
 			if err != nil {
-				if err != io.EOF && err != context.Canceled {
-					fmt.Printf("[network] stream broadcast submit failed: node=%d client=%s request=%s err=%v\n",
-						s.host.ID, submit.req.ClientID, submit.req.ID, err)
-				}
 				cancel()
 				stream = nil
 				cancel = nil
@@ -899,10 +1079,7 @@ func (s *submitSender) sendUnary(submit broadcastSubmit) {
 		ReplyAddress: s.replyAddress,
 	}, &out)
 	cancel()
-	if err != nil {
-		fmt.Printf("[network] broadcast submit failed: node=%d client=%s request=%s err=%v\n",
-			s.host.ID, submit.req.ClientID, submit.req.ID, err)
-	}
+	_ = err
 }
 
 func (s *submitSender) close() {
@@ -920,6 +1097,7 @@ type networkNodeServer struct {
 	grpcServer     *grpc.Server
 	listener       net.Listener
 	requestTimeout time.Duration
+	closeOnce      sync.Once
 }
 
 func newNetworkNodeServer(
@@ -927,7 +1105,7 @@ func newNetworkNodeServer(
 	hosts []hostEntry,
 	opts nodeOptions,
 	dataDir string,
-	verbose bool,
+	logMode smallBankLogMode,
 	requestTimeout time.Duration,
 ) (*networkNodeServer, error) {
 	host, exists := hostByID(hosts, id)
@@ -939,7 +1117,7 @@ func newNetworkNodeServer(
 	if err != nil {
 		return nil, err
 	}
-	logger := newSmallBankLogger(verbose)
+	logger := newSmallBankLogger(logMode)
 	met := &disabled.Provider{}
 	walMet := wal.NewMetrics(met, "smallbank")
 	bftMet := smart.NewMetrics(met, "smallbank")
@@ -950,13 +1128,20 @@ func newNetworkNodeServer(
 	nodeOpts.NumNodes = len(hosts)
 	nodeOpts.Network = transport
 	nodeOpts.Replies = newClientReplyDispatcher(id)
+	var localNode *node
 	learningOpts := opts.LearningOptions
 	if learningOpts.Enabled {
 		if learningOpts.NodeID == 0 {
 			learningOpts.NodeID = 1
 		}
 		if learningOpts.NodeID == id {
-			learningOpts.ApplyTimeout = applyRecommendedPBFTTimeoutOverNetwork(hosts)
+			learningOpts.ApplyTimeout = func(timeout time.Duration) error {
+				if localNode == nil {
+					return fmt.Errorf("node %d not initialized", id)
+				}
+				_, err := localNode.applyBaseRequestTimeout(timeout, "learning-recommendation")
+				return err
+			}
 		} else {
 			learningOpts = learningOptions{}
 		}
@@ -973,6 +1158,7 @@ func newNetworkNodeServer(
 		transport.close()
 		return nil, err
 	}
+	localNode = n
 
 	listener, err := net.Listen("tcp", host.address())
 	if err != nil {
@@ -991,34 +1177,6 @@ func newNetworkNodeServer(
 	return s, nil
 }
 
-func applyRecommendedPBFTTimeoutOverNetwork(hosts []hostEntry) func(time.Duration) error {
-	conns := make(map[uint64]*grpc.ClientConn, len(hosts))
-	return func(timeout time.Duration) error {
-		var firstErr error
-		for _, host := range hosts {
-			conn := conns[host.ID]
-			if conn == nil {
-				var err error
-				conn, err = newSmallBankGRPCClientConn(host.address())
-				if err != nil {
-					if firstErr == nil {
-						firstErr = fmt.Errorf("node %d: %w", host.ID, err)
-					}
-					continue
-				}
-				conns[host.ID] = conn
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
-			err := conn.Invoke(ctx, methodApplyTimeout, &grpcApplyTimeoutRequest{TimeoutMS: timeout.Milliseconds()}, &grpcAck{})
-			cancel()
-			if err != nil && firstErr == nil {
-				firstErr = fmt.Errorf("node %d: %w", host.ID, err)
-			}
-		}
-		return firstErr
-	}
-}
-
 func (s *networkNodeServer) serve() error {
 	fmt.Printf("SmartBFT SmallBank gRPC server listening: node=%d address=%s\n", s.host.ID, s.host.address())
 	err := s.grpcServer.Serve(s.listener)
@@ -1029,6 +1187,13 @@ func (s *networkNodeServer) serve() error {
 }
 
 func (s *networkNodeServer) close(ctx context.Context) {
+	s.closeOnce.Do(func() {
+		s.closeOnceClose(ctx)
+	})
+}
+
+func (s *networkNodeServer) closeOnceClose(ctx context.Context) {
+	s.node.printShutdownState()
 	done := make(chan struct{})
 	go func() {
 		s.grpcServer.GracefulStop()
@@ -1043,12 +1208,19 @@ func (s *networkNodeServer) close(ctx context.Context) {
 	s.node.stop()
 }
 
-func (s *networkNodeServer) Consensus(_ context.Context, req *grpcConsensusRequest) (*grpcAck, error) {
+func (s *networkNodeServer) handleConsensusRequest(req *grpcConsensusRequest) error {
 	msg := &smartbftprotos.Message{}
 	if err := proto.Unmarshal(req.Message, msg); err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "decode consensus message: %v", err)
+		return grpcstatus.Errorf(codes.InvalidArgument, "decode consensus message: %v", err)
 	}
 	s.node.consensus.HandleMessage(req.From, msg)
+	return nil
+}
+
+func (s *networkNodeServer) Consensus(_ context.Context, req *grpcConsensusRequest) (*grpcAck, error) {
+	if err := s.handleConsensusRequest(req); err != nil {
+		return nil, err
+	}
 	return &grpcAck{}, nil
 }
 
@@ -1111,13 +1283,9 @@ func (s *networkNodeServer) SubmitStream(stream smallBankSubmitStreamServer) err
 		}
 		decoded, err := decodeRequest(req.Payload)
 		if err != nil {
-			fmt.Printf("[network] decode broadcast submit failed: node=%d err=%v\n", s.node.id, err)
 			continue
 		}
-		if err := s.acceptBroadcastSubmit(decoded, req); err != nil {
-			fmt.Printf("[network] accept broadcast submit failed: node=%d client=%s request=%s err=%v\n",
-				s.node.id, decoded.ClientID, decoded.ID, err)
-		}
+		_ = s.acceptBroadcastSubmit(decoded, req)
 	}
 }
 
@@ -1140,30 +1308,24 @@ func (s *networkNodeServer) Status(context.Context, *grpcStatusRequest) (*grpcSt
 
 func (s *networkNodeServer) Checksum(context.Context, *grpcChecksumRequest) (*grpcChecksumResponse, error) {
 	s.node.stateLock.Lock()
-	raw := mustJSON(struct {
-		Accounts map[uint64]string `json:"accounts"`
-		Checking map[uint64]int64  `json:"checking"`
-		Savings  map[uint64]int64  `json:"savings"`
-	}{
-		Accounts: s.node.state.accounts,
-		Checking: s.node.state.checking,
-		Savings:  s.node.state.savings,
-	})
+	raw := mustJSON(s.node.state.deterministicSnapshot())
 	s.node.stateLock.Unlock()
 	return &grpcChecksumResponse{NodeID: s.node.id, Checksum: hashBytes(raw)}, nil
+}
+
+func (s *networkNodeServer) StateSnapshot(context.Context, *grpcStateSnapshotRequest) (*stateSyncSnapshot, error) {
+	snapshot := s.node.localStateSyncSnapshot()
+	return &snapshot, nil
 }
 
 func (s *networkNodeServer) ApplyTimeout(_ context.Context, req *grpcApplyTimeoutRequest) (*grpcAck, error) {
 	if req.TimeoutMS <= 0 {
 		return nil, grpcstatus.Error(codes.InvalidArgument, "timeout_ms must be positive")
 	}
-	config, err := s.node.consensus.ApplyRequestTimeout(time.Duration(req.TimeoutMS) * time.Millisecond)
+	_, err := s.node.applyBaseRequestTimeout(time.Duration(req.TimeoutMS)*time.Millisecond, "learning-recommendation")
 	if err != nil {
 		return nil, grpcstatus.Errorf(codes.InvalidArgument, "apply timeout: %v", err)
 	}
-	s.node.configuration = config
-	fmt.Printf("[learning] applied SmartBFT request timeout: node=%d total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d\n",
-		s.node.id, req.TimeoutMS, config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds())
 	return &grpcAck{}, nil
 }
 
@@ -1271,9 +1433,7 @@ func (c *networkSmallBankClient) startReplyServer() error {
 	c.replyServer = grpc.NewServer(grpc.ForceServerCodec(smallBankCodec))
 	c.replyServer.RegisterService(&smallBankClientServiceDesc, &clientReplyServer{tracker: c.replyTracker})
 	go func() {
-		if err := c.replyServer.Serve(listener); err != nil && err != grpc.ErrServerStopped {
-			fmt.Printf("[network] client reply server failed: %v\n", err)
-		}
+		_ = c.replyServer.Serve(listener)
 	}()
 	fmt.Printf("SmartBFT SmallBank client reply listener: address=%s quorum=%d\n", c.replyAddress, c.replyQuorum())
 	return nil

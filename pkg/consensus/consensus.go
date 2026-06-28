@@ -26,24 +26,27 @@ import (
 // and delivers to the application proposals by invoking Deliver() on it.
 // The proposals contain batches of requests assembled together by the Assembler.
 type Consensus struct {
-	Config             types.Configuration
-	Application        bft.Application
-	Assembler          bft.Assembler
-	WAL                bft.WriteAheadLog
-	WALInitialContent  [][]byte
-	Comm               bft.Comm
-	Signer             bft.Signer
-	Verifier           bft.Verifier
-	MembershipNotifier bft.MembershipNotifier
-	RequestInspector   bft.RequestInspector
-	Synchronizer       bft.Synchronizer
-	Logger             bft.Logger
-	Metrics            *bft.Metrics
-	Metadata           *protos.ViewMetadata
-	LastProposal       types.Proposal
-	LastSignatures     []types.Signature
-	Scheduler          <-chan time.Time
-	ViewChangerTicker  <-chan time.Time
+	Config                    types.Configuration
+	Application               bft.Application
+	Assembler                 bft.Assembler
+	WAL                       bft.WriteAheadLog
+	WALInitialContent         [][]byte
+	Comm                      bft.Comm
+	Signer                    bft.Signer
+	Verifier                  bft.Verifier
+	MembershipNotifier        bft.MembershipNotifier
+	RequestInspector          bft.RequestInspector
+	Synchronizer              bft.Synchronizer
+	Logger                    bft.Logger
+	Metrics                   *bft.Metrics
+	Metadata                  *protos.ViewMetadata
+	LastProposal              types.Proposal
+	LastSignatures            []types.Signature
+	Scheduler                 <-chan time.Time
+	ViewChangerTicker         <-chan time.Time
+	RequestTimeout            func(view uint64)
+	ViewEvent                 func(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string)
+	ExternalViewChangeBackoff bool
 
 	submittedChan chan struct{}
 	inFlight      *algorithm.InFlightData
@@ -355,6 +358,69 @@ func (c *Consensus) ApplyRequestTimeout(timeout time.Duration) (types.Configurat
 	return next, nil
 }
 
+// ApplyViewChangeTimeout updates the base view-change timeout at runtime.
+func (c *Consensus) ApplyViewChangeTimeout(timeout time.Duration) (types.Configuration, error) {
+	if timeout <= 0 {
+		return c.Config, fmt.Errorf("view change timeout must be positive: %s", timeout)
+	}
+
+	c.consensusLock.Lock()
+	defer c.consensusLock.Unlock()
+
+	if c.viewChanger == nil {
+		return c.Config, errors.New("consensus is not started")
+	}
+
+	next := c.Config
+	next.ViewChangeTimeout = timeout
+	if next.ViewChangeResendInterval > timeout {
+		next.ViewChangeResendInterval = timeout
+	}
+	if err := next.Validate(); err != nil {
+		return c.Config, fmt.Errorf("recommended view change timeout creates invalid configuration: %w", err)
+	}
+
+	c.Config = next
+	c.viewChanger.ViewChangeTimeout = next.ViewChangeTimeout
+	c.viewChanger.ResendTimeout = next.ViewChangeResendInterval
+
+	return next, nil
+}
+
+// ApplyViewChangeResendInterval updates the view-change resend interval at runtime.
+func (c *Consensus) ApplyViewChangeResendInterval(interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("view change resend interval must be positive: %s", interval)
+	}
+
+	c.consensusLock.Lock()
+	defer c.consensusLock.Unlock()
+
+	if c.viewChanger == nil {
+		return errors.New("consensus is not started")
+	}
+
+	c.viewChanger.ResendTimeout = interval
+	return nil
+}
+
+// ApplyViewChangeBackoffFactor updates SmartBFT's view-change timeout multiplier.
+func (c *Consensus) ApplyViewChangeBackoffFactor(factor uint64) error {
+	if factor == 0 {
+		return errors.New("view change backoff factor must be positive")
+	}
+
+	c.consensusLock.Lock()
+	defer c.consensusLock.Unlock()
+
+	if c.viewChanger == nil {
+		return errors.New("consensus is not started")
+	}
+
+	c.viewChanger.SetBackOffFactor(factor)
+	return nil
+}
+
 func splitRequestTimeout(timeout time.Duration) (forward, complain time.Duration) {
 	forward = timeout / 2
 	if forward <= 0 {
@@ -452,10 +518,12 @@ func (c *Consensus) createComponents() {
 		Ticker:            c.ViewChangerTicker,
 		ResendTimeout:     c.Config.ViewChangeResendInterval,
 		ViewChangeTimeout: c.Config.ViewChangeTimeout,
+		ExternalBackoff:   c.ExternalViewChangeBackoff,
 		InMsqQSize:        int(c.Config.IncomingMessageBufferSize),
 		MetricsViewChange: c.Metrics.MetricsViewChange,
 		MetricsBlacklist:  c.Metrics.MetricsBlacklist,
 		MetricsView:       c.Metrics.MetricsView,
+		ViewEvent:         c.ViewEvent,
 	}
 
 	c.collector = &algorithm.StateCollector{
@@ -488,6 +556,8 @@ func (c *Consensus) createComponents() {
 		State:              c.state,
 		InFlight:           c.inFlight,
 		MetricsView:        c.Metrics.MetricsView,
+		RequestTimeout:     c.RequestTimeout,
+		ViewEvent:          c.ViewEvent,
 	}
 	c.controller.Deliver = &algorithm.MutuallyExclusiveDeliver{C: c.controller}
 

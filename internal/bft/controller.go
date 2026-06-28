@@ -6,6 +6,7 @@
 package bft
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -114,6 +115,8 @@ type Controller struct {
 	State              State
 	InFlight           *InFlightData
 	MetricsView        *api.MetricsView
+	RequestTimeout     func(view uint64)
+	ViewEvent          func(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string)
 	quorum             int
 
 	currView Proposer
@@ -222,6 +225,12 @@ func (c *Controller) setCurrentDecisionsInView(decisions uint64) {
 	c.currDecisionsInView = decisions
 }
 
+func (c *Controller) emitViewEvent(event string, currentView uint64, nextView uint64, proposalSeq uint64, detail string) {
+	if c.ViewEvent != nil {
+		c.ViewEvent(event, c.ID, currentView, nextView, proposalSeq, 0, detail)
+	}
+}
+
 // thread safe
 func (c *Controller) iAmTheLeader() (bool, uint64) {
 	leader := c.leaderID()
@@ -274,6 +283,10 @@ func (c *Controller) addRequest(info types.RequestInfo, request []byte) error {
 // OnRequestTimeout is called when request-timeout expires and forwards the request to leader.
 // Called by the request-pool timeout goroutine. Upon return, the leader-forward timeout is started.
 func (c *Controller) OnRequestTimeout(request []byte, info types.RequestInfo) {
+	if c.RequestTimeout != nil {
+		c.RequestTimeout(c.getCurrentViewNumber())
+	}
+
 	iAm, leaderID := c.iAmTheLeader()
 	if iAm {
 		c.Logger.Infof("Request %s timeout expired, this node is the leader, nothing to do", info)
@@ -295,6 +308,8 @@ func (c *Controller) OnLeaderFwdRequestTimeout(request []byte, info types.Reques
 	}
 
 	c.Logger.Warnf("Request %s leader-forwarding timeout expired, complaining about leader: %d", info, leaderID)
+	view := c.getCurrentViewNumber()
+	c.emitViewEvent("request_complain", view, view+1, 0, fmt.Sprintf("leader=%d", leaderID))
 	c.FailureDetector.Complain(c.getCurrentViewNumber(), true)
 }
 
@@ -330,6 +345,9 @@ func (c *Controller) ProcessMessages(sender uint64, m *protos.Message) {
 	c.Logger.Debugf("%d got message from %d: %s", c.ID, sender, MsgToString(m))
 	switch m.GetContent().(type) {
 	case *protos.Message_PrePrepare, *protos.Message_Prepare, *protos.Message_Commit:
+		if c.dropStaleConsensusMessage(sender, m) {
+			return
+		}
 		c.currViewLock.RLock()
 		view := c.currView
 		c.currViewLock.RUnlock()
@@ -349,6 +367,21 @@ func (c *Controller) ProcessMessages(sender uint64, m *protos.Message) {
 	default:
 		c.Logger.Warnf("Unexpected message type, ignoring")
 	}
+}
+
+func (c *Controller) dropStaleConsensusMessage(sender uint64, m *protos.Message) bool {
+	msgView := viewNumber(m)
+	c.currViewLock.RLock()
+	currentView := c.currViewNumber
+	c.currViewLock.RUnlock()
+	if msgView < currentView {
+		logViewDiag(
+			"event=consensus_message_drop_stale node=%d sender=%d message=%s current_view=%d",
+			c.ID, sender, internalMessageSummary(m), currentView,
+		)
+		return true
+	}
+	return false
 }
 
 func (c *Controller) respondToStateTransferRequest(sender uint64) {
@@ -400,6 +433,7 @@ func (c *Controller) startView(proposalSequence uint64) {
 		role = Leader
 	}
 	c.LeaderMonitor.ChangeRole(role, c.currViewNumber, c.leaderID())
+	c.emitViewEvent("start_view", c.currViewNumber, c.currViewNumber, proposalSequence, fmt.Sprintf("leader=%d decisions_in_view=%d", c.leaderID(), c.currDecisionsInView))
 	c.Logger.Infof("Starting view with number %d, sequence %d, and decisions %d", c.currViewNumber, proposalSequence, c.currDecisionsInView)
 }
 
@@ -427,6 +461,8 @@ func (c *Controller) changeView(newViewNumber uint64, newProposalSequence uint64
 	c.setCurrentDecisionsInView(newDecisionsInView)
 	c.Logger.Debugf("Starting view after setting decisions in view to %d", newDecisionsInView)
 	c.startView(newProposalSequence)
+	c.Logger.Debugf("Restarting request timers after starting view %d", newViewNumber)
+	c.RequestPool.RestartTimers()
 
 	if iAm, _ := c.iAmTheLeader(); iAm {
 		c.Batcher.Reset()
@@ -434,22 +470,51 @@ func (c *Controller) changeView(newViewNumber uint64, newProposalSequence uint64
 }
 
 func (c *Controller) abortView(view uint64) bool {
+	start := time.Now()
 	currView := c.getCurrentViewNumber()
 	c.Logger.Debugf("view for abort %d, current view %d", view, currView)
+	logViewDiag(
+		"event=controller_abort_inner_start node=%d requested_view=%d current_view=%d",
+		c.ID, view, currView,
+	)
 
 	if view < currView {
 		c.Logger.Debugf("Was asked to abort view %d but the current view with number %d", view, currView)
+		logViewDiag(
+			"event=controller_abort_inner_done node=%d requested_view=%d current_view=%d result=stale duration_ms=%d",
+			c.ID, view, currView, time.Since(start).Milliseconds(),
+		)
 		return false
 	}
 
 	// Drain the leader token in case we held it,
 	// so we won't start proposing after view change.
+	logViewDiag(
+		"event=controller_abort_inner_relinquish_start node=%d requested_view=%d current_view=%d",
+		c.ID, view, currView,
+	)
 	c.relinquishLeaderToken()
+	logViewDiag(
+		"event=controller_abort_inner_relinquish_done node=%d requested_view=%d current_view=%d",
+		c.ID, view, currView,
+	)
 
 	// Kill current view
 	c.Logger.Debugf("Aborting current view with number %d", c.currViewNumber)
+	logViewDiag(
+		"event=controller_abort_inner_curr_view_abort_start node=%d requested_view=%d current_view=%d",
+		c.ID, view, currView,
+	)
 	c.currView.Abort()
+	logViewDiag(
+		"event=controller_abort_inner_curr_view_abort_done node=%d requested_view=%d current_view=%d",
+		c.ID, view, currView,
+	)
 
+	logViewDiag(
+		"event=controller_abort_inner_done node=%d requested_view=%d current_view=%d result=aborted duration_ms=%d",
+		c.ID, view, currView, time.Since(start).Milliseconds(),
+	)
 	return true
 }
 
@@ -465,14 +530,35 @@ func (c *Controller) Sync() {
 func (c *Controller) AbortView(view uint64) {
 	c.Logger.Debugf("AbortView, the current view num is %d", c.getCurrentViewNumber())
 
+	logViewDiag(
+		"event=controller_abort_view_start node=%d requested_view=%d current_view=%d abort_queue_len=%d abort_queue_cap=%d",
+		c.ID, view, c.getCurrentViewNumber(), len(c.abortViewChan), cap(c.abortViewChan),
+	)
+	logViewDiag(
+		"event=controller_abort_view_batcher_close_start node=%d requested_view=%d current_view=%d",
+		c.ID, view, c.getCurrentViewNumber(),
+	)
 	c.Batcher.Close()
+	logViewDiag(
+		"event=controller_abort_view_batcher_close_done node=%d requested_view=%d current_view=%d",
+		c.ID, view, c.getCurrentViewNumber(),
+	)
 
+	logViewDiag(
+		"event=controller_abort_view_send_start node=%d requested_view=%d current_view=%d abort_queue_len=%d abort_queue_cap=%d",
+		c.ID, view, c.getCurrentViewNumber(), len(c.abortViewChan), cap(c.abortViewChan),
+	)
 	c.abortViewChan <- view
+	logViewDiag(
+		"event=controller_abort_view_send_done node=%d requested_view=%d current_view=%d abort_queue_len=%d abort_queue_cap=%d",
+		c.ID, view, c.getCurrentViewNumber(), len(c.abortViewChan), cap(c.abortViewChan),
+	)
 }
 
 // ViewChanged makes the controller abort the current view and start a new one with the given numbers
 func (c *Controller) ViewChanged(newViewNumber uint64, newProposalSequence uint64) {
 	c.Logger.Debugf("ViewChanged, the new view is %d", newViewNumber)
+	c.emitViewEvent("controller_view_changed", c.getCurrentViewNumber(), newViewNumber, newProposalSequence, "")
 	amILeader, _ := c.iAmTheLeader()
 	if amILeader {
 		c.Batcher.Close()
@@ -505,17 +591,76 @@ func (c *Controller) run() {
 	for {
 		select {
 		case d := <-c.decisionChan:
+			branchStart := time.Now()
+			proposalForLog := &protos.Proposal{
+				Header:               d.proposal.Header,
+				Payload:              d.proposal.Payload,
+				Metadata:             d.proposal.Metadata,
+				VerificationSequence: uint64(d.proposal.VerificationSequence),
+			}
+			logViewDiag(
+				"event=controller_branch_start node=%d branch=decision current_view=%d proposal={%s}",
+				c.ID, c.getCurrentViewNumber(), proposalMetadataSummary(proposalForLog),
+			)
 			c.decide(d)
+			logViewDiag(
+				"event=controller_branch_done node=%d branch=decision current_view=%d duration_ms=%d",
+				c.ID, c.getCurrentViewNumber(), time.Since(branchStart).Milliseconds(),
+			)
 		case newView := <-c.viewChange:
+			branchStart := time.Now()
+			logViewDiag(
+				"event=controller_branch_start node=%d branch=view_change current_view=%d target_view=%d target_seq=%d",
+				c.ID, c.getCurrentViewNumber(), newView.viewNumber, newView.proposalSeq,
+			)
 			c.Logger.Debugf("get newView from viewChange")
 			c.changeView(newView.viewNumber, newView.proposalSeq, 0)
+			logViewDiag(
+				"event=controller_branch_done node=%d branch=view_change current_view=%d target_view=%d target_seq=%d duration_ms=%d",
+				c.ID, c.getCurrentViewNumber(), newView.viewNumber, newView.proposalSeq, time.Since(branchStart).Milliseconds(),
+			)
 		case view := <-c.abortViewChan:
+			branchStart := time.Now()
+			logViewDiag(
+				"event=controller_branch_start node=%d branch=abort current_view=%d requested_view=%d abort_queue_len=%d abort_queue_cap=%d",
+				c.ID, c.getCurrentViewNumber(), view, len(c.abortViewChan), cap(c.abortViewChan),
+			)
+			logViewDiag(
+				"event=controller_abort_view_recv node=%d requested_view=%d current_view=%d abort_queue_len=%d abort_queue_cap=%d",
+				c.ID, view, c.getCurrentViewNumber(), len(c.abortViewChan), cap(c.abortViewChan),
+			)
 			c.abortView(view)
+			logViewDiag(
+				"event=controller_abort_view_done node=%d requested_view=%d current_view=%d abort_queue_len=%d abort_queue_cap=%d",
+				c.ID, view, c.getCurrentViewNumber(), len(c.abortViewChan), cap(c.abortViewChan),
+			)
+			logViewDiag(
+				"event=controller_branch_done node=%d branch=abort current_view=%d requested_view=%d duration_ms=%d abort_queue_len=%d abort_queue_cap=%d",
+				c.ID, c.getCurrentViewNumber(), view, time.Since(branchStart).Milliseconds(), len(c.abortViewChan), cap(c.abortViewChan),
+			)
 		case <-c.stopChan:
+			logViewDiag(
+				"event=controller_branch_start node=%d branch=stop current_view=%d",
+				c.ID, c.getCurrentViewNumber(),
+			)
 			return
 		case <-c.leaderToken:
+			branchStart := time.Now()
+			logViewDiag(
+				"event=controller_branch_start node=%d branch=propose current_view=%d batcher_closed=%t stopped=%t",
+				c.ID, c.getCurrentViewNumber(), c.Batcher.Closed(), c.stopped(),
+			)
 			c.propose()
+			logViewDiag(
+				"event=controller_branch_done node=%d branch=propose current_view=%d duration_ms=%d batcher_closed=%t stopped=%t",
+				c.ID, c.getCurrentViewNumber(), time.Since(branchStart).Milliseconds(), c.Batcher.Closed(), c.stopped(),
+			)
 		case <-c.syncChan:
+			branchStart := time.Now()
+			logViewDiag(
+				"event=controller_branch_start node=%d branch=sync current_view=%d",
+				c.ID, c.getCurrentViewNumber(),
+			)
 			c.Logger.Debugf("get msg from syncChan")
 			view, seq, dec := c.sync()
 			c.MaybePruneRevokedRequests()
@@ -529,6 +674,10 @@ func (c *Controller) run() {
 				}
 				c.changeView(c.getCurrentViewNumber(), vs.(ViewSequence).ProposalSeq, c.getCurrentDecisionsInView())
 			}
+			logViewDiag(
+				"event=controller_branch_done node=%d branch=sync current_view=%d sync_view=%d sync_seq=%d sync_decisions=%d duration_ms=%d",
+				c.ID, c.getCurrentViewNumber(), view, seq, dec, time.Since(branchStart).Milliseconds(),
+			)
 		}
 	}
 }
@@ -557,8 +706,6 @@ func (c *Controller) decide(d decision) {
 	if c.checkIfRotate(md.BlackList) {
 		c.Logger.Debugf("Restarting view to rotate the leader")
 		c.changeView(c.getCurrentViewNumber(), md.LatestSequence+1, c.getCurrentDecisionsInView())
-		c.Logger.Debugf("Restarting timers in request pool due to leader rotation")
-		c.RequestPool.RestartTimers()
 	}
 	c.MaybePruneRevokedRequests()
 	if iAm, _ := c.iAmTheLeader(); iAm {
@@ -592,6 +739,15 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 
 	c.syncLock.Lock()
 	defer c.syncLock.Unlock()
+	controllerViewNum := c.currViewNumber
+	controllerSequence := c.latestSeq()
+	c.emitViewEvent(
+		"sync_start",
+		controllerViewNum,
+		controllerViewNum,
+		controllerSequence,
+		fmt.Sprintf("decisions_in_view=%d", c.getCurrentDecisionsInView()),
+	)
 
 	syncResponse := c.Synchronizer.Sync()
 	if syncResponse.Reconfig.InReplicatedDecisions {
@@ -615,6 +771,13 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 	if len(latestDecision.Proposal.Metadata) == 0 {
 		c.Logger.Infof("Synchronizer returned with an empty proposal metadata")
 		latestDecisionMetadata = nil
+		c.emitViewEvent(
+			"sync_latest_decision",
+			controllerViewNum,
+			controllerViewNum,
+			controllerSequence,
+			"empty_metadata=true",
+		)
 	} else {
 		md := &protos.ViewMetadata{}
 		if err := proto.Unmarshal(latestDecision.Proposal.Metadata, md); err != nil {
@@ -624,12 +787,17 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 		latestDecisionViewNum = md.ViewId
 		latestDecisionDecisions = md.DecisionsInView
 		latestDecisionMetadata = md
+		c.emitViewEvent(
+			"sync_latest_decision",
+			controllerViewNum,
+			latestDecisionViewNum,
+			latestDecisionSeq,
+			fmt.Sprintf("decisions_in_view=%d local_seq=%d", latestDecisionDecisions, controllerSequence),
+		)
 	}
 
-	controllerSequence := c.latestSeq()
 	newProposalSequence = controllerSequence + 1
 
-	controllerViewNum := c.currViewNumber
 	newViewNum = controllerViewNum
 
 	newDecisionsInView = c.getCurrentDecisionsInView()
@@ -651,12 +819,40 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 	response := c.fetchState()
 	if response == nil {
 		c.Logger.Infof("Fetching state failed")
+		c.emitViewEvent(
+			"sync_fetch_state_failed",
+			controllerViewNum,
+			newViewNum,
+			newProposalSequence,
+			fmt.Sprintf("latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
+		)
 		if latestDecisionMetadata == nil || latestDecisionViewNum < controllerViewNum {
 			// And the synchronizer did not return a new view
+			c.emitViewEvent(
+				"sync_no_progress",
+				controllerViewNum,
+				newViewNum,
+				newProposalSequence,
+				fmt.Sprintf("reason=fetch_failed_no_new_view latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
+			)
 			return 0, 0, 0
 		}
 	} else {
+		c.emitViewEvent(
+			"sync_fetch_state_result",
+			controllerViewNum,
+			response.View,
+			response.Seq,
+			fmt.Sprintf("latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
+		)
 		if response.View <= controllerViewNum && latestDecisionViewNum < controllerViewNum {
+			c.emitViewEvent(
+				"sync_no_progress",
+				controllerViewNum,
+				response.View,
+				response.Seq,
+				fmt.Sprintf("reason=response_not_newer latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
+			)
 			return 0, 0, 0 // no new view to report
 		}
 		if response.View > newViewNum && response.Seq == latestDecisionSeq+1 {
@@ -684,7 +880,22 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 
 	if newViewNum > controllerViewNum {
 		c.Logger.Debugf("Node %d is informing the view changer of view %d after sync of view %d and seq %d", c.ID, newViewNum, latestDecisionViewNum, latestDecisionSeq)
+		c.emitViewEvent(
+			"sync_inform_new_view",
+			controllerViewNum,
+			newViewNum,
+			newProposalSequence,
+			fmt.Sprintf("latest_decision_view=%d latest_decision_seq=%d decisions_in_view=%d", latestDecisionViewNum, latestDecisionSeq, newDecisionsInView),
+		)
 		c.ViewChanger.InformNewView(newViewNum)
+	} else {
+		c.emitViewEvent(
+			"sync_no_progress",
+			controllerViewNum,
+			newViewNum,
+			newProposalSequence,
+			fmt.Sprintf("reason=no_newer_view latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
+		)
 	}
 
 	return newViewNum, newProposalSequence, newDecisionsInView

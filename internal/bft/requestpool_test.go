@@ -186,12 +186,14 @@ func TestReqPoolCapacity(t *testing.T) {
 		wg.Add(2 * numReq)
 		for i := range numReq {
 			go func(i string) {
+				defer wg.Done()
 				byteReq := makeTestRequest(i, i, "foo")
 				err := pool.Submit(byteReq)
 
-				if err == nil ||
-					errors.Is(err, bft.ErrReqAlreadyProcessed) {
-					wg.Done()
+				if err != nil &&
+					!errors.Is(err, bft.ErrSubmitTimeout) &&
+					!errors.Is(err, bft.ErrReqAlreadyProcessed) {
+					t.Errorf("unexpected submit error: %v", err)
 				}
 			}(fmt.Sprintf("%d", i))
 		}

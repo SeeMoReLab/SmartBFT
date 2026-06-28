@@ -189,6 +189,7 @@ func (v *View) HandleMessage(sender uint64, m *protos.Message) {
 	case <-v.abortChan:
 		return
 	case v.incMsgs <- msg:
+		logInternalQueueEnqueue("view", v.SelfID, sender, m, len(v.incMsgs), cap(v.incMsgs))
 	}
 }
 

@@ -17,13 +17,20 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+type smallBankLogMode int
+
+const (
+	smallBankLogModeQuiet smallBankLogMode = iota
+	smallBankLogModeDebug
+)
+
 type cluster struct {
 	nodes   map[uint64]*node
 	pending *pendingTracker
 	logger  smart.Logger
 }
 
-func newCluster(numNodes int, opts nodeOptions, testDir string, verbose bool) (*cluster, error) {
+func newCluster(numNodes int, opts nodeOptions, testDir string, logMode smallBankLogMode) (*cluster, error) {
 	if numNodes < 4 {
 		return nil, fmt.Errorf("SmartBFT requires at least 4 nodes for this example")
 	}
@@ -37,7 +44,7 @@ func newCluster(numNodes int, opts nodeOptions, testDir string, verbose bool) (*
 		opts.NumNodes = numNodes
 	}
 
-	logger := newSmallBankLogger(verbose)
+	logger := newSmallBankLogger(logMode)
 
 	channels := make(map[uint64]chan wireMessage)
 	for id := 1; id <= numNodes; id++ {
@@ -54,28 +61,41 @@ func newCluster(numNodes int, opts nodeOptions, testDir string, verbose bool) (*
 	bftMet := smart.NewMetrics(met, "smallbank")
 
 	for id := 1; id <= numNodes; id++ {
+		nodeID := uint64(id)
 		out := make(map[uint64]chan<- wireMessage)
 		for targetID, ch := range channels {
-			if targetID == uint64(id) {
+			if targetID == nodeID {
 				continue
 			}
 			out[targetID] = ch
 		}
 
 		nodeOpts := opts
-		learning, err := newLearningManager(c.optsLearningForNode(opts, uint64(id)))
+		var localNode *node
+		learningOpts := c.optsLearningForNode(opts, nodeID)
+		if learningOpts.Enabled {
+			learningOpts.ApplyTimeout = func(timeout time.Duration) error {
+				if localNode == nil {
+					return fmt.Errorf("node %d not initialized", nodeID)
+				}
+				_, err := localNode.applyBaseRequestTimeout(timeout, "learning-recommendation")
+				return err
+			}
+		}
+		learning, err := newLearningManager(learningOpts)
 		if err != nil {
 			c.stop()
-			return nil, fmt.Errorf("create learning manager for node %d: %w", id, err)
+			return nil, fmt.Errorf("create learning manager for node %d: %w", nodeID, err)
 		}
 		nodeOpts.Learning = learning
-		n, err := newNode(uint64(id), channels[uint64(id)], out, c.pending, logger, walMet, bftMet, nodeOpts, testDir)
+		n, err := newNode(nodeID, channels[nodeID], out, c.pending, logger, walMet, bftMet, nodeOpts, testDir)
 		if err != nil {
 			nodeOpts.Learning.close()
 			c.stop()
 			return nil, err
 		}
-		c.nodes[uint64(id)] = n
+		localNode = n
+		c.nodes[nodeID] = n
 	}
 
 	return c, nil
@@ -93,25 +113,7 @@ func (c *cluster) optsLearningForNode(opts nodeOptions, nodeID uint64) learningO
 		return learningOptions{}
 	}
 	learning.NodeID = nodeID
-	learning.ApplyTimeout = c.applyRecommendedPBFTTimeout
 	return learning
-}
-
-func (c *cluster) applyRecommendedPBFTTimeout(timeout time.Duration) error {
-	var firstErr error
-	for id, n := range c.nodes {
-		config, err := n.consensus.ApplyRequestTimeout(timeout)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("node %d: %w", id, err)
-			}
-			continue
-		}
-		n.configuration = config
-		fmt.Printf("[learning] applied SmartBFT request timeout: node=%d total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d\n",
-			id, timeout.Milliseconds(), config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds())
-	}
-	return firstErr
 }
 
 func (c *cluster) stop() {
@@ -176,15 +178,7 @@ func (c *cluster) stateChecksums() map[uint64]string {
 	checksums := make(map[uint64]string, len(c.nodes))
 	for id, n := range c.nodes {
 		n.stateLock.Lock()
-		raw := mustJSON(struct {
-			Accounts map[uint64]string `json:"accounts"`
-			Checking map[uint64]int64  `json:"checking"`
-			Savings  map[uint64]int64  `json:"savings"`
-		}{
-			Accounts: n.state.accounts,
-			Checking: n.state.checking,
-			Savings:  n.state.savings,
-		})
+		raw := mustJSON(n.state.deterministicSnapshot())
 		n.stateLock.Unlock()
 		checksums[id] = hashBytes(raw)
 	}
@@ -224,18 +218,18 @@ func (discardWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func newSmallBankLogger(verbose bool) smart.Logger {
-	level := zap.NewAtomicLevelAt(zapcore.PanicLevel)
-	if verbose {
-		level.SetLevel(zapcore.InfoLevel)
+func newSmallBankLogger(logMode smallBankLogMode) smart.Logger {
+	if logMode == smallBankLogModeDebug {
+		zapLogger, _ := zap.NewDevelopment()
+		return zapLogger.Sugar()
 	}
+
+	level := zap.NewAtomicLevelAt(zapcore.PanicLevel)
+	writer := zapcore.AddSync(discardWriter{})
 	zapLogger := zap.New(zapcore.NewCore(
 		zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()),
-		zapcore.AddSync(zapcore.Lock(zapcore.AddSync(discardWriter{}))),
+		zapcore.AddSync(zapcore.Lock(writer)),
 		level,
 	))
-	if verbose {
-		zapLogger, _ = zap.NewDevelopment()
-	}
 	return zapLogger.Sugar()
 }

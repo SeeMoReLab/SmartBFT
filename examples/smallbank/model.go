@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 )
 
 type txType string
@@ -127,6 +128,13 @@ type smallBankState struct {
 	savings  map[uint64]int64
 }
 
+type accountSnapshot struct {
+	CustomerID           uint64 `json:"customer_id"`
+	CustomerName         string `json:"customer_name"`
+	CheckingBalanceCents int64  `json:"checking_balance_cents"`
+	SavingsBalanceCents  int64  `json:"savings_balance_cents"`
+}
+
 func newSmallBankState() *smallBankState {
 	return &smallBankState{
 		accounts: make(map[uint64]string),
@@ -212,6 +220,25 @@ func (s *smallBankState) apply(req request) response {
 func (s *smallBankState) accountExists(id uint64) bool {
 	_, exists := s.accounts[id]
 	return exists
+}
+
+func (s *smallBankState) deterministicSnapshot() []accountSnapshot {
+	ids := make([]uint64, 0, len(s.accounts))
+	for id := range s.accounts {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	snapshot := make([]accountSnapshot, 0, len(ids))
+	for _, id := range ids {
+		snapshot = append(snapshot, accountSnapshot{
+			CustomerID:           id,
+			CustomerName:         s.accounts[id],
+			CheckingBalanceCents: s.checking[id],
+			SavingsBalanceCents:  s.savings[id],
+		})
+	}
+	return snapshot
 }
 
 func (r response) withError(status responseStatus, message string) response {

@@ -223,3 +223,223 @@ func TestLearningApplyRecommendedTimeoutCallsCallback(t *testing.T) {
 		t.Fatalf("currentTimeout = %s, want 400ms", manager.currentTimeout)
 	}
 }
+
+func TestRequestTimeoutBackoffGrowsOnNoProgressViewsUntilCommitThenDecays(t *testing.T) {
+	backoff, err := newRequestTimeoutBackoff(700*time.Millisecond, requestTimeoutBackoffOptions{
+		Enabled:    true,
+		MaxTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("create backoff: %v", err)
+	}
+
+	assertState := func(multiplier int, effective time.Duration) {
+		t.Helper()
+		state := backoff.state()
+		if state.Multiplier != multiplier {
+			t.Fatalf("multiplier = %d, want %d", state.Multiplier, multiplier)
+		}
+		if state.EffectiveTimeout != effective {
+			t.Fatalf("effective = %s, want %s", state.EffectiveTimeout, effective)
+		}
+	}
+
+	update := backoff.onNoProgressViewChange(1)
+	if update.Apply {
+		t.Fatalf("first no-progress view should keep regular timeout")
+	}
+	assertState(1, 700*time.Millisecond)
+
+	update = backoff.onNoProgressViewChange(2)
+	if !update.Apply {
+		t.Fatalf("second consecutive no-progress view should apply 2x")
+	}
+	assertState(2, 1400*time.Millisecond)
+
+	backoff.onNoProgressViewChange(3)
+	assertState(4, 2800*time.Millisecond)
+
+	backoff.onNoProgressViewChange(4)
+	assertState(8, 5600*time.Millisecond)
+
+	update = backoff.onCommit(5, 10)
+	if !update.Decayed {
+		t.Fatalf("commit after no-progress views should report decay")
+	}
+	if update.Previous.Multiplier != 8 || update.State.Multiplier != 7 {
+		t.Fatalf("decay multiplier = %d -> %d, want 8 -> 7", update.Previous.Multiplier, update.State.Multiplier)
+	}
+	assertState(7, 4900*time.Millisecond)
+
+	backoff.onCommit(5, 11)
+	assertState(6, 4200*time.Millisecond)
+
+	backoff.onCommit(5, 12)
+	assertState(5, 3500*time.Millisecond)
+
+	update = backoff.onNoProgressViewChange(6)
+	if update.Apply {
+		t.Fatalf("first no-progress view after commit should keep current multiplier")
+	}
+	assertState(5, 3500*time.Millisecond)
+
+	backoff.onNoProgressViewChange(7)
+	assertState(10, 7*time.Second)
+}
+
+func TestRequestTimeoutBackoffIgnoresDuplicateNoProgressViews(t *testing.T) {
+	backoff, err := newRequestTimeoutBackoff(700*time.Millisecond, requestTimeoutBackoffOptions{
+		Enabled:    true,
+		MaxTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("create backoff: %v", err)
+	}
+
+	backoff.onNoProgressViewChange(1)
+	backoff.onNoProgressViewChange(1)
+	if got := backoff.state().Multiplier; got != 1 {
+		t.Fatalf("multiplier after duplicate target view 1 = %d, want 1", got)
+	}
+
+	backoff.onNoProgressViewChange(2)
+	backoff.onNoProgressViewChange(2)
+	if got := backoff.state().Multiplier; got != 2 {
+		t.Fatalf("multiplier after target view 2 and duplicate = %d, want 2", got)
+	}
+
+	backoff.onNoProgressViewChange(3)
+	if got := backoff.state().Multiplier; got != 4 {
+		t.Fatalf("multiplier after target view 3 = %d, want 4", got)
+	}
+}
+
+func TestRequestTimeoutBackoffCountsSkippedNoProgressViews(t *testing.T) {
+	backoff, err := newRequestTimeoutBackoff(700*time.Millisecond, requestTimeoutBackoffOptions{
+		Enabled:    true,
+		MaxTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("create backoff: %v", err)
+	}
+
+	backoff.onNoProgressViewChange(3)
+	state := backoff.state()
+	if state.Multiplier != 4 {
+		t.Fatalf("multiplier after jump to target view 3 = %d, want 4", state.Multiplier)
+	}
+	if state.EffectiveTimeout != 2800*time.Millisecond {
+		t.Fatalf("effective = %s, want 2800ms", state.EffectiveTimeout)
+	}
+}
+
+func TestRequestTimeoutBackoffRequestTimeoutDoesNotGrowMultiplier(t *testing.T) {
+	backoff, err := newRequestTimeoutBackoff(700*time.Millisecond, requestTimeoutBackoffOptions{
+		Enabled:    true,
+		MaxTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("create backoff: %v", err)
+	}
+
+	backoff.onRequestTimeout(1)
+	backoff.onRequestTimeout(2)
+	if got := backoff.state().Multiplier; got != 1 {
+		t.Fatalf("multiplier after request timeouts = %d, want 1", got)
+	}
+}
+
+func TestRequestTimeoutBackoffPreservesEffectiveTimeoutOnBaseChange(t *testing.T) {
+	backoff, err := newRequestTimeoutBackoff(700*time.Millisecond, requestTimeoutBackoffOptions{
+		Enabled:    true,
+		MaxTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("create backoff: %v", err)
+	}
+
+	backoff.onNoProgressViewChange(1)
+	backoff.onNoProgressViewChange(2)
+	backoff.onNoProgressViewChange(3)
+	backoff.onNoProgressViewChange(4)
+
+	update, err := backoff.setBaseTimeout(1900 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("set base: %v", err)
+	}
+	if !update.Apply {
+		t.Fatalf("base change should apply recomputed effective timeout")
+	}
+	if update.State.Multiplier != 3 {
+		t.Fatalf("multiplier = %d, want 3", update.State.Multiplier)
+	}
+	if update.State.EffectiveTimeout != 5700*time.Millisecond {
+		t.Fatalf("effective = %s, want 5700ms", update.State.EffectiveTimeout)
+	}
+	if update.State.EffectiveViewChangeTimeout != 5700*time.Millisecond {
+		t.Fatalf("effective view change = %s, want 5700ms", update.State.EffectiveViewChangeTimeout)
+	}
+}
+
+func TestRequestTimeoutBackoffClampsMultiplierToMaxTimeout(t *testing.T) {
+	backoff, err := newRequestTimeoutBackoff(700*time.Millisecond, requestTimeoutBackoffOptions{
+		Enabled:    true,
+		MaxTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("create backoff: %v", err)
+	}
+
+	for view := uint64(1); view <= 10; view++ {
+		backoff.onNoProgressViewChange(view)
+	}
+
+	state := backoff.state()
+	if state.Multiplier != 14 {
+		t.Fatalf("multiplier = %d, want 14", state.Multiplier)
+	}
+	if state.EffectiveTimeout != 9800*time.Millisecond {
+		t.Fatalf("effective = %s, want 9800ms", state.EffectiveTimeout)
+	}
+
+	update, err := backoff.setBaseTimeout(1900 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("set base: %v", err)
+	}
+	if update.State.Multiplier != 5 {
+		t.Fatalf("multiplier after base change = %d, want 5", update.State.Multiplier)
+	}
+	if update.State.EffectiveTimeout != 9500*time.Millisecond {
+		t.Fatalf("effective after base change = %s, want 9500ms", update.State.EffectiveTimeout)
+	}
+}
+
+func TestRequestTimeoutBackoffViewChangeResendIntervalUsesCappedMultiplier(t *testing.T) {
+	backoff, err := newRequestTimeoutBackoff(100*time.Millisecond, requestTimeoutBackoffOptions{
+		Enabled:    true,
+		MaxTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("create backoff: %v", err)
+	}
+
+	if got := backoff.state().EffectiveViewChangeResendInterval; got != 100*time.Millisecond {
+		t.Fatalf("initial resend interval = %s, want 100ms", got)
+	}
+
+	backoff.onNoProgressViewChange(1)
+	backoff.onNoProgressViewChange(2)
+	backoff.onNoProgressViewChange(3)
+	if got := backoff.state().EffectiveViewChangeResendInterval; got != 400*time.Millisecond {
+		t.Fatalf("resend interval after multiplier 4 = %s, want 400ms", got)
+	}
+
+	backoff.onNoProgressViewChange(4)
+	backoff.onNoProgressViewChange(5)
+	if got := backoff.state().EffectiveViewChangeResendInterval; got != time.Second {
+		t.Fatalf("capped resend interval = %s, want 1s", got)
+	}
+	if got := backoff.state().EffectiveViewChangeTimeout; got != 1600*time.Millisecond {
+		t.Fatalf("view change timeout should continue past resend cap = %s, want 1.6s", got)
+	}
+}

@@ -60,6 +60,7 @@ func (s *StateCollector) HandleMessage(sender uint64, m *protos.Message) {
 	case <-s.stopChan:
 		return
 	case s.incMsgs <- msg:
+		logInternalQueueEnqueue("statecollector", s.SelfID, sender, m, len(s.incMsgs), cap(s.incMsgs))
 	default: // if incMsgs is full do nothing
 		s.Logger.Debugf("Node %d reached default in handling state response: %v", s.SelfID, msg)
 	}

@@ -15,12 +15,59 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hyperledger-labs/SmartBFT/pkg/api"
 	"github.com/hyperledger-labs/SmartBFT/pkg/types"
 	protos "github.com/hyperledger-labs/SmartBFT/smartbftprotos"
 	"google.golang.org/protobuf/proto"
 )
+
+func logInternalQueueEnqueue(queueName string, selfID uint64, sender uint64, message *protos.Message, queueLen int, queueCap int) {
+	if queueLen <= 0 || queueLen%10 != 0 {
+		return
+	}
+	fmt.Printf("%s side=receiver queue=%s node=%d sender=%d message=%s queue_len=%d queue_cap=%d\n",
+		internalQueueLogTag(), queueName, selfID, sender, internalMessageSummary(message), queueLen, queueCap)
+}
+
+func logViewDiag(format string, args ...any) {
+	fmt.Printf("[viewdiag %s] %s\n", time.Now().Format("2006-01-02T15:04:05.000Z07:00"), fmt.Sprintf(format, args...))
+}
+
+func internalQueueLogTag() string {
+	return fmt.Sprintf("[queue %s]", time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
+}
+
+func internalMessageSummary(message *protos.Message) string {
+	if message == nil {
+		return "nil"
+	}
+	switch msg := message.GetContent().(type) {
+	case *protos.Message_PrePrepare:
+		return fmt.Sprintf("pre_prepare view=%d seq=%d", msg.PrePrepare.GetView(), msg.PrePrepare.GetSeq())
+	case *protos.Message_Prepare:
+		return fmt.Sprintf("prepare view=%d seq=%d", msg.Prepare.GetView(), msg.Prepare.GetSeq())
+	case *protos.Message_Commit:
+		return fmt.Sprintf("commit view=%d seq=%d", msg.Commit.GetView(), msg.Commit.GetSeq())
+	case *protos.Message_ViewChange:
+		return fmt.Sprintf("view_change next_view=%d", msg.ViewChange.GetNextView())
+	case *protos.Message_ViewData:
+		return "view_data"
+	case *protos.Message_NewView:
+		return fmt.Sprintf("new_view signatures=%d", len(msg.NewView.GetSignedViewData()))
+	case *protos.Message_HeartBeat:
+		return fmt.Sprintf("heartbeat view=%d seq=%d", msg.HeartBeat.GetView(), msg.HeartBeat.GetSeq())
+	case *protos.Message_HeartBeatResponse:
+		return fmt.Sprintf("heartbeat_response view=%d", msg.HeartBeatResponse.GetView())
+	case *protos.Message_StateTransferRequest:
+		return "state_transfer_request"
+	case *protos.Message_StateTransferResponse:
+		return fmt.Sprintf("state_transfer_response view=%d seq=%d", msg.StateTransferResponse.GetViewNum(), msg.StateTransferResponse.GetSequence())
+	default:
+		return "unknown"
+	}
+}
 
 type proposalInfo struct {
 	digest string
@@ -157,7 +204,79 @@ func (nv *nextViews) sendRecv(next uint64, sender uint64) bool {
 
 type incMsg struct {
 	*protos.Message
+	sender     uint64
+	enqueuedAt time.Time
+	coalesce   *viewMessageCoalesceKey
+}
+
+func messageKind(m *protos.Message) string {
+	if m == nil {
+		return "nil"
+	}
+	switch {
+	case m.GetPrePrepare() != nil:
+		return "pre_prepare"
+	case m.GetPrepare() != nil:
+		return "prepare"
+	case m.GetCommit() != nil:
+		return "commit"
+	case m.GetViewChange() != nil:
+		return "view_change"
+	case m.GetViewData() != nil:
+		return "view_data"
+	case m.GetNewView() != nil:
+		return "new_view"
+	case m.GetHeartBeat() != nil:
+		return "heartbeat"
+	case m.GetHeartBeatResponse() != nil:
+		return "heartbeat_response"
+	case m.GetStateTransferRequest() != nil:
+		return "state_transfer_request"
+	case m.GetStateTransferResponse() != nil:
+		return "state_transfer_response"
+	default:
+		return "unknown"
+	}
+}
+
+type viewMessageCoalesceKey struct {
 	sender uint64
+	kind   string
+	view   uint64
+}
+
+func viewMessageTargetView(m *protos.Message) (string, uint64, bool) {
+	if m == nil {
+		return "", 0, false
+	}
+	if vc := m.GetViewChange(); vc != nil {
+		return "view_change", vc.GetNextView(), true
+	}
+	if vd := m.GetViewData(); vd != nil {
+		target, ok := signedViewDataTargetView(vd)
+		return "view_data", target, ok
+	}
+	if nv := m.GetNewView(); nv != nil {
+		for _, svd := range nv.GetSignedViewData() {
+			target, ok := signedViewDataTargetView(svd)
+			if ok {
+				return "new_view", target, true
+			}
+		}
+		return "new_view", 0, false
+	}
+	return "", 0, false
+}
+
+func signedViewDataTargetView(svd *protos.SignedViewData) (uint64, bool) {
+	if svd == nil {
+		return 0, false
+	}
+	vd := &protos.ViewData{}
+	if err := proto.Unmarshal(svd.GetRawViewData(), vd); err != nil {
+		return 0, false
+	}
+	return vd.GetNextView(), true
 }
 
 // computeQuorum calculates the quorums size Q, given a cluster size N.

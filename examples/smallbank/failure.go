@@ -299,13 +299,13 @@ func (c *proposalDelayController) logPhaseChange(activePhase int, elapsedSinceSt
 		return
 	}
 	if activePhase < 0 {
-		fmt.Printf("Failure injection phase changed: inactive elapsed_since_start_ms=%d elapsed_since_warmup_ms=%d\n",
-			elapsedSinceStart.Milliseconds(), elapsedSinceWarmUp.Milliseconds())
+		fmt.Printf("%s injection phase changed: inactive elapsed_since_start_ms=%d elapsed_since_warmup_ms=%d\n",
+			timestampedLogTag("failure"), elapsedSinceStart.Milliseconds(), elapsedSinceWarmUp.Milliseconds())
 		return
 	}
 	phase := c.phases[activePhase]
-	fmt.Printf("Failure injection phase changed: index=%d start_offset_ms=%d elapsed_since_start_ms=%d elapsed_since_warmup_ms=%d\n",
-		activePhase, phase.startOffset.Milliseconds(), elapsedSinceStart.Milliseconds(), elapsedSinceWarmUp.Milliseconds())
+	fmt.Printf("%s injection phase changed: index=%d start_offset_ms=%d elapsed_since_start_ms=%d elapsed_since_warmup_ms=%d\n",
+		timestampedLogTag("failure"), activePhase, phase.startOffset.Milliseconds(), elapsedSinceStart.Milliseconds(), elapsedSinceWarmUp.Milliseconds())
 }
 
 func (c *proposalDelayController) pinnedLeaderWindow(activePhase int) map[uint64]time.Duration {

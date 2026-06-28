@@ -45,9 +45,11 @@ func main() {
 		maxReportLen   = flag.Uint64("learning-max-report-length", defaultLearningMaxReportLength, "maximum consensus ticks in one learning report window")
 		pollInterval   = flag.Duration("learning-poll-interval", defaultLearningPollInterval, "interval for polling the learning agent for timeout recommendations")
 		rpcTimeout     = flag.Duration("learning-rpc-timeout", defaultLearningRPCTimeout, "timeout for learning agent RPCs")
+		backoff        = flag.Bool("request-timeout-backoff", false, "enable request timeout backoff for SmartBFT forward/complain timers")
+		backoffMax     = flag.Duration("request-timeout-backoff-max", 10*time.Second, "maximum effective SmartBFT request timeout when backoff is enabled")
 		dataDir        = flag.String("data-dir", "", "directory for SmartBFT WAL data; defaults to a temporary directory")
 		keepData       = flag.Bool("keep-data", false, "keep generated WAL data when using a temporary data directory")
-		verbose        = flag.Bool("verbose", false, "enable SmartBFT logs")
+		verbose        = flag.Bool("verbose", false, "enable SmartBFT debug logs")
 	)
 	flag.Parse()
 
@@ -72,12 +74,20 @@ func main() {
 		PollInterval:       *pollInterval,
 		RPCTimeout:         *rpcTimeout,
 	}
+	backoffOptions := requestTimeoutBackoffOptions{
+		Enabled:    *backoff,
+		MaxTimeout: *backoffMax,
+	}
+	logMode := smallBankLogModeQuiet
+	if *verbose {
+		logMode = smallBankLogModeDebug
+	}
 
 	switch *role {
 	case "inprocess":
-		runInProcess(*configPath, *nodes, *batchSize, *batchTimeout, *requestTimeout, *create, *execute, *createWorkers, *startUnixMS, *failureSpec, *failureStartMS, learningOptions, *dataDir, *keepData, *verbose)
+		runInProcess(*configPath, *nodes, *batchSize, *batchTimeout, *requestTimeout, *create, *execute, *createWorkers, *startUnixMS, *failureSpec, *failureStartMS, learningOptions, backoffOptions, *dataDir, *keepData, logMode)
 	case "server":
-		runNetworkServer(*nodeID, *hostsConfig, *batchSize, *batchTimeout, *requestTimeout, *failureSpec, *failureStartMS, *startUnixMS, learningOptions, *dataDir, *keepData, *verbose)
+		runNetworkServer(*nodeID, *hostsConfig, *batchSize, *batchTimeout, *requestTimeout, *failureSpec, *failureStartMS, *startUnixMS, learningOptions, backoffOptions, *dataDir, *keepData, logMode)
 	case "client":
 		if !*create && !*execute {
 			*create = true
@@ -89,7 +99,7 @@ func main() {
 	}
 }
 
-func runInProcess(configPath string, nodes int, batchSize uint64, batchTimeout time.Duration, requestTimeout time.Duration, create bool, execute bool, createWorkers int, startUnixMS int64, failureSpec string, failureStartMS int64, learning learningOptions, dataDir string, keepData bool, verbose bool) {
+func runInProcess(configPath string, nodes int, batchSize uint64, batchTimeout time.Duration, requestTimeout time.Duration, create bool, execute bool, createWorkers int, startUnixMS int64, failureSpec string, failureStartMS int64, learning learningOptions, backoff requestTimeoutBackoffOptions, dataDir string, keepData bool, logMode smallBankLogMode) {
 	cfg, err := loadWorkloadConfig(configPath)
 	if err != nil {
 		fatalf("load config: %v", err)
@@ -119,7 +129,8 @@ func runInProcess(configPath string, nodes int, batchSize uint64, batchTimeout t
 		BatchTimeout:    batchTimeout,
 		Failures:        failures,
 		LearningOptions: learning,
-	}, dir, verbose)
+		Backoff:         backoff,
+	}, dir, logMode)
 	if err != nil {
 		fatalf("start cluster: %v", err)
 	}
@@ -143,7 +154,7 @@ func runInProcess(configPath string, nodes int, batchSize uint64, batchTimeout t
 	printChecksums(cluster.stateChecksums())
 }
 
-func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batchTimeout time.Duration, requestTimeout time.Duration, failureSpec string, failureStartMS int64, startUnixMS int64, learning learningOptions, dataDir string, keepData bool, verbose bool) {
+func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batchTimeout time.Duration, requestTimeout time.Duration, failureSpec string, failureStartMS int64, startUnixMS int64, learning learningOptions, backoff requestTimeoutBackoffOptions, dataDir string, keepData bool, logMode smallBankLogMode) {
 	if nodeID == 0 {
 		fatalf("--role server requires --node-id")
 	}
@@ -177,21 +188,27 @@ func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batch
 		BatchTimeout:    batchTimeout,
 		Failures:        failures,
 		LearningOptions: learning,
-	}, dir, verbose, requestTimeout)
+		Backoff:         backoff,
+	}, dir, logMode, requestTimeout)
 	if err != nil {
 		fatalf("start server: %v", err)
 	}
 
 	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
 	defer stop()
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-stopCtx.Done()
+		defer close(shutdownDone)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		server.close(shutdownCtx)
 	}()
 	if err := server.serve(); err != nil {
 		fatalf("serve: %v", err)
+	}
+	if stopCtx.Err() != nil {
+		<-shutdownDone
 	}
 }
 
