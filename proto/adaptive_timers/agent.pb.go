@@ -100,26 +100,23 @@ type PbftReport struct {
 	TotalConsensusInstances uint32 `protobuf:"varint,2,opt,name=total_consensus_instances,json=totalConsensusInstances,proto3" json:"total_consensus_instances,omitempty"`
 	// End-to-end PBFT consensus latency summaries (milliseconds).
 	AvgConsensusLatencyMs float32 `protobuf:"fixed32,3,opt,name=avg_consensus_latency_ms,json=avgConsensusLatencyMs,proto3" json:"avg_consensus_latency_ms,omitempty"`
-	P95ConsensusLatencyMs float32 `protobuf:"fixed32,4,opt,name=p95_consensus_latency_ms,json=p95ConsensusLatencyMs,proto3" json:"p95_consensus_latency_ms,omitempty"`
-	P99ConsensusLatencyMs float32 `protobuf:"fixed32,5,opt,name=p99_consensus_latency_ms,json=p99ConsensusLatencyMs,proto3" json:"p99_consensus_latency_ms,omitempty"`
-	// Throughput and core rates.
-	ThroughputTps        float32 `protobuf:"fixed32,6,opt,name=throughput_tps,json=throughputTps,proto3" json:"throughput_tps,omitempty"`
-	TimeoutViolationRate float32 `protobuf:"fixed32,7,opt,name=timeout_violation_rate,json=timeoutViolationRate,proto3" json:"timeout_violation_rate,omitempty"`
+	P50ConsensusLatencyMs float32 `protobuf:"fixed32,4,opt,name=p50_consensus_latency_ms,json=p50ConsensusLatencyMs,proto3" json:"p50_consensus_latency_ms,omitempty"`
+	P95ConsensusLatencyMs float32 `protobuf:"fixed32,5,opt,name=p95_consensus_latency_ms,json=p95ConsensusLatencyMs,proto3" json:"p95_consensus_latency_ms,omitempty"`
+	// Throughput.
+	ThroughputTps float32 `protobuf:"fixed32,6,opt,name=throughput_tps,json=throughputTps,proto3" json:"throughput_tps,omitempty"`
 	// Batch characteristics.
-	AvgBatchSize float32 `protobuf:"fixed32,8,opt,name=avg_batch_size,json=avgBatchSize,proto3" json:"avg_batch_size,omitempty"`
-	P95BatchSize float32 `protobuf:"fixed32,9,opt,name=p95_batch_size,json=p95BatchSize,proto3" json:"p95_batch_size,omitempty"`
+	AvgBatchSize float32 `protobuf:"fixed32,7,opt,name=avg_batch_size,json=avgBatchSize,proto3" json:"avg_batch_size,omitempty"`
+	P95BatchSize float32 `protobuf:"fixed32,8,opt,name=p95_batch_size,json=p95BatchSize,proto3" json:"p95_batch_size,omitempty"`
 	// Leadership dynamics.
-	LeaderChangeCount  uint32 `protobuf:"varint,10,opt,name=leader_change_count,json=leaderChangeCount,proto3" json:"leader_change_count,omitempty"`
-	RegencyChangeCount uint32 `protobuf:"varint,11,opt,name=regency_change_count,json=regencyChangeCount,proto3" json:"regency_change_count,omitempty"`
-	// Phase delays (milliseconds).
-	PhaseProposeAvgDelayMs      float32 `protobuf:"fixed32,12,opt,name=phase_propose_avg_delay_ms,json=phaseProposeAvgDelayMs,proto3" json:"phase_propose_avg_delay_ms,omitempty"`
-	PhaseProposeP95DelayMs      float32 `protobuf:"fixed32,13,opt,name=phase_propose_p95_delay_ms,json=phaseProposeP95DelayMs,proto3" json:"phase_propose_p95_delay_ms,omitempty"`
-	PhaseWriteAvgDelayMs        float32 `protobuf:"fixed32,14,opt,name=phase_write_avg_delay_ms,json=phaseWriteAvgDelayMs,proto3" json:"phase_write_avg_delay_ms,omitempty"`
-	PhaseWriteP95DelayMs        float32 `protobuf:"fixed32,15,opt,name=phase_write_p95_delay_ms,json=phaseWriteP95DelayMs,proto3" json:"phase_write_p95_delay_ms,omitempty"`
-	PhaseAcceptAvgDelayMs       float32 `protobuf:"fixed32,16,opt,name=phase_accept_avg_delay_ms,json=phaseAcceptAvgDelayMs,proto3" json:"phase_accept_avg_delay_ms,omitempty"`
-	PhaseAcceptP95DelayMs       float32 `protobuf:"fixed32,17,opt,name=phase_accept_p95_delay_ms,json=phaseAcceptP95DelayMs,proto3" json:"phase_accept_p95_delay_ms,omitempty"`
-	PhasePostDecisionAvgDelayMs float32 `protobuf:"fixed32,18,opt,name=phase_post_decision_avg_delay_ms,json=phasePostDecisionAvgDelayMs,proto3" json:"phase_post_decision_avg_delay_ms,omitempty"`
-	PhasePostDecisionP95DelayMs float32 `protobuf:"fixed32,19,opt,name=phase_post_decision_p95_delay_ms,json=phasePostDecisionP95DelayMs,proto3" json:"phase_post_decision_p95_delay_ms,omitempty"`
+	LeaderChangeCount  uint32 `protobuf:"varint,9,opt,name=leader_change_count,json=leaderChangeCount,proto3" json:"leader_change_count,omitempty"`
+	RegencyChangeCount uint32 `protobuf:"varint,10,opt,name=regency_change_count,json=regencyChangeCount,proto3" json:"regency_change_count,omitempty"`
+	// Timer and liveness context for the same learning window.
+	TimeoutMs                 uint32  `protobuf:"varint,11,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
+	AvgInterCommitGapMs       float32 `protobuf:"fixed32,12,opt,name=avg_inter_commit_gap_ms,json=avgInterCommitGapMs,proto3" json:"avg_inter_commit_gap_ms,omitempty"`
+	P50InterCommitGapMs       float32 `protobuf:"fixed32,13,opt,name=p50_inter_commit_gap_ms,json=p50InterCommitGapMs,proto3" json:"p50_inter_commit_gap_ms,omitempty"`
+	P95InterCommitGapMs       float32 `protobuf:"fixed32,14,opt,name=p95_inter_commit_gap_ms,json=p95InterCommitGapMs,proto3" json:"p95_inter_commit_gap_ms,omitempty"`
+	ViewChangeCount           uint32  `protobuf:"varint,15,opt,name=view_change_count,json=viewChangeCount,proto3" json:"view_change_count,omitempty"`
+	NoProgressViewChangeCount uint32  `protobuf:"varint,16,opt,name=no_progress_view_change_count,json=noProgressViewChangeCount,proto3" json:"no_progress_view_change_count,omitempty"`
 }
 
 func (m *PbftReport) Reset()         { *m = PbftReport{} }
@@ -183,9 +180,9 @@ func (m *PbftReport) GetP95ConsensusLatencyMs() float32 {
 	return 0
 }
 
-func (m *PbftReport) GetP99ConsensusLatencyMs() float32 {
+func (m *PbftReport) GetP50ConsensusLatencyMs() float32 {
 	if m != nil {
-		return m.P99ConsensusLatencyMs
+		return m.P50ConsensusLatencyMs
 	}
 	return 0
 }
@@ -193,13 +190,6 @@ func (m *PbftReport) GetP99ConsensusLatencyMs() float32 {
 func (m *PbftReport) GetThroughputTps() float32 {
 	if m != nil {
 		return m.ThroughputTps
-	}
-	return 0
-}
-
-func (m *PbftReport) GetTimeoutViolationRate() float32 {
-	if m != nil {
-		return m.TimeoutViolationRate
 	}
 	return 0
 }
@@ -232,58 +222,44 @@ func (m *PbftReport) GetRegencyChangeCount() uint32 {
 	return 0
 }
 
-func (m *PbftReport) GetPhaseProposeAvgDelayMs() float32 {
+func (m *PbftReport) GetTimeoutMs() uint32 {
 	if m != nil {
-		return m.PhaseProposeAvgDelayMs
+		return m.TimeoutMs
 	}
 	return 0
 }
 
-func (m *PbftReport) GetPhaseProposeP95DelayMs() float32 {
+func (m *PbftReport) GetAvgInterCommitGapMs() float32 {
 	if m != nil {
-		return m.PhaseProposeP95DelayMs
+		return m.AvgInterCommitGapMs
 	}
 	return 0
 }
 
-func (m *PbftReport) GetPhaseWriteAvgDelayMs() float32 {
+func (m *PbftReport) GetP50InterCommitGapMs() float32 {
 	if m != nil {
-		return m.PhaseWriteAvgDelayMs
+		return m.P50InterCommitGapMs
 	}
 	return 0
 }
 
-func (m *PbftReport) GetPhaseWriteP95DelayMs() float32 {
+func (m *PbftReport) GetP95InterCommitGapMs() float32 {
 	if m != nil {
-		return m.PhaseWriteP95DelayMs
+		return m.P95InterCommitGapMs
 	}
 	return 0
 }
 
-func (m *PbftReport) GetPhaseAcceptAvgDelayMs() float32 {
+func (m *PbftReport) GetViewChangeCount() uint32 {
 	if m != nil {
-		return m.PhaseAcceptAvgDelayMs
+		return m.ViewChangeCount
 	}
 	return 0
 }
 
-func (m *PbftReport) GetPhaseAcceptP95DelayMs() float32 {
+func (m *PbftReport) GetNoProgressViewChangeCount() uint32 {
 	if m != nil {
-		return m.PhaseAcceptP95DelayMs
-	}
-	return 0
-}
-
-func (m *PbftReport) GetPhasePostDecisionAvgDelayMs() float32 {
-	if m != nil {
-		return m.PhasePostDecisionAvgDelayMs
-	}
-	return 0
-}
-
-func (m *PbftReport) GetPhasePostDecisionP95DelayMs() float32 {
-	if m != nil {
-		return m.PhasePostDecisionP95DelayMs
+		return m.NoProgressViewChangeCount
 	}
 	return 0
 }
@@ -2441,87 +2417,60 @@ func (m *PbftReport) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.PhasePostDecisionP95DelayMs != 0 {
-		i -= 4
-		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.PhasePostDecisionP95DelayMs))))
+	if m.NoProgressViewChangeCount != 0 {
+		i = encodeVarintAgent(dAtA, i, uint64(m.NoProgressViewChangeCount))
 		i--
 		dAtA[i] = 0x1
 		i--
-		dAtA[i] = 0x9d
+		dAtA[i] = 0x80
 	}
-	if m.PhasePostDecisionAvgDelayMs != 0 {
-		i -= 4
-		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.PhasePostDecisionAvgDelayMs))))
+	if m.ViewChangeCount != 0 {
+		i = encodeVarintAgent(dAtA, i, uint64(m.ViewChangeCount))
 		i--
-		dAtA[i] = 0x1
-		i--
-		dAtA[i] = 0x95
+		dAtA[i] = 0x78
 	}
-	if m.PhaseAcceptP95DelayMs != 0 {
+	if m.P95InterCommitGapMs != 0 {
 		i -= 4
-		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.PhaseAcceptP95DelayMs))))
-		i--
-		dAtA[i] = 0x1
-		i--
-		dAtA[i] = 0x8d
-	}
-	if m.PhaseAcceptAvgDelayMs != 0 {
-		i -= 4
-		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.PhaseAcceptAvgDelayMs))))
-		i--
-		dAtA[i] = 0x1
-		i--
-		dAtA[i] = 0x85
-	}
-	if m.PhaseWriteP95DelayMs != 0 {
-		i -= 4
-		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.PhaseWriteP95DelayMs))))
-		i--
-		dAtA[i] = 0x7d
-	}
-	if m.PhaseWriteAvgDelayMs != 0 {
-		i -= 4
-		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.PhaseWriteAvgDelayMs))))
+		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.P95InterCommitGapMs))))
 		i--
 		dAtA[i] = 0x75
 	}
-	if m.PhaseProposeP95DelayMs != 0 {
+	if m.P50InterCommitGapMs != 0 {
 		i -= 4
-		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.PhaseProposeP95DelayMs))))
+		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.P50InterCommitGapMs))))
 		i--
 		dAtA[i] = 0x6d
 	}
-	if m.PhaseProposeAvgDelayMs != 0 {
+	if m.AvgInterCommitGapMs != 0 {
 		i -= 4
-		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.PhaseProposeAvgDelayMs))))
+		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.AvgInterCommitGapMs))))
 		i--
 		dAtA[i] = 0x65
+	}
+	if m.TimeoutMs != 0 {
+		i = encodeVarintAgent(dAtA, i, uint64(m.TimeoutMs))
+		i--
+		dAtA[i] = 0x58
 	}
 	if m.RegencyChangeCount != 0 {
 		i = encodeVarintAgent(dAtA, i, uint64(m.RegencyChangeCount))
 		i--
-		dAtA[i] = 0x58
+		dAtA[i] = 0x50
 	}
 	if m.LeaderChangeCount != 0 {
 		i = encodeVarintAgent(dAtA, i, uint64(m.LeaderChangeCount))
 		i--
-		dAtA[i] = 0x50
+		dAtA[i] = 0x48
 	}
 	if m.P95BatchSize != 0 {
 		i -= 4
 		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.P95BatchSize))))
 		i--
-		dAtA[i] = 0x4d
+		dAtA[i] = 0x45
 	}
 	if m.AvgBatchSize != 0 {
 		i -= 4
 		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.AvgBatchSize))))
-		i--
-		dAtA[i] = 0x45
-	}
-	if m.TimeoutViolationRate != 0 {
-		i -= 4
-		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.TimeoutViolationRate))))
 		i--
 		dAtA[i] = 0x3d
 	}
@@ -2531,15 +2480,15 @@ func (m *PbftReport) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i--
 		dAtA[i] = 0x35
 	}
-	if m.P99ConsensusLatencyMs != 0 {
-		i -= 4
-		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.P99ConsensusLatencyMs))))
-		i--
-		dAtA[i] = 0x2d
-	}
 	if m.P95ConsensusLatencyMs != 0 {
 		i -= 4
 		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.P95ConsensusLatencyMs))))
+		i--
+		dAtA[i] = 0x2d
+	}
+	if m.P50ConsensusLatencyMs != 0 {
+		i -= 4
+		encoding_binary.LittleEndian.PutUint32(dAtA[i:], uint32(math.Float32bits(float32(m.P50ConsensusLatencyMs))))
 		i--
 		dAtA[i] = 0x25
 	}
@@ -3908,16 +3857,13 @@ func (m *PbftReport) Size() (n int) {
 	if m.AvgConsensusLatencyMs != 0 {
 		n += 5
 	}
+	if m.P50ConsensusLatencyMs != 0 {
+		n += 5
+	}
 	if m.P95ConsensusLatencyMs != 0 {
 		n += 5
 	}
-	if m.P99ConsensusLatencyMs != 0 {
-		n += 5
-	}
 	if m.ThroughputTps != 0 {
-		n += 5
-	}
-	if m.TimeoutViolationRate != 0 {
 		n += 5
 	}
 	if m.AvgBatchSize != 0 {
@@ -3932,29 +3878,23 @@ func (m *PbftReport) Size() (n int) {
 	if m.RegencyChangeCount != 0 {
 		n += 1 + sovAgent(uint64(m.RegencyChangeCount))
 	}
-	if m.PhaseProposeAvgDelayMs != 0 {
+	if m.TimeoutMs != 0 {
+		n += 1 + sovAgent(uint64(m.TimeoutMs))
+	}
+	if m.AvgInterCommitGapMs != 0 {
 		n += 5
 	}
-	if m.PhaseProposeP95DelayMs != 0 {
+	if m.P50InterCommitGapMs != 0 {
 		n += 5
 	}
-	if m.PhaseWriteAvgDelayMs != 0 {
+	if m.P95InterCommitGapMs != 0 {
 		n += 5
 	}
-	if m.PhaseWriteP95DelayMs != 0 {
-		n += 5
+	if m.ViewChangeCount != 0 {
+		n += 1 + sovAgent(uint64(m.ViewChangeCount))
 	}
-	if m.PhaseAcceptAvgDelayMs != 0 {
-		n += 6
-	}
-	if m.PhaseAcceptP95DelayMs != 0 {
-		n += 6
-	}
-	if m.PhasePostDecisionAvgDelayMs != 0 {
-		n += 6
-	}
-	if m.PhasePostDecisionP95DelayMs != 0 {
-		n += 6
+	if m.NoProgressViewChangeCount != 0 {
+		n += 2 + sovAgent(uint64(m.NoProgressViewChangeCount))
 	}
 	return n
 }
@@ -4660,6 +4600,17 @@ func (m *PbftReport) Unmarshal(dAtA []byte) error {
 			m.AvgConsensusLatencyMs = float32(math.Float32frombits(v))
 		case 4:
 			if wireType != 5 {
+				return fmt.Errorf("proto: wrong wireType = %d for field P50ConsensusLatencyMs", wireType)
+			}
+			var v uint32
+			if (iNdEx + 4) > l {
+				return io.ErrUnexpectedEOF
+			}
+			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
+			iNdEx += 4
+			m.P50ConsensusLatencyMs = float32(math.Float32frombits(v))
+		case 5:
+			if wireType != 5 {
 				return fmt.Errorf("proto: wrong wireType = %d for field P95ConsensusLatencyMs", wireType)
 			}
 			var v uint32
@@ -4669,17 +4620,6 @@ func (m *PbftReport) Unmarshal(dAtA []byte) error {
 			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
 			iNdEx += 4
 			m.P95ConsensusLatencyMs = float32(math.Float32frombits(v))
-		case 5:
-			if wireType != 5 {
-				return fmt.Errorf("proto: wrong wireType = %d for field P99ConsensusLatencyMs", wireType)
-			}
-			var v uint32
-			if (iNdEx + 4) > l {
-				return io.ErrUnexpectedEOF
-			}
-			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
-			iNdEx += 4
-			m.P99ConsensusLatencyMs = float32(math.Float32frombits(v))
 		case 6:
 			if wireType != 5 {
 				return fmt.Errorf("proto: wrong wireType = %d for field ThroughputTps", wireType)
@@ -4693,17 +4633,6 @@ func (m *PbftReport) Unmarshal(dAtA []byte) error {
 			m.ThroughputTps = float32(math.Float32frombits(v))
 		case 7:
 			if wireType != 5 {
-				return fmt.Errorf("proto: wrong wireType = %d for field TimeoutViolationRate", wireType)
-			}
-			var v uint32
-			if (iNdEx + 4) > l {
-				return io.ErrUnexpectedEOF
-			}
-			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
-			iNdEx += 4
-			m.TimeoutViolationRate = float32(math.Float32frombits(v))
-		case 8:
-			if wireType != 5 {
 				return fmt.Errorf("proto: wrong wireType = %d for field AvgBatchSize", wireType)
 			}
 			var v uint32
@@ -4713,7 +4642,7 @@ func (m *PbftReport) Unmarshal(dAtA []byte) error {
 			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
 			iNdEx += 4
 			m.AvgBatchSize = float32(math.Float32frombits(v))
-		case 9:
+		case 8:
 			if wireType != 5 {
 				return fmt.Errorf("proto: wrong wireType = %d for field P95BatchSize", wireType)
 			}
@@ -4724,7 +4653,7 @@ func (m *PbftReport) Unmarshal(dAtA []byte) error {
 			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
 			iNdEx += 4
 			m.P95BatchSize = float32(math.Float32frombits(v))
-		case 10:
+		case 9:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field LeaderChangeCount", wireType)
 			}
@@ -4743,7 +4672,7 @@ func (m *PbftReport) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
-		case 11:
+		case 10:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field RegencyChangeCount", wireType)
 			}
@@ -4762,9 +4691,28 @@ func (m *PbftReport) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 11:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field TimeoutMs", wireType)
+			}
+			m.TimeoutMs = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowAgent
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.TimeoutMs |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		case 12:
 			if wireType != 5 {
-				return fmt.Errorf("proto: wrong wireType = %d for field PhaseProposeAvgDelayMs", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field AvgInterCommitGapMs", wireType)
 			}
 			var v uint32
 			if (iNdEx + 4) > l {
@@ -4772,10 +4720,10 @@ func (m *PbftReport) Unmarshal(dAtA []byte) error {
 			}
 			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
 			iNdEx += 4
-			m.PhaseProposeAvgDelayMs = float32(math.Float32frombits(v))
+			m.AvgInterCommitGapMs = float32(math.Float32frombits(v))
 		case 13:
 			if wireType != 5 {
-				return fmt.Errorf("proto: wrong wireType = %d for field PhaseProposeP95DelayMs", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field P50InterCommitGapMs", wireType)
 			}
 			var v uint32
 			if (iNdEx + 4) > l {
@@ -4783,10 +4731,10 @@ func (m *PbftReport) Unmarshal(dAtA []byte) error {
 			}
 			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
 			iNdEx += 4
-			m.PhaseProposeP95DelayMs = float32(math.Float32frombits(v))
+			m.P50InterCommitGapMs = float32(math.Float32frombits(v))
 		case 14:
 			if wireType != 5 {
-				return fmt.Errorf("proto: wrong wireType = %d for field PhaseWriteAvgDelayMs", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field P95InterCommitGapMs", wireType)
 			}
 			var v uint32
 			if (iNdEx + 4) > l {
@@ -4794,62 +4742,45 @@ func (m *PbftReport) Unmarshal(dAtA []byte) error {
 			}
 			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
 			iNdEx += 4
-			m.PhaseWriteAvgDelayMs = float32(math.Float32frombits(v))
+			m.P95InterCommitGapMs = float32(math.Float32frombits(v))
 		case 15:
-			if wireType != 5 {
-				return fmt.Errorf("proto: wrong wireType = %d for field PhaseWriteP95DelayMs", wireType)
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ViewChangeCount", wireType)
 			}
-			var v uint32
-			if (iNdEx + 4) > l {
-				return io.ErrUnexpectedEOF
+			m.ViewChangeCount = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowAgent
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ViewChangeCount |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
 			}
-			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
-			iNdEx += 4
-			m.PhaseWriteP95DelayMs = float32(math.Float32frombits(v))
 		case 16:
-			if wireType != 5 {
-				return fmt.Errorf("proto: wrong wireType = %d for field PhaseAcceptAvgDelayMs", wireType)
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field NoProgressViewChangeCount", wireType)
 			}
-			var v uint32
-			if (iNdEx + 4) > l {
-				return io.ErrUnexpectedEOF
+			m.NoProgressViewChangeCount = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowAgent
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.NoProgressViewChangeCount |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
 			}
-			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
-			iNdEx += 4
-			m.PhaseAcceptAvgDelayMs = float32(math.Float32frombits(v))
-		case 17:
-			if wireType != 5 {
-				return fmt.Errorf("proto: wrong wireType = %d for field PhaseAcceptP95DelayMs", wireType)
-			}
-			var v uint32
-			if (iNdEx + 4) > l {
-				return io.ErrUnexpectedEOF
-			}
-			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
-			iNdEx += 4
-			m.PhaseAcceptP95DelayMs = float32(math.Float32frombits(v))
-		case 18:
-			if wireType != 5 {
-				return fmt.Errorf("proto: wrong wireType = %d for field PhasePostDecisionAvgDelayMs", wireType)
-			}
-			var v uint32
-			if (iNdEx + 4) > l {
-				return io.ErrUnexpectedEOF
-			}
-			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
-			iNdEx += 4
-			m.PhasePostDecisionAvgDelayMs = float32(math.Float32frombits(v))
-		case 19:
-			if wireType != 5 {
-				return fmt.Errorf("proto: wrong wireType = %d for field PhasePostDecisionP95DelayMs", wireType)
-			}
-			var v uint32
-			if (iNdEx + 4) > l {
-				return io.ErrUnexpectedEOF
-			}
-			v = uint32(encoding_binary.LittleEndian.Uint32(dAtA[iNdEx:]))
-			iNdEx += 4
-			m.PhasePostDecisionP95DelayMs = float32(math.Float32frombits(v))
 		default:
 			iNdEx = preIndex
 			skippy, err := skipAgent(dAtA[iNdEx:])

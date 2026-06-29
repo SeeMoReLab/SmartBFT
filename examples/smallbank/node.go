@@ -112,8 +112,8 @@ func newNode(
 	config.RequestBatchMaxInterval = opts.BatchTimeout
 	config.RequestPoolSize = max(2*opts.BatchSize, 1024)
 	config.RequestPoolSubmitTimeout = 5 * time.Millisecond
-	config.RequestForwardTimeout = 50 * time.Millisecond
-	config.RequestComplainTimeout = 50 * time.Millisecond
+	config.RequestForwardTimeout = 950 * time.Millisecond
+	config.RequestComplainTimeout = 950 * time.Millisecond
 	config.ViewChangeTimeout = 10 * time.Second
 	if opts.Backoff.Enabled {
 		config.ViewChangeTimeout = config.RequestForwardTimeout + config.RequestComplainTimeout
@@ -443,7 +443,6 @@ func (n *node) Deliver(proposal bft.Proposal, signatures []bft.Signature) bft.Re
 		BatchSize:    len(data.Requests),
 		DecisionTime: decisionTime,
 		Latencies:    latencies,
-		PostDecision: postDecision,
 		Timeout:      n.learning.currentTimeoutValue(),
 	})
 	n.onCommitBackoff(md.GetViewId(), md.GetLatestSequence())
@@ -490,6 +489,7 @@ func (n *node) onNoProgressViewChangeBackoff(targetView uint64) {
 	if !update.Log {
 		return
 	}
+	n.learning.recordNoProgressViewChange()
 	if update.Apply {
 		if _, err := n.applyEffectiveTimeouts(update.State, "backoff-view-change"); err != nil {
 			n.logger.Errorf("node %d failed to apply timeout backoff after view change to %d: %v", n.id, targetView, err)
@@ -556,6 +556,7 @@ func (n *node) applyEffectiveTimeouts(state requestTimeoutBackoffState, source s
 func (n *node) onViewEvent(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string) {
 	n.recordObservedView(currentView, nextView, proposalSeq)
 	if event == "start_view_change" {
+		n.learning.recordViewChange()
 		n.onNoProgressViewChangeBackoff(nextView)
 	}
 }

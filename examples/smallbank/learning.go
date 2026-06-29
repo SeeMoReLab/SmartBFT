@@ -193,6 +193,28 @@ func (m *learningManager) recordConsensus(sample learningSample) {
 	m.maybeHandleRewardDeadlineLocked(sample.Sequence)
 }
 
+func (m *learningManager) recordViewChange() {
+	if m == nil || !m.enabled {
+		return
+	}
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	m.metrics.recordViewChange()
+}
+
+func (m *learningManager) recordNoProgressViewChange() {
+	if m == nil || !m.enabled {
+		return
+	}
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	m.metrics.recordNoProgressViewChange()
+}
+
 func (m *learningManager) maybeSendReportTickLocked(sequence uint64) {
 	if m.selectedWindow != nil || m.reachedReportCapForEpisode {
 		return

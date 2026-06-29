@@ -14,20 +14,23 @@ import (
 )
 
 type learningWindowMetrics struct {
-	latencies             []time.Duration
-	batchSizes            []int
-	totalTransactions     uint64
-	totalConsensus        uint64
-	timeoutViolations     uint64
-	leaderChangeCount     uint64
-	regencyChangeCount    uint64
-	previousLeader        uint64
-	previousRegency       uint64
-	havePreviousLeader    bool
-	havePreviousRegency   bool
-	firstDecisionTime     time.Time
-	lastDecisionTime      time.Time
-	postDecisionLatencies []time.Duration
+	latencies            []time.Duration
+	batchSizes           []int
+	totalTransactions    uint64
+	totalConsensus       uint64
+	leaderChangeCount    uint64
+	regencyChangeCount   uint64
+	previousLeader       uint64
+	previousRegency      uint64
+	havePreviousLeader   bool
+	havePreviousRegency  bool
+	firstDecisionTime    time.Time
+	lastDecisionTime     time.Time
+	previousDecisionTime time.Time
+	interCommitGaps      []time.Duration
+	timeout              time.Duration
+	viewChangeCount      uint64
+	noProgressViewChange uint64
 }
 
 type learningSample struct {
@@ -37,7 +40,6 @@ type learningSample struct {
 	BatchSize    int
 	DecisionTime time.Time
 	Latencies    []time.Duration
-	PostDecision time.Duration
 	Timeout      time.Duration
 }
 
@@ -70,21 +72,29 @@ func (m *learningWindowMetrics) record(sample learningSample) {
 	if m.firstDecisionTime.IsZero() {
 		m.firstDecisionTime = sample.DecisionTime
 	}
+	if !m.previousDecisionTime.IsZero() && sample.DecisionTime.After(m.previousDecisionTime) {
+		m.interCommitGaps = append(m.interCommitGaps, sample.DecisionTime.Sub(m.previousDecisionTime))
+	}
+	m.previousDecisionTime = sample.DecisionTime
 	m.lastDecisionTime = sample.DecisionTime
 
-	if sample.PostDecision >= 0 {
-		m.postDecisionLatencies = append(m.postDecisionLatencies, sample.PostDecision)
+	if sample.Timeout > 0 {
+		m.timeout = sample.Timeout
 	}
-
 	for _, latency := range sample.Latencies {
 		if latency < 0 {
 			continue
 		}
 		m.latencies = append(m.latencies, latency)
-		if sample.Timeout > 0 && latency > sample.Timeout {
-			m.timeoutViolations++
-		}
 	}
+}
+
+func (m *learningWindowMetrics) recordViewChange() {
+	m.viewChangeCount++
+}
+
+func (m *learningWindowMetrics) recordNoProgressViewChange() {
+	m.noProgressViewChange++
 }
 
 func (m *learningWindowMetrics) buildReport() *adaptivetimers.PbftReport {
@@ -98,36 +108,28 @@ func (m *learningWindowMetrics) buildReport() *adaptivetimers.PbftReport {
 		throughput = float32(float64(m.totalTransactions) / duration.Seconds())
 	}
 
-	timeoutViolationRate := float32(0)
-	if len(m.latencies) > 0 {
-		timeoutViolationRate = float32(float64(m.timeoutViolations) / float64(len(m.latencies)))
-	}
-
 	avgBatchSize := float32(0)
 	if m.totalConsensus > 0 {
 		avgBatchSize = float32(float64(m.totalTransactions) / float64(m.totalConsensus))
 	}
 
 	return &adaptivetimers.PbftReport{
-		TotalTransactions:           saturatingUint32(m.totalTransactions),
-		TotalConsensusInstances:     saturatingUint32(m.totalConsensus),
-		AvgConsensusLatencyMs:       avgDurationMS(m.latencies),
-		P95ConsensusLatencyMs:       percentileDurationMS(m.latencies, 0.95),
-		P99ConsensusLatencyMs:       percentileDurationMS(m.latencies, 0.99),
-		ThroughputTps:               throughput,
-		TimeoutViolationRate:        timeoutViolationRate,
-		AvgBatchSize:                avgBatchSize,
-		P95BatchSize:                percentileInt(m.batchSizes, 0.95),
-		LeaderChangeCount:           saturatingUint32(m.leaderChangeCount),
-		RegencyChangeCount:          saturatingUint32(m.regencyChangeCount),
-		PhaseProposeAvgDelayMs:      0,
-		PhaseProposeP95DelayMs:      0,
-		PhaseWriteAvgDelayMs:        0,
-		PhaseWriteP95DelayMs:        0,
-		PhaseAcceptAvgDelayMs:       0,
-		PhaseAcceptP95DelayMs:       0,
-		PhasePostDecisionAvgDelayMs: avgDurationMS(m.postDecisionLatencies),
-		PhasePostDecisionP95DelayMs: percentileDurationMS(m.postDecisionLatencies, 0.95),
+		TotalTransactions:         saturatingUint32(m.totalTransactions),
+		TotalConsensusInstances:   saturatingUint32(m.totalConsensus),
+		AvgConsensusLatencyMs:     avgDurationMS(m.latencies),
+		P50ConsensusLatencyMs:     percentileDurationMS(m.latencies, 0.50),
+		P95ConsensusLatencyMs:     percentileDurationMS(m.latencies, 0.95),
+		ThroughputTps:             throughput,
+		AvgBatchSize:              avgBatchSize,
+		P95BatchSize:              percentileInt(m.batchSizes, 0.95),
+		LeaderChangeCount:         saturatingUint32(m.leaderChangeCount),
+		RegencyChangeCount:        saturatingUint32(m.regencyChangeCount),
+		TimeoutMs:                 saturatingUint32(uint64(max(int64(0), m.timeout.Milliseconds()))),
+		AvgInterCommitGapMs:       avgDurationMS(m.interCommitGaps),
+		P50InterCommitGapMs:       percentileDurationMS(m.interCommitGaps, 0.50),
+		P95InterCommitGapMs:       percentileDurationMS(m.interCommitGaps, 0.95),
+		ViewChangeCount:           saturatingUint32(m.viewChangeCount),
+		NoProgressViewChangeCount: saturatingUint32(m.noProgressViewChange),
 	}
 }
 

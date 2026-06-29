@@ -8,6 +8,9 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/gogo/protobuf/proto"
+	adaptivetimers "github.com/hyperledger-labs/SmartBFT/proto/adaptive_timers"
 )
 
 func TestLoadWorkloadConfig(t *testing.T) {
@@ -158,7 +161,6 @@ func TestLearningMetricsBuildPBFTReport(t *testing.T) {
 		BatchSize:    2,
 		DecisionTime: start,
 		Latencies:    []time.Duration{10 * time.Millisecond, 20 * time.Millisecond},
-		PostDecision: 2 * time.Millisecond,
 		Timeout:      15 * time.Millisecond,
 	})
 	metrics.record(learningSample{
@@ -168,9 +170,10 @@ func TestLearningMetricsBuildPBFTReport(t *testing.T) {
 		BatchSize:    3,
 		DecisionTime: start.Add(100 * time.Millisecond),
 		Latencies:    []time.Duration{30 * time.Millisecond},
-		PostDecision: 4 * time.Millisecond,
 		Timeout:      15 * time.Millisecond,
 	})
+	metrics.recordViewChange()
+	metrics.recordNoProgressViewChange()
 
 	report := metrics.buildReport()
 	if report == nil {
@@ -185,11 +188,34 @@ func TestLearningMetricsBuildPBFTReport(t *testing.T) {
 	if report.LeaderChangeCount != 1 {
 		t.Fatalf("LeaderChangeCount = %d, want 1", report.LeaderChangeCount)
 	}
-	if report.TimeoutViolationRate < 0.66 || report.TimeoutViolationRate > 0.67 {
-		t.Fatalf("TimeoutViolationRate = %f, want about 0.67", report.TimeoutViolationRate)
+	if report.P50ConsensusLatencyMs != 20 {
+		t.Fatalf("P50ConsensusLatencyMs = %f, want 20", report.P50ConsensusLatencyMs)
 	}
-	if report.PhasePostDecisionAvgDelayMs != 3 {
-		t.Fatalf("PhasePostDecisionAvgDelayMs = %f, want 3", report.PhasePostDecisionAvgDelayMs)
+	if report.TimeoutMs != 15 {
+		t.Fatalf("TimeoutMs = %d, want 15", report.TimeoutMs)
+	}
+	if report.AvgInterCommitGapMs != 100 || report.P50InterCommitGapMs != 100 || report.P95InterCommitGapMs != 100 {
+		t.Fatalf("inter-commit gaps = avg %f p50 %f p95 %f, want 100/100/100",
+			report.AvgInterCommitGapMs, report.P50InterCommitGapMs, report.P95InterCommitGapMs)
+	}
+	if report.ViewChangeCount != 1 {
+		t.Fatalf("ViewChangeCount = %d, want 1", report.ViewChangeCount)
+	}
+	if report.NoProgressViewChangeCount != 1 {
+		t.Fatalf("NoProgressViewChangeCount = %d, want 1", report.NoProgressViewChangeCount)
+	}
+	encoded, err := proto.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	roundTrip := &adaptivetimers.PbftReport{}
+	if err := proto.Unmarshal(encoded, roundTrip); err != nil {
+		t.Fatalf("unmarshal report: %v", err)
+	}
+	if roundTrip.P50ConsensusLatencyMs != report.P50ConsensusLatencyMs ||
+		roundTrip.P95InterCommitGapMs != report.P95InterCommitGapMs ||
+		roundTrip.NoProgressViewChangeCount != report.NoProgressViewChangeCount {
+		t.Fatalf("round-trip report lost new fields: got %#v want %#v", roundTrip, report)
 	}
 }
 
