@@ -22,7 +22,7 @@ func main() {
 		role           = flag.String("role", "inprocess", "run role: inprocess, server, or client")
 		nodeID         = flag.Uint64("node-id", 0, "SmartBFT node ID for --role server")
 		hostsConfig    = flag.String("hosts-config", "", "SmartBFT hosts config for network server/client roles")
-		configPath     = flag.String("config", filepath.Join("config", "bft-smart", workloadFileName), "SmallBank XML config file or directory containing smallbank.xml")
+		configPath     = flag.String("config", filepath.Join("config", "pbft", workloadFileName), "SmallBank XML config file or directory containing smallbank.xml")
 		nodes          = flag.Int("nodes", 4, "number of SmartBFT nodes to run in-process")
 		batchSize      = flag.Uint64("batch-size", 100, "maximum SmartBFT request batch size")
 		batchTimeout   = flag.Duration("batch-timeout", 50*time.Millisecond, "maximum SmartBFT request batch interval")
