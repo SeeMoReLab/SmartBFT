@@ -250,6 +250,46 @@ func TestLearningApplyRecommendedTimeoutCallsCallback(t *testing.T) {
 	}
 }
 
+func TestLearningRewardMetricsResetOnApply(t *testing.T) {
+	manager := &learningManager{
+		enabled:            true,
+		metrics:            newLearningWindowMetrics(),
+		currentEpisode:     1,
+		currentTimeout:     5 * time.Second,
+		reportTickInterval: 1000,
+		selectedWindow:     newLearningEpisodeWindow(0, 10, 10),
+		selectedTimeout:    700 * time.Millisecond,
+	}
+
+	for seq := uint64(1); seq <= 20; seq++ {
+		manager.recordConsensus(learningSample{
+			Sequence:     seq,
+			View:         0,
+			LeaderID:     1,
+			BatchSize:    1,
+			DecisionTime: time.Unix(0, int64(seq)*int64(time.Second)),
+			Latencies:    []time.Duration{time.Millisecond},
+			Timeout:      manager.currentTimeoutValue(),
+		})
+	}
+
+	if manager.pendingReward == nil {
+		t.Fatalf("pending reward was not captured")
+	}
+	if manager.pendingReward.episode != 1 {
+		t.Fatalf("pending reward episode = %d, want 1", manager.pendingReward.episode)
+	}
+	if got := manager.pendingReward.report.TotalConsensusInstances; got != 5 {
+		t.Fatalf("reward consensus instances = %d, want 5", got)
+	}
+	if got := manager.pendingReward.report.TotalTransactions; got != 5 {
+		t.Fatalf("reward total transactions = %d, want 5", got)
+	}
+	if manager.episodeStartTick != 20 {
+		t.Fatalf("next episode start tick = %d, want 20", manager.episodeStartTick)
+	}
+}
+
 func TestRequestTimeoutBackoffGrowsOnNoProgressViewsUntilCommitThenDecays(t *testing.T) {
 	backoff, err := newRequestTimeoutBackoff(700*time.Millisecond, requestTimeoutBackoffOptions{
 		Enabled:    true,

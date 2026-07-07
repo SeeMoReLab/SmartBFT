@@ -182,7 +182,11 @@ func (m *learningManager) recordConsensus(sample learningSample) {
 	m.metrics.record(sample)
 	if m.episodeStartWallTime.IsZero() {
 		m.episodeStartWallTime = time.Now()
-		m.episodeStartTick = sample.Sequence
+		if sample.Sequence > 0 {
+			m.episodeStartTick = sample.Sequence - 1
+		} else {
+			m.episodeStartTick = 0
+		}
 	}
 
 	m.maybeConsumeRecommendationLocked(sample.Sequence)
@@ -230,16 +234,15 @@ func (m *learningManager) maybeSendReportTickLocked(sequence uint64) {
 		return
 	}
 
-	effectiveReportLength := min(reportLength, m.maxReportLength)
-	reportSeq := m.episodeStartTick + effectiveReportLength
+	reportSeq := sequence
 	m.sendStateReportLocked(m.currentEpisode, m.episodeStartTick, reportSeq)
 	m.reportSentForEpisode = true
 	m.waitingForRecommendation = true
 	m.startTimeoutPollingLocked(m.currentEpisode)
 
-	if effectiveReportLength >= m.maxReportLength {
+	if reportLength >= m.maxReportLength {
 		m.reachedReportCapForEpisode = true
-		window := newLearningEpisodeWindow(m.episodeStartTick, reportSeq, effectiveReportLength)
+		window := newLearningEpisodeWindow(m.episodeStartTick, reportSeq, reportLength)
 		m.capApplyDeadlineTick = window.applyTick
 		m.capRewardDeadlineTick = window.rewardTick
 	}
@@ -290,6 +293,7 @@ func (m *learningManager) maybeHandleApplyDeadlineLocked(sequence uint64) {
 		m.applyHandledForEpisode = true
 		m.lastTimeout = m.currentTimeout
 		if applied {
+			m.metrics.reset()
 			fmt.Printf("[learning] applied recommendation on time: episode=%d report_seq=%d apply_tick=%d current_seq=%d timeout_ms=%d\n",
 				m.currentEpisode, m.selectedWindow.reportSeq, m.selectedWindow.applyTick, sequence, m.currentTimeout.Milliseconds())
 		} else if applyErr != nil {
