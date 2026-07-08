@@ -293,7 +293,7 @@ func (m *learningManager) maybeHandleApplyDeadlineLocked(sequence uint64) {
 		m.applyHandledForEpisode = true
 		m.lastTimeout = m.currentTimeout
 		if applied {
-			m.metrics.reset()
+			m.metrics.resetWithThroughputStart(time.Now())
 			fmt.Printf("[learning] applied recommendation on time: episode=%d report_seq=%d apply_tick=%d current_seq=%d timeout_ms=%d\n",
 				m.currentEpisode, m.selectedWindow.reportSeq, m.selectedWindow.applyTick, sequence, m.currentTimeout.Milliseconds())
 		} else if applyErr != nil {

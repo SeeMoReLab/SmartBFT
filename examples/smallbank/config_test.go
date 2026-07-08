@@ -219,6 +219,38 @@ func TestLearningMetricsBuildPBFTReport(t *testing.T) {
 	}
 }
 
+func TestLearningMetricsThroughputCanStartBeforeFirstDecision(t *testing.T) {
+	metrics := newLearningWindowMetrics()
+	start := time.Now()
+	metrics.resetWithThroughputStart(start)
+	metrics.record(learningSample{
+		Sequence:     10,
+		View:         1,
+		LeaderID:     1,
+		BatchSize:    2,
+		DecisionTime: start.Add(10 * time.Second),
+		Latencies:    []time.Duration{10 * time.Millisecond},
+		Timeout:      15 * time.Millisecond,
+	})
+	metrics.record(learningSample{
+		Sequence:     11,
+		View:         1,
+		LeaderID:     1,
+		BatchSize:    3,
+		DecisionTime: start.Add(20 * time.Second),
+		Latencies:    []time.Duration{20 * time.Millisecond},
+		Timeout:      15 * time.Millisecond,
+	})
+
+	report := metrics.buildReport()
+	if report == nil {
+		t.Fatalf("report is nil")
+	}
+	if got := report.ThroughputTps; got < 0.249 || got > 0.251 {
+		t.Fatalf("ThroughputTps = %f, want about 0.25", got)
+	}
+}
+
 func TestLearningEpisodeWindow(t *testing.T) {
 	window := newLearningEpisodeWindow(10, 30, 20)
 	if window.applyTick != 40 {

@@ -26,6 +26,7 @@ type learningWindowMetrics struct {
 	havePreviousRegency  bool
 	firstDecisionTime    time.Time
 	lastDecisionTime     time.Time
+	throughputStartTime  time.Time
 	previousDecisionTime time.Time
 	interCommitGaps      []time.Duration
 	timeout              time.Duration
@@ -49,6 +50,11 @@ func newLearningWindowMetrics() *learningWindowMetrics {
 
 func (m *learningWindowMetrics) reset() {
 	*m = learningWindowMetrics{}
+}
+
+func (m *learningWindowMetrics) resetWithThroughputStart(start time.Time) {
+	m.reset()
+	m.throughputStartTime = start
 }
 
 func (m *learningWindowMetrics) record(sample learningSample) {
@@ -103,7 +109,11 @@ func (m *learningWindowMetrics) buildReport() *adaptivetimers.PbftReport {
 	}
 
 	throughput := float32(0)
-	duration := m.lastDecisionTime.Sub(m.firstDecisionTime)
+	throughputStart := m.firstDecisionTime
+	if !m.throughputStartTime.IsZero() {
+		throughputStart = m.throughputStartTime
+	}
+	duration := m.lastDecisionTime.Sub(throughputStart)
 	if duration > 0 {
 		throughput = float32(float64(m.totalTransactions) / duration.Seconds())
 	}
