@@ -30,7 +30,7 @@ func newBenchmarker(client smallBankInvoker, cfg *workloadConfig, requestTimeout
 	return &benchmarker{
 		client:         client,
 		config:         cfg,
-		metrics:        newBenchmarkMetrics(),
+		metrics:        newBenchmarkMetrics(requestTimeout),
 		requestTimeout: requestTimeout,
 	}
 }
