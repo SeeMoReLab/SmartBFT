@@ -112,8 +112,8 @@ func newNode(
 	config.RequestBatchMaxInterval = opts.BatchTimeout
 	config.RequestPoolSize = max(2*opts.BatchSize, 1024)
 	config.RequestPoolSubmitTimeout = 5 * time.Millisecond
-	config.RequestForwardTimeout = 950 * time.Millisecond
-	config.RequestComplainTimeout = 950 * time.Millisecond
+	config.RequestForwardTimeout = 400 * time.Millisecond
+	config.RequestComplainTimeout = 400 * time.Millisecond
 	config.ViewChangeTimeout = 10 * time.Second
 	if opts.Backoff.Enabled {
 		config.ViewChangeTimeout = config.RequestForwardTimeout + config.RequestComplainTimeout
@@ -175,7 +175,12 @@ func (n *node) start() {
 			case wm := <-n.in:
 				switch msg := wm.msg.(type) {
 				case *smartbftprotos.Message:
+					start := time.Now()
+					smallbankTracePrintf("%s event=local_consensus_start node=%d from=%d %s\n",
+						timestampedLogTag("trace"), n.id, wm.from, smartBFTTraceMessageSummary(msg))
 					n.consensus.HandleMessage(wm.from, msg)
+					smallbankTracePrintf("%s event=local_consensus_done node=%d from=%d elapsed_ms=%d %s\n",
+						timestampedLogTag("trace"), n.id, wm.from, time.Since(start).Milliseconds(), smartBFTTraceMessageSummary(msg))
 				case forwardedRequest:
 					n.consensus.HandleRequest(wm.from, msg.payload)
 				}
@@ -565,10 +570,21 @@ func timestampedLogTag(component string) string {
 	return fmt.Sprintf("[%s %s]", component, time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
 }
 
+func smallbankTracePrintf(format string, args ...any) {
+	// fmt.Printf(format, args...)
+}
+
 func (n *node) stateAccountCount() int {
 	n.stateLock.Lock()
 	defer n.stateLock.Unlock()
 	return len(n.state.accounts)
+}
+
+func (n *node) leaderID() uint64 {
+	if n.consensus == nil {
+		return 0
+	}
+	return n.consensus.GetLeaderID()
 }
 
 func cloneProposal(proposal bft.Proposal) bft.Proposal {

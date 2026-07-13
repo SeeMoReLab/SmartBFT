@@ -6,6 +6,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -138,6 +139,111 @@ func TestProposalDelayControllerPinsLeaderWindowPerPhase(t *testing.T) {
 	}
 }
 
+func TestProposalDelayControllerIntervalRepinsLeaderWindow(t *testing.T) {
+	specPath := t.TempDir() + "/failure_spec.xml"
+	spec := `<?xml version="1.0"?>
+<failureSpec>
+    <warmUpTime>0</warmUpTime>
+    <phases>
+        <phase>
+            <atTime>0</atTime>
+            <pbft>
+                <proposalDelay>
+                    <interval>1</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>25</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>2</atTime>
+            <pbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </pbft>
+        </phase>
+    </phases>
+</failureSpec>`
+	if err := os.WriteFile(specPath, []byte(spec), 0o600); err != nil {
+		t.Fatalf("write failure spec: %v", err)
+	}
+
+	ctrl, err := loadProposalDelayController(specPath, time.Now().Add(-500*time.Millisecond).UnixMilli())
+	if err != nil {
+		t.Fatalf("load failure spec: %v", err)
+	}
+
+	nodes := []uint64{1, 2, 3, 4}
+	ctrl.observeLeader(2, nodes)
+
+	delay := ctrl.delayForProposal(2, 2, nodes)
+	if delay != 25*time.Millisecond {
+		t.Fatalf("interval leader delay = %s, want 25ms", delay)
+	}
+
+	delay = ctrl.delayForProposal(1, 2, nodes)
+	if delay != 0 {
+		t.Fatalf("previous interval leader delay = %s, want 0", delay)
+	}
+}
+
+func TestProposalDelayControllerOpenEndedIntervalRepinsLeaderWindow(t *testing.T) {
+	specPath := t.TempDir() + "/failure_spec.xml"
+	spec := `<?xml version="1.0"?>
+<failureSpec>
+    <warmUpTime>0</warmUpTime>
+    <phases>
+        <phase>
+            <atTime>0</atTime>
+            <pbft>
+                <proposalDelay>
+                    <interval>1</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>25</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+    </phases>
+</failureSpec>`
+	if err := os.WriteFile(specPath, []byte(spec), 0o600); err != nil {
+		t.Fatalf("write failure spec: %v", err)
+	}
+
+	ctrl, err := loadProposalDelayController(specPath, time.Now().Add(-500*time.Millisecond).UnixMilli())
+	if err != nil {
+		t.Fatalf("load failure spec: %v", err)
+	}
+
+	nodes := []uint64{1, 2, 3, 4}
+	ctrl.observeLeader(2, nodes)
+
+	delay := ctrl.delayForProposal(2, 2, nodes)
+	if delay != 25*time.Millisecond {
+		t.Fatalf("first interval leader delay = %s, want 25ms", delay)
+	}
+
+	ctrl.startUnixMS = time.Now().Add(-1500 * time.Millisecond).UnixMilli()
+	ctrl.observeLeader(3, nodes)
+
+	delay = ctrl.delayForProposal(2, 3, nodes)
+	if delay != 0 {
+		t.Fatalf("previous interval leader delay = %s, want 0", delay)
+	}
+	delay = ctrl.delayForProposal(3, 3, nodes)
+	if delay != 25*time.Millisecond {
+		t.Fatalf("second interval leader delay = %s, want 25ms", delay)
+	}
+}
+
 func TestProposalDelayControllerExplicitReplica(t *testing.T) {
 	ctrl, err := loadProposalDelayController("testdata/failure_spec.xml", time.Now().Add(-1500*time.Millisecond).UnixMilli())
 	if err != nil {
@@ -256,8 +362,11 @@ func TestLearningEpisodeWindow(t *testing.T) {
 	if window.applyTick != 40 {
 		t.Fatalf("applyTick = %d, want 40", window.applyTick)
 	}
-	if window.rewardTick != 50 {
-		t.Fatalf("rewardTick = %d, want 50", window.rewardTick)
+	if window.rewardStartTick != 50 {
+		t.Fatalf("rewardStartTick = %d, want 50", window.rewardStartTick)
+	}
+	if window.rewardTick != 70 {
+		t.Fatalf("rewardTick = %d, want 70", window.rewardTick)
 	}
 }
 
@@ -282,7 +391,50 @@ func TestLearningApplyRecommendedTimeoutCallsCallback(t *testing.T) {
 	}
 }
 
-func TestLearningRewardMetricsResetOnApply(t *testing.T) {
+func TestLearningApplyRecommendedTimeoutAfterSkippedApplyTick(t *testing.T) {
+	var applied time.Duration
+	manager := &learningManager{
+		enabled:            true,
+		metrics:            newLearningWindowMetrics(),
+		currentEpisode:     1,
+		currentTimeout:     5 * time.Second,
+		reportTickInterval: 1000,
+		selectedWindow:     newLearningEpisodeWindow(0, 10, 10),
+		selectedTimeout:    700 * time.Millisecond,
+		applyTimeout: func(timeout time.Duration) error {
+			applied = timeout
+			return nil
+		},
+	}
+
+	manager.recordConsensus(learningSample{
+		Sequence:     16,
+		View:         0,
+		LeaderID:     1,
+		BatchSize:    1,
+		DecisionTime: time.Unix(0, 16*int64(time.Second)),
+		Latencies:    []time.Duration{time.Millisecond},
+		Timeout:      manager.currentTimeoutValue(),
+	})
+
+	if applied != 700*time.Millisecond {
+		t.Fatalf("applied = %s, want 700ms", applied)
+	}
+	if manager.currentTimeout != 700*time.Millisecond {
+		t.Fatalf("currentTimeout = %s, want 700ms", manager.currentTimeout)
+	}
+	if manager.selectedWindow.applyTick != 16 {
+		t.Fatalf("rebased applyTick = %d, want 16", manager.selectedWindow.applyTick)
+	}
+	if manager.selectedWindow.rewardStartTick != 21 {
+		t.Fatalf("rebased rewardStartTick = %d, want 21", manager.selectedWindow.rewardStartTick)
+	}
+	if manager.selectedWindow.rewardTick != 31 {
+		t.Fatalf("rebased rewardTick = %d, want 31", manager.selectedWindow.rewardTick)
+	}
+}
+
+func TestLearningRewardMetricsStartAfterWarmup(t *testing.T) {
 	manager := &learningManager{
 		enabled:            true,
 		metrics:            newLearningWindowMetrics(),
@@ -293,7 +445,7 @@ func TestLearningRewardMetricsResetOnApply(t *testing.T) {
 		selectedTimeout:    700 * time.Millisecond,
 	}
 
-	for seq := uint64(1); seq <= 20; seq++ {
+	for seq := uint64(1); seq <= 30; seq++ {
 		manager.recordConsensus(learningSample{
 			Sequence:     seq,
 			View:         0,
@@ -311,14 +463,133 @@ func TestLearningRewardMetricsResetOnApply(t *testing.T) {
 	if manager.pendingReward.episode != 1 {
 		t.Fatalf("pending reward episode = %d, want 1", manager.pendingReward.episode)
 	}
-	if got := manager.pendingReward.report.TotalConsensusInstances; got != 5 {
-		t.Fatalf("reward consensus instances = %d, want 5", got)
+	if got := manager.pendingReward.report.TotalConsensusInstances; got != 10 {
+		t.Fatalf("reward consensus instances = %d, want 10", got)
 	}
-	if got := manager.pendingReward.report.TotalTransactions; got != 5 {
-		t.Fatalf("reward total transactions = %d, want 5", got)
+	if got := manager.pendingReward.report.TotalTransactions; got != 10 {
+		t.Fatalf("reward total transactions = %d, want 10", got)
 	}
-	if manager.episodeStartTick != 20 {
-		t.Fatalf("next episode start tick = %d, want 20", manager.episodeStartTick)
+	if manager.episodeStartTick != 30 {
+		t.Fatalf("next episode start tick = %d, want 30", manager.episodeStartTick)
+	}
+}
+
+func TestLearningLateApplyDoesNotCaptureStaleRewardWindow(t *testing.T) {
+	var applied time.Duration
+	manager := &learningManager{
+		enabled:            true,
+		metrics:            newLearningWindowMetrics(),
+		currentEpisode:     1,
+		currentTimeout:     5 * time.Second,
+		lastTimeout:        5 * time.Second,
+		reportTickInterval: 1000,
+		selectedWindow:     newLearningEpisodeWindow(0, 10, 10),
+		selectedTimeout:    700 * time.Millisecond,
+		applyTimeout: func(timeout time.Duration) error {
+			applied = timeout
+			return nil
+		},
+	}
+
+	manager.recordConsensus(learningSample{
+		Sequence:     35,
+		View:         0,
+		LeaderID:     1,
+		BatchSize:    1,
+		DecisionTime: time.Unix(0, 35*int64(time.Second)),
+		Latencies:    []time.Duration{time.Millisecond},
+		Timeout:      manager.currentTimeoutValue(),
+	})
+
+	if applied != 700*time.Millisecond {
+		t.Fatalf("applied = %s, want 700ms", applied)
+	}
+	if manager.rewardMetricsStarted {
+		t.Fatalf("reward metrics started from stale window")
+	}
+	if manager.pendingReward != nil {
+		t.Fatalf("captured stale reward after late apply")
+	}
+	if manager.selectedWindow.applyTick != 35 {
+		t.Fatalf("rebased applyTick = %d, want 35", manager.selectedWindow.applyTick)
+	}
+	if manager.selectedWindow.rewardStartTick != 40 {
+		t.Fatalf("rebased rewardStartTick = %d, want 40", manager.selectedWindow.rewardStartTick)
+	}
+	if manager.selectedWindow.rewardTick != 50 {
+		t.Fatalf("rebased rewardTick = %d, want 50", manager.selectedWindow.rewardTick)
+	}
+
+	for seq := uint64(40); seq <= 50; seq++ {
+		manager.recordConsensus(learningSample{
+			Sequence:     seq,
+			View:         0,
+			LeaderID:     1,
+			BatchSize:    1,
+			DecisionTime: time.Unix(0, int64(seq)*int64(time.Second)),
+			Latencies:    []time.Duration{time.Millisecond},
+			Timeout:      manager.currentTimeoutValue(),
+		})
+	}
+
+	if manager.pendingReward == nil {
+		t.Fatalf("pending reward was not captured")
+	}
+	if got := manager.pendingReward.report.TotalConsensusInstances; got != 10 {
+		t.Fatalf("reward consensus instances = %d, want 10", got)
+	}
+	if manager.episodeStartTick != 50 {
+		t.Fatalf("next episode start tick = %d, want 50", manager.episodeStartTick)
+	}
+}
+
+func TestLearningRewardMetricsCountsGapWhenRewardStartIsSkipped(t *testing.T) {
+	manager := &learningManager{
+		enabled:                true,
+		metrics:                newLearningWindowMetrics(),
+		currentEpisode:         1,
+		currentTimeout:         700 * time.Millisecond,
+		lastTimeout:            700 * time.Millisecond,
+		reportTickInterval:     1000,
+		selectedWindow:         newLearningEpisodeWindow(0, 10, 10),
+		selectedTimeout:        700 * time.Millisecond,
+		applyHandledForEpisode: true,
+	}
+
+	manager.recordConsensus(learningSample{
+		Sequence:     19,
+		View:         0,
+		LeaderID:     1,
+		BatchSize:    1,
+		DecisionTime: time.Unix(0, 19*int64(time.Second)),
+		Latencies:    []time.Duration{time.Millisecond},
+		Timeout:      manager.currentTimeoutValue(),
+	})
+	manager.recordConsensus(learningSample{
+		Sequence:     25,
+		View:         0,
+		LeaderID:     1,
+		BatchSize:    5,
+		DecisionTime: time.Unix(0, 29*int64(time.Second)),
+		Latencies:    []time.Duration{time.Millisecond},
+		Timeout:      manager.currentTimeoutValue(),
+	})
+
+	if !manager.rewardMetricsStarted {
+		t.Fatalf("reward metrics were not started")
+	}
+	report := manager.metrics.buildReport()
+	if report == nil {
+		t.Fatalf("reward report is nil")
+	}
+	if got := report.TotalConsensusInstances; got != 1 {
+		t.Fatalf("reward consensus instances = %d, want 1", got)
+	}
+	if got := report.TotalTransactions; got != 5 {
+		t.Fatalf("reward transactions = %d, want 5", got)
+	}
+	if got := report.ThroughputTps; got < 0.499 || got > 0.501 {
+		t.Fatalf("reward throughput = %f, want about 0.5", got)
 	}
 }
 

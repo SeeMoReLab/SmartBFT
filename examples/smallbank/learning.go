@@ -43,11 +43,12 @@ type learningDecision struct {
 }
 
 type learningEpisodeWindow struct {
-	startTick  uint64
-	reportSeq  uint64
-	reportLen  uint64
-	applyTick  uint64
-	rewardTick uint64
+	startTick       uint64
+	reportSeq       uint64
+	reportLen       uint64
+	applyTick       uint64
+	rewardStartTick uint64
+	rewardTick      uint64
 }
 
 type pendingLearningReward struct {
@@ -81,10 +82,12 @@ type learningManager struct {
 	reportSentForEpisode       bool
 	reachedReportCapForEpisode bool
 	capApplyDeadlineTick       uint64
+	capRewardStartTick         uint64
 	capRewardDeadlineTick      uint64
 	selectedWindow             *learningEpisodeWindow
 	selectedTimeout            time.Duration
 	applyHandledForEpisode     bool
+	rewardMetricsStarted       bool
 	rewardCapturedForEpisode   bool
 	waitingForRecommendation   bool
 
@@ -179,6 +182,7 @@ func (m *learningManager) recordConsensus(sample learningSample) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	previousDecisionTime := m.metrics.lastDecisionTime
 	m.metrics.record(sample)
 	if m.episodeStartWallTime.IsZero() {
 		m.episodeStartWallTime = time.Now()
@@ -194,6 +198,7 @@ func (m *learningManager) recordConsensus(sample learningSample) {
 		m.maybeSendReportTickLocked(sample.Sequence)
 	}
 	m.maybeHandleApplyDeadlineLocked(sample.Sequence)
+	m.maybeHandleRewardStartLocked(sample, previousDecisionTime)
 	m.maybeHandleRewardDeadlineLocked(sample.Sequence)
 }
 
@@ -244,6 +249,7 @@ func (m *learningManager) maybeSendReportTickLocked(sequence uint64) {
 		m.reachedReportCapForEpisode = true
 		window := newLearningEpisodeWindow(m.episodeStartTick, reportSeq, reportLength)
 		m.capApplyDeadlineTick = window.applyTick
+		m.capRewardStartTick = window.rewardStartTick
 		m.capRewardDeadlineTick = window.rewardTick
 	}
 }
@@ -259,8 +265,8 @@ func (m *learningManager) maybeConsumeRecommendationLocked(sequence uint64) {
 	m.selectedTimeout = decision.timeout
 	m.waitingForRecommendation = false
 	m.stopTimeoutPollingLocked()
-	fmt.Printf("[learning] received recommendation: episode=%d report_seq=%d apply_tick=%d reward_tick=%d timeout_ms=%d current_seq=%d\n",
-		m.currentEpisode, window.reportSeq, window.applyTick, window.rewardTick, decision.timeout.Milliseconds(), sequence)
+	fmt.Printf("[learning] received recommendation: episode=%d report_seq=%d apply_tick=%d reward_start_tick=%d reward_tick=%d timeout_ms=%d current_seq=%d\n",
+		m.currentEpisode, window.reportSeq, window.applyTick, window.rewardStartTick, window.rewardTick, decision.timeout.Milliseconds(), sequence)
 
 	if sequence > window.applyTick {
 		m.applyHandledForEpisode = true
@@ -281,7 +287,7 @@ func (m *learningManager) maybeHandleApplyDeadlineLocked(sequence uint64) {
 		applied := false
 		var applyErr error
 		recommendedTimeout := m.selectedTimeout
-		if sequence == m.selectedWindow.applyTick && recommendedTimeout > 0 {
+		if recommendedTimeout > 0 {
 			if err := m.applyRecommendedTimeoutLocked(recommendedTimeout); err != nil {
 				applyErr = err
 				fmt.Printf("[learning] failed to apply recommendation: episode=%d report_seq=%d apply_tick=%d current_seq=%d timeout_ms=%d err=%v\n",
@@ -293,9 +299,10 @@ func (m *learningManager) maybeHandleApplyDeadlineLocked(sequence uint64) {
 		m.applyHandledForEpisode = true
 		m.lastTimeout = m.currentTimeout
 		if applied {
+			m.rebaseSelectedWindowAfterApplyLocked(sequence)
 			m.metrics.resetWithThroughputStart(time.Now())
-			fmt.Printf("[learning] applied recommendation on time: episode=%d report_seq=%d apply_tick=%d current_seq=%d timeout_ms=%d\n",
-				m.currentEpisode, m.selectedWindow.reportSeq, m.selectedWindow.applyTick, sequence, m.currentTimeout.Milliseconds())
+			fmt.Printf("[learning] applied recommendation: episode=%d report_seq=%d apply_tick=%d reward_start_tick=%d reward_tick=%d current_seq=%d timeout_ms=%d\n",
+				m.currentEpisode, m.selectedWindow.reportSeq, m.selectedWindow.applyTick, m.selectedWindow.rewardStartTick, m.selectedWindow.rewardTick, sequence, m.currentTimeout.Milliseconds())
 		} else if applyErr != nil {
 			fmt.Printf("[learning] apply deadline reached with recommendation apply failure: episode=%d report_seq=%d apply_tick=%d current_seq=%d recommended_timeout_ms=%d current_timeout_ms=%d err=%v\n",
 				m.currentEpisode, m.selectedWindow.reportSeq, m.selectedWindow.applyTick, sequence, recommendedTimeout.Milliseconds(), m.currentTimeout.Milliseconds(), applyErr)
@@ -313,6 +320,46 @@ func (m *learningManager) maybeHandleApplyDeadlineLocked(sequence uint64) {
 		fmt.Printf("[learning] recommendation unavailable at cap apply deadline: episode=%d cap_apply_tick=%d current_seq=%d timeout_ms=%d\n",
 			m.currentEpisode, m.capApplyDeadlineTick, sequence, m.currentTimeout.Milliseconds())
 	}
+}
+
+func (m *learningManager) rebaseSelectedWindowAfterApplyLocked(sequence uint64) {
+	if m.selectedWindow == nil || sequence <= m.selectedWindow.applyTick {
+		return
+	}
+	applyToRewardStart := m.selectedWindow.rewardStartTick - m.selectedWindow.applyTick
+	m.selectedWindow.applyTick = sequence
+	m.selectedWindow.rewardStartTick = sequence + applyToRewardStart
+	m.selectedWindow.rewardTick = m.selectedWindow.rewardStartTick + m.selectedWindow.reportLen
+}
+
+func (m *learningManager) maybeHandleRewardStartLocked(sample learningSample, previousDecisionTime time.Time) {
+	if m.rewardMetricsStarted || m.rewardCapturedForEpisode {
+		return
+	}
+	var rewardStartTick uint64
+	source := "none"
+	if m.selectedWindow != nil {
+		rewardStartTick = m.selectedWindow.rewardStartTick
+		source = "recommended_window"
+	} else if m.reachedReportCapForEpisode && m.capRewardStartTick > 0 {
+		rewardStartTick = m.capRewardStartTick
+		source = "cap_window"
+	}
+	if rewardStartTick == 0 || sample.Sequence < rewardStartTick {
+		return
+	}
+
+	throughputStart := sample.DecisionTime
+	if sample.Sequence > rewardStartTick && !previousDecisionTime.IsZero() {
+		throughputStart = previousDecisionTime
+	}
+	m.metrics.resetWithThroughputStart(throughputStart)
+	if sample.Sequence > rewardStartTick {
+		m.metrics.record(sample)
+	}
+	m.rewardMetricsStarted = true
+	fmt.Printf("[learning] started reward measurement: episode=%d reward_start_tick=%d current_seq=%d source=%s timeout_ms=%d\n",
+		m.currentEpisode, rewardStartTick, sample.Sequence, source, m.lastTimeout.Milliseconds())
 }
 
 func (m *learningManager) applyRecommendedTimeoutLocked(timeout time.Duration) error {
@@ -342,6 +389,9 @@ func (m *learningManager) maybeHandleRewardDeadlineLocked(sequence uint64) {
 		source = "cap_window"
 	}
 	if rewardDeadline == 0 || sequence < rewardDeadline {
+		return
+	}
+	if !m.rewardMetricsStarted {
 		return
 	}
 
@@ -479,10 +529,12 @@ func (m *learningManager) startNextEpisodeLocked(startTick uint64) {
 	m.reportSentForEpisode = false
 	m.reachedReportCapForEpisode = false
 	m.capApplyDeadlineTick = 0
+	m.capRewardStartTick = 0
 	m.capRewardDeadlineTick = 0
 	m.selectedWindow = nil
 	m.selectedTimeout = 0
 	m.applyHandledForEpisode = false
+	m.rewardMetricsStarted = false
 	m.rewardCapturedForEpisode = false
 	m.waitingForRecommendation = false
 	m.pollerDecision = nil
@@ -492,10 +544,11 @@ func (m *learningManager) startNextEpisodeLocked(startTick uint64) {
 
 func newLearningEpisodeWindow(startTick, reportSeq, reportLength uint64) *learningEpisodeWindow {
 	return &learningEpisodeWindow{
-		startTick:  startTick,
-		reportSeq:  reportSeq,
-		reportLen:  reportLength,
-		applyTick:  reportSeq + reportLength/2,
-		rewardTick: reportSeq + reportLength,
+		startTick:       startTick,
+		reportSeq:       reportSeq,
+		reportLen:       reportLength,
+		applyTick:       reportSeq + reportLength/2,
+		rewardStartTick: reportSeq + reportLength,
+		rewardTick:      reportSeq + 2*reportLength,
 	}
 }

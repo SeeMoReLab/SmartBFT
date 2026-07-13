@@ -117,6 +117,14 @@ func encodeBlockHeader(header blockHeader) []byte {
 	return raw
 }
 
+func decodeBlockHeader(raw []byte) (*blockHeader, error) {
+	var header blockHeader
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return nil, err
+	}
+	return &header, nil
+}
+
 func hashBytes(raw []byte) string {
 	digest := sha256.Sum256(raw)
 	return hex.EncodeToString(digest[:])

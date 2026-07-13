@@ -35,7 +35,7 @@ import (
 const (
 	defaultNetworkSendTimeout = 2 * time.Second
 	consensusQueueSize        = 4096
-	asyncForwardLimit         = 256
+	asyncForwardLimit         = 1024
 	smallBankNetworkService   = "smallbank.SmallBankNetwork"
 	methodConsensus           = "/" + smallBankNetworkService + "/Consensus"
 	methodTransaction         = "/" + smallBankNetworkService + "/Transaction"
@@ -408,11 +408,20 @@ type networkOutbound struct {
 	method   string
 	request  any
 	coalesce *networkCoalesceKey
+	trace    string
 }
 
 type networkCoalesceKey struct {
 	kind string
 	view uint64
+}
+
+func smallBankRequestTrace(raw []byte) string {
+	req, err := decodeRequest(raw)
+	if err != nil {
+		return fmt.Sprintf("request_decode_error=%q request_bytes=%d", err.Error(), len(raw))
+	}
+	return fmt.Sprintf("request={%s %s}", req.ClientID, req.ID)
 }
 
 func smartBFTNetworkCoalesceKey(message *smartbftprotos.Message) *networkCoalesceKey {
@@ -455,6 +464,93 @@ func smartBFTSignedViewDataTarget(svd *smartbftprotos.SignedViewData) (uint64, b
 		return 0, false
 	}
 	return vd.GetNextView(), true
+}
+
+func smartBFTTraceMessageSummary(message *smartbftprotos.Message) string {
+	if message == nil {
+		return "type=nil view=na seq=na"
+	}
+	switch msg := message.GetContent().(type) {
+	case *smartbftprotos.Message_PrePrepare:
+		pp := msg.PrePrepare
+		if pp == nil {
+			return "type=pre_prepare view=na seq=na"
+		}
+		batchBytes := 0
+		if pp.Proposal != nil {
+			batchBytes = len(pp.Proposal.Payload)
+		}
+		return fmt.Sprintf("type=pre_prepare view=%d seq=%d proposal_bytes=%d", pp.GetView(), pp.GetSeq(), batchBytes)
+	case *smartbftprotos.Message_Prepare:
+		prepare := msg.Prepare
+		if prepare == nil {
+			return "type=prepare view=na seq=na"
+		}
+		return fmt.Sprintf("type=prepare view=%d seq=%d", prepare.GetView(), prepare.GetSeq())
+	case *smartbftprotos.Message_Commit:
+		commit := msg.Commit
+		if commit == nil {
+			return "type=commit view=na seq=na"
+		}
+		signer := uint64(0)
+		if commit.GetSignature() != nil {
+			signer = commit.GetSignature().GetSigner()
+		}
+		return fmt.Sprintf("type=commit view=%d seq=%d signer=%d", commit.GetView(), commit.GetSeq(), signer)
+	case *smartbftprotos.Message_ViewChange:
+		vc := msg.ViewChange
+		if vc == nil {
+			return "type=view_change next_view=na"
+		}
+		return fmt.Sprintf("type=view_change next_view=%d", vc.GetNextView())
+	case *smartbftprotos.Message_ViewData:
+		nextView := uint64(0)
+		signer := uint64(0)
+		if msg.ViewData != nil {
+			signer = msg.ViewData.GetSigner()
+			vd := &smartbftprotos.ViewData{}
+			if err := proto.Unmarshal(msg.ViewData.GetRawViewData(), vd); err == nil {
+				nextView = vd.GetNextView()
+			}
+		}
+		return fmt.Sprintf("type=view_data next_view=%d signer=%d", nextView, signer)
+	case *smartbftprotos.Message_NewView:
+		count := 0
+		nextView := uint64(0)
+		if msg.NewView != nil {
+			count = len(msg.NewView.GetSignedViewData())
+			for _, svd := range msg.NewView.GetSignedViewData() {
+				vd := &smartbftprotos.ViewData{}
+				if err := proto.Unmarshal(svd.GetRawViewData(), vd); err == nil {
+					nextView = vd.GetNextView()
+					break
+				}
+			}
+		}
+		return fmt.Sprintf("type=new_view next_view=%d view_data_count=%d", nextView, count)
+	case *smartbftprotos.Message_HeartBeat:
+		hb := msg.HeartBeat
+		if hb == nil {
+			return "type=heartbeat view=na seq=na"
+		}
+		return fmt.Sprintf("type=heartbeat view=%d seq=%d", hb.GetView(), hb.GetSeq())
+	case *smartbftprotos.Message_HeartBeatResponse:
+		hbr := msg.HeartBeatResponse
+		if hbr == nil {
+			return "type=heartbeat_response view=na"
+		}
+		return fmt.Sprintf("type=heartbeat_response view=%d", hbr.GetView())
+	case *smartbftprotos.Message_StateTransferRequest:
+		return "type=state_transfer_request"
+	case *smartbftprotos.Message_StateTransferResponse:
+		st := msg.StateTransferResponse
+		if st == nil {
+			return "type=state_transfer_response view=na seq=na"
+		}
+		return fmt.Sprintf("type=state_transfer_response view=%d seq=%d", st.GetViewNum(), st.GetSequence())
+	default:
+		return fmt.Sprintf("type=%T", msg)
+	}
 }
 
 func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, error) {
@@ -530,9 +626,11 @@ func (t *networkTransport) sendConsensus(targetID uint64, message *smartbftproto
 		return
 	}
 	key := smartBFTNetworkCoalesceKey(message)
+	trace := smartBFTTraceMessageSummary(message)
 	t.enqueue(targetID, networkOutbound{
 		method:   methodConsensus,
 		coalesce: key,
+		trace:    trace,
 		request: &grpcConsensusRequest{
 			From:    t.selfID,
 			Message: raw,
@@ -541,8 +639,10 @@ func (t *networkTransport) sendConsensus(targetID uint64, message *smartbftproto
 }
 
 func (t *networkTransport) sendTransaction(targetID uint64, payload []byte) {
+	trace := smallBankRequestTrace(payload)
 	t.enqueue(targetID, networkOutbound{
 		method: methodTransaction,
+		trace:  trace,
 		request: &grpcTransactionRequest{
 			From:    t.selfID,
 			Payload: append([]byte(nil), payload...),
@@ -556,12 +656,37 @@ func (t *networkTransport) enqueue(targetID uint64, outbound networkOutbound) {
 		return
 	}
 	if !t.reservePending(targetID, outbound.coalesce) {
+		if outbound.method == methodConsensus {
+			smallbankTracePrintf("%s event=send_consensus_drop_coalesced node=%d to=%d queue_len=%d queue_cap=%d %s\n",
+				timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
+		}
 		return
+	}
+	if outbound.method == methodConsensus {
+		smallbankTracePrintf("%s event=send_consensus_enqueue_start node=%d to=%d queue_len=%d queue_cap=%d %s\n",
+			timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
+	} else if outbound.method == methodTransaction {
+		smallbankTracePrintf("%s event=forward_enqueue_start node=%d to=%d queue_len=%d queue_cap=%d %s\n",
+			timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
 	}
 	select {
 	case queue <- outbound:
+		if outbound.method == methodConsensus {
+			smallbankTracePrintf("%s event=send_consensus_enqueue_done node=%d to=%d queue_len=%d queue_cap=%d %s\n",
+				timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
+		} else if outbound.method == methodTransaction {
+			smallbankTracePrintf("%s event=forward_enqueue_done node=%d to=%d queue_len=%d queue_cap=%d %s\n",
+				timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
+		}
 	case <-t.stop:
 		t.releasePending(targetID, outbound.coalesce)
+		if outbound.method == methodConsensus {
+			smallbankTracePrintf("%s event=send_consensus_enqueue_stopped node=%d to=%d %s\n",
+				timestampedLogTag("trace"), t.selfID, targetID, outbound.trace)
+		} else if outbound.method == methodTransaction {
+			smallbankTracePrintf("%s event=forward_enqueue_stopped node=%d to=%d %s\n",
+				timestampedLogTag("trace"), t.selfID, targetID, outbound.trace)
+		}
 	}
 }
 
@@ -572,6 +697,13 @@ func (t *networkTransport) worker(host hostEntry, conn *grpc.ClientConn, queue <
 		case <-t.stop:
 			return
 		case outbound := <-queue:
+			if outbound.method == methodConsensus {
+				smallbankTracePrintf("%s event=send_consensus_dequeue node=%d to=%d queue_len=%d queue_cap=%d %s\n",
+					timestampedLogTag("trace"), t.selfID, host.ID, len(queue), cap(queue), outbound.trace)
+			} else if outbound.method == methodTransaction {
+				smallbankTracePrintf("%s event=forward_dequeue node=%d to=%d queue_len=%d queue_cap=%d %s\n",
+					timestampedLogTag("trace"), t.selfID, host.ID, len(queue), cap(queue), outbound.trace)
+			}
 			t.releasePending(host.ID, outbound.coalesce)
 			if outbound.method == methodTransaction {
 				t.invokeForwardAsync(host, conn, outbound)
@@ -614,13 +746,19 @@ func (t *networkTransport) releasePending(targetID uint64, key *networkCoalesceK
 func (t *networkTransport) invokeForwardAsync(host hostEntry, conn *grpc.ClientConn, outbound networkOutbound) {
 	inflight, exists := t.forwardInflight[host.ID]
 	if !exists {
+		smallbankTracePrintf("%s event=forward_drop node=%d to=%d reason=no_inflight_bucket %s\n",
+			timestampedLogTag("trace"), t.selfID, host.ID, outbound.trace)
 		return
 	}
 	select {
 	case inflight <- struct{}{}:
 	case <-t.stop:
+		smallbankTracePrintf("%s event=forward_drop node=%d to=%d reason=transport_stopped %s\n",
+			timestampedLogTag("trace"), t.selfID, host.ID, outbound.trace)
 		return
 	default:
+		smallbankTracePrintf("%s event=forward_drop node=%d to=%d reason=inflight_full inflight_len=%d inflight_cap=%d %s\n",
+			timestampedLogTag("trace"), t.selfID, host.ID, len(inflight), cap(inflight), outbound.trace)
 		return
 	}
 
@@ -634,8 +772,33 @@ func (t *networkTransport) invokeForwardAsync(host hostEntry, conn *grpc.ClientC
 
 func (t *networkTransport) invokeOnce(host hostEntry, conn *grpc.ClientConn, outbound networkOutbound) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
+	start := time.Now()
+	if outbound.method == methodConsensus {
+		smallbankTracePrintf("%s event=send_consensus_rpc_start node=%d to=%d method=%s %s\n",
+			timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, outbound.trace)
+	} else if outbound.method == methodTransaction {
+		smallbankTracePrintf("%s event=forward_rpc_start node=%d to=%d method=%s %s\n",
+			timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, outbound.trace)
+	}
 	err := conn.Invoke(ctx, outbound.method, outbound.request, &grpcAck{})
 	cancel()
+	if outbound.method == methodConsensus {
+		if err != nil {
+			smallbankTracePrintf("%s event=send_consensus_rpc_done node=%d to=%d method=%s elapsed_ms=%d err=%q %s\n",
+				timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, time.Since(start).Milliseconds(), err.Error(), outbound.trace)
+		} else {
+			smallbankTracePrintf("%s event=send_consensus_rpc_done node=%d to=%d method=%s elapsed_ms=%d err=\"\" %s\n",
+				timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, time.Since(start).Milliseconds(), outbound.trace)
+		}
+	} else if outbound.method == methodTransaction {
+		if err != nil {
+			smallbankTracePrintf("%s event=forward_rpc_done node=%d to=%d method=%s elapsed_ms=%d err=%q %s\n",
+				timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, time.Since(start).Milliseconds(), err.Error(), outbound.trace)
+		} else {
+			smallbankTracePrintf("%s event=forward_rpc_done node=%d to=%d method=%s elapsed_ms=%d err=\"\" %s\n",
+				timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, time.Since(start).Milliseconds(), outbound.trace)
+		}
+	}
 	if err == nil {
 		return
 	}
@@ -649,10 +812,17 @@ func (t *networkTransport) fetchStateSnapshot(targetID uint64) (stateSyncSnapsho
 	ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
 	defer cancel()
 
+	start := time.Now()
+	smallbankTracePrintf("%s event=sync_rpc_start node=%d to=%d method=StateSnapshot\n",
+		timestampedLogTag("trace"), t.selfID, targetID)
 	var snapshot stateSyncSnapshot
 	if err := conn.Invoke(ctx, methodStateSnapshot, &grpcStateSnapshotRequest{}, &snapshot); err != nil {
+		smallbankTracePrintf("%s event=sync_rpc_done node=%d to=%d method=StateSnapshot elapsed_ms=%d err=%q\n",
+			timestampedLogTag("trace"), t.selfID, targetID, time.Since(start).Milliseconds(), err.Error())
 		return stateSyncSnapshot{}, err
 	}
+	smallbankTracePrintf("%s event=sync_rpc_done node=%d to=%d method=StateSnapshot elapsed_ms=%d err=\"\" view=%d seq=%d source=%d\n",
+		timestampedLogTag("trace"), t.selfID, targetID, time.Since(start).Milliseconds(), snapshot.View, snapshot.Sequence, snapshot.NodeID)
 	return snapshot, nil
 }
 
@@ -1157,6 +1327,13 @@ func (s *networkNodeServer) handleConsensusRequest(req *grpcConsensusRequest) er
 	if err := proto.Unmarshal(req.Message, msg); err != nil {
 		return grpcstatus.Errorf(codes.InvalidArgument, "decode consensus message: %v", err)
 	}
+	start := time.Now()
+	smallbankTracePrintf("%s event=recv_consensus_start node=%d from=%d %s\n",
+		timestampedLogTag("trace"), s.node.id, req.From, smartBFTTraceMessageSummary(msg))
+	defer func() {
+		smallbankTracePrintf("%s event=recv_consensus_done node=%d from=%d elapsed_ms=%d %s\n",
+			timestampedLogTag("trace"), s.node.id, req.From, time.Since(start).Milliseconds(), smartBFTTraceMessageSummary(msg))
+	}()
 	s.node.consensus.HandleMessage(req.From, msg)
 	return nil
 }
@@ -1169,7 +1346,21 @@ func (s *networkNodeServer) Consensus(_ context.Context, req *grpcConsensusReque
 }
 
 func (s *networkNodeServer) Transaction(_ context.Context, req *grpcTransactionRequest) (*grpcAck, error) {
-	s.node.consensus.HandleRequest(req.From, req.Payload)
+	start := time.Now()
+	trace := smallBankRequestTrace(req.Payload)
+	smallbankTracePrintf("%s event=recv_forward_start node=%d from=%d %s\n",
+		timestampedLogTag("trace"), s.node.id, req.From, trace)
+	defer func() {
+		smallbankTracePrintf("%s event=recv_forward_done node=%d from=%d elapsed_ms=%d %s\n",
+			timestampedLogTag("trace"), s.node.id, req.From, time.Since(start).Milliseconds(), trace)
+	}()
+	if err := s.node.consensus.HandleRequest(req.From, req.Payload); err != nil {
+		smallbankTracePrintf("%s event=recv_forward_submit_result node=%d from=%d result=rejected err=%q %s\n",
+			timestampedLogTag("trace"), s.node.id, req.From, err.Error(), trace)
+		return &grpcAck{}, nil
+	}
+	smallbankTracePrintf("%s event=recv_forward_submit_result node=%d from=%d result=accepted err=\"\" %s\n",
+		timestampedLogTag("trace"), s.node.id, req.From, trace)
 	return &grpcAck{}, nil
 }
 
@@ -1258,7 +1449,12 @@ func (s *networkNodeServer) Checksum(context.Context, *grpcChecksumRequest) (*gr
 }
 
 func (s *networkNodeServer) StateSnapshot(context.Context, *grpcStateSnapshotRequest) (*stateSyncSnapshot, error) {
+	start := time.Now()
+	smallbankTracePrintf("%s event=recv_sync_start node=%d method=StateSnapshot\n",
+		timestampedLogTag("trace"), s.node.id)
 	snapshot := s.node.localStateSyncSnapshot()
+	smallbankTracePrintf("%s event=recv_sync_done node=%d method=StateSnapshot elapsed_ms=%d view=%d seq=%d\n",
+		timestampedLogTag("trace"), s.node.id, time.Since(start).Milliseconds(), snapshot.View, snapshot.Sequence)
 	return &snapshot, nil
 }
 

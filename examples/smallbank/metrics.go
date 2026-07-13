@@ -100,8 +100,8 @@ func printResults(label string, duration time.Duration, snap metricsSnapshot) {
 	maxLatency := maximumLatency(snap.histogram, snap.success)
 
 	if label == "Monitor" {
-		fmt.Printf("%s duration=%.3fs trxs=%d succ=%d err=%d tps=%.3f avg_ms=%.3f p50=%d p95=%d p99=%d max=%d\n",
-			label, seconds, total, snap.success, snap.errors, tps, avgMS, p50, p95, p99, maxLatency)
+		fmt.Printf("%s %s duration=%.3fs trxs=%d succ=%d err=%d tps=%.3f avg_ms=%.3f p50=%d p95=%d p99=%d max=%d\n",
+			timestampedLogTag("client"), label, seconds, total, snap.success, snap.errors, tps, avgMS, p50, p95, p99, maxLatency)
 		return
 	}
 

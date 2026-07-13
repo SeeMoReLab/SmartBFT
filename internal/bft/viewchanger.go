@@ -236,18 +236,28 @@ func (v *ViewChanger) Stop() {
 // HandleMessage passes a message to the view changer
 func (v *ViewChanger) HandleMessage(sender uint64, m *protos.Message) {
 	if v.dropStaleViewMessage(sender, m) {
+		tracePrintf("%s event=viewchanger_drop_stale node=%d from=%d curr_view=%d next_view=%d real_view=%d %s\n",
+			traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, traceMessageSummary(m))
 		return
 	}
 	key, coalesce := v.reservePendingViewMessage(sender, m)
 	if !coalesce {
+		tracePrintf("%s event=viewchanger_drop_coalesced node=%d from=%d curr_view=%d next_view=%d real_view=%d %s\n",
+			traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, traceMessageSummary(m))
 		return
 	}
 	msg := &incMsg{sender: sender, Message: m, coalesce: key}
+	tracePrintf("%s event=viewchanger_enqueue_start node=%d from=%d curr_view=%d next_view=%d real_view=%d queue_len=%d queue_cap=%d %s\n",
+		traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, len(v.incMsgs), cap(v.incMsgs), traceMessageSummary(m))
 	select {
 	case <-v.stopChan:
 		v.releasePendingViewMessage(key)
+		tracePrintf("%s event=viewchanger_enqueue_stopped node=%d from=%d curr_view=%d next_view=%d real_view=%d %s\n",
+			traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, traceMessageSummary(m))
 		return
 	case v.incMsgs <- msg:
+		tracePrintf("%s event=viewchanger_enqueue_done node=%d from=%d curr_view=%d next_view=%d real_view=%d queue_len=%d queue_cap=%d %s\n",
+			traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, len(v.incMsgs), cap(v.incMsgs), traceMessageSummary(m))
 	}
 }
 
@@ -535,6 +545,13 @@ func (v *ViewChanger) startViewChangeTimeout() {
 	}
 	v.startViewChangeTime = v.lastTick
 	v.checkTimeout = true
+	v.emitViewEvent(
+		"view_change_timeout_started",
+		v.currView,
+		v.nextView,
+		0,
+		fmt.Sprintf("votes=%d required=%d senders=%v", len(v.viewChangeMsgs.voted), v.quorum-1, sortedVoteSenders(v.viewChangeMsgs)),
+	)
 }
 
 func (v *ViewChanger) promoteFutureViewChangeTarget(targetView uint64) bool {
@@ -587,6 +604,13 @@ func (v *ViewChanger) retryTimedOutViewChange() {
 }
 
 func (v *ViewChanger) processMsg(sender uint64, m *protos.Message) {
+	start := time.Now()
+	tracePrintf("%s event=viewchanger_process_start node=%d from=%d curr_view=%d next_view=%d real_view=%d %s\n",
+		traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, traceMessageSummary(m))
+	defer func() {
+		tracePrintf("%s event=viewchanger_process_done node=%d from=%d curr_view=%d next_view=%d real_view=%d elapsed_ms=%d %s\n",
+			traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, time.Since(start).Milliseconds(), traceMessageSummary(m))
+	}()
 	// viewChange message
 	if vc := m.GetViewChange(); vc != nil {
 		v.Logger.Debugf("Node %d is processing a view change message %v from %d with next view %d", v.SelfID, m, sender, vc.NextView)
@@ -811,6 +835,13 @@ func (v *ViewChanger) startViewChange(change *change) {
 		detail = fmt.Sprintf("%s catch_up=true old_next_view=%d", detail, oldNextView)
 	}
 	v.emitViewEvent("start_view_change", v.currView, v.nextView, 0, detail)
+	v.emitViewEvent(
+		"election_trigger",
+		v.currView,
+		v.nextView,
+		0,
+		fmt.Sprintf("reason=start_view_change stop_view=%t catch_up=%t votes=%d required=%d senders=%v", change.stopView, change.catchUp, len(v.viewChangeMsgs.voted), v.quorum-1, sortedVoteSenders(v.viewChangeMsgs)),
+	)
 	v.RequestsTimer.StopTimers()
 	msg := &protos.Message{
 		Content: &protos.Message_ViewChange{
@@ -839,6 +870,13 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 	)
 	if ((uint64(len(v.viewChangeMsgs.voted)) == uint64(v.f+1)) && v.SpeedUpViewChange) || restore { // join view change
 		v.Logger.Debugf("Node %d is joining view change, last view is %d", v.SelfID, v.currView)
+		v.emitViewEvent(
+			"election_trigger",
+			v.currView,
+			target,
+			0,
+			fmt.Sprintf("reason=view_change_votes_speedup restore=%t votes=%d required=%d senders=%v", restore, len(v.viewChangeMsgs.voted), v.f+1, sortedVoteSenders(v.viewChangeMsgs)),
+		)
 		v.startViewChange(&change{view: v.currView, nextView: target, stopView: true})
 	}
 	if (len(v.viewChangeMsgs.voted) < v.quorum-1) && !restore {
@@ -848,6 +886,13 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 	// send view data
 	if !v.SpeedUpViewChange {
 		v.Logger.Debugf("Node %d is joining view change, last view is %d", v.SelfID, v.currView)
+		v.emitViewEvent(
+			"election_trigger",
+			v.currView,
+			target,
+			0,
+			fmt.Sprintf("reason=view_change_votes_no_speedup restore=%t votes=%d required=%d senders=%v", restore, len(v.viewChangeMsgs.voted), v.quorum-1, sortedVoteSenders(v.viewChangeMsgs)),
+		)
 		v.startViewChange(&change{view: v.currView, nextView: target, stopView: true})
 	}
 	if !restore {
@@ -1940,11 +1985,17 @@ func (v *ViewChanger) syncInFlight(attempt *inFlightAttempt) {
 
 // HandleViewMessage passes a message to the in flight proposal view if applicable
 func (v *ViewChanger) HandleViewMessage(sender uint64, m *protos.Message) {
+	tracePrintf("%s event=inflight_view_check node=%d from=%d curr_view=%d next_view=%d real_view=%d %s\n",
+		traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, traceMessageSummary(m))
 	v.inFlightViewLock.RLock()
 	defer v.inFlightViewLock.RUnlock()
 	if view := v.inFlightView; view != nil {
 		v.Logger.Debugf("Node %d is passing a message to the in flight view", v.SelfID)
+		tracePrintf("%s event=inflight_view_forward node=%d from=%d inflight_view=%d inflight_seq=%d %s\n",
+			traceLogTag("trace"), v.SelfID, sender, view.Number, view.ProposalSequence, traceMessageSummary(m))
 		view.HandleMessage(sender, m)
+		tracePrintf("%s event=inflight_view_forward_done node=%d from=%d inflight_view=%d inflight_seq=%d %s\n",
+			traceLogTag("trace"), v.SelfID, sender, view.Number, view.ProposalSequence, traceMessageSummary(m))
 	}
 }
 

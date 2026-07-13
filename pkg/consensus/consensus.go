@@ -300,10 +300,10 @@ func (c *Consensus) HandleMessage(sender uint64, m *protos.Message) {
 	c.controller.ProcessMessages(sender, m)
 }
 
-func (c *Consensus) HandleRequest(sender uint64, req []byte) {
+func (c *Consensus) HandleRequest(sender uint64, req []byte) error {
 	c.consensusLock.RLock()
 	defer c.consensusLock.RUnlock()
-	c.controller.HandleRequest(sender, req)
+	return c.controller.HandleRequest(sender, req)
 }
 
 func (c *Consensus) SubmitRequest(req []byte) error {

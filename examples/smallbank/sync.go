@@ -44,12 +44,25 @@ type stateSyncResult struct {
 
 func (n *node) Sync() bft.SyncResponse {
 	local := n.localStateSyncSnapshot()
+	start := time.Now()
+	smallbankTracePrintf("%s event=app_sync_start node=%d local_view=%d local_seq=%d network=%t\n",
+		timestampedLogTag("trace"), n.id, local.View, local.Sequence, n.network != nil)
+	defer func() {
+		smallbankTracePrintf("%s event=app_sync_done node=%d elapsed_ms=%d\n",
+			timestampedLogTag("trace"), n.id, time.Since(start).Milliseconds())
+	}()
 	if n.network == nil {
 		n.logStateSyncSnapshot("local", local, 1, 1)
 		return bft.SyncResponse{Latest: cloneDecision(local.Latest)}
 	}
 
 	targetCount := stateSyncMatchCount(len(n.Nodes()))
+	return n.fullSnapshotSync(local, targetCount)
+}
+
+func (n *node) fullSnapshotSync(local stateSyncSnapshot, targetCount int) bft.SyncResponse {
+	smallbankTracePrintf("%s event=app_sync_full_snapshot_start node=%d local_view=%d local_seq=%d required=%d\n",
+		timestampedLogTag("trace"), n.id, local.View, local.Sequence, targetCount)
 	snapshots := []stateSyncSnapshot{local}
 	results := make(chan stateSyncResult, len(n.Nodes()))
 	requests := 0
@@ -71,12 +84,12 @@ func (n *node) Sync() bft.SyncResponse {
 		case result := <-results:
 			received++
 			if result.err != nil {
-				fmt.Printf("%s app sync: node=%d peer=%d fetch_failed err=%v\n",
+				smallbankTracePrintf("%s app sync: node=%d peer=%d fetch_failed err=%v\n",
 					timestampedLogTag("sync"), n.id, result.nodeID, result.err)
 				continue
 			}
 			if err := validateStateSyncSnapshot(result.snapshot); err != nil {
-				fmt.Printf("%s app sync: node=%d peer=%d invalid_snapshot err=%v\n",
+				smallbankTracePrintf("%s app sync: node=%d peer=%d invalid_snapshot err=%v\n",
 					timestampedLogTag("sync"), n.id, result.nodeID, err)
 				continue
 			}
@@ -88,21 +101,27 @@ func (n *node) Sync() bft.SyncResponse {
 
 	best, count, ok := selectStateSyncSnapshot(snapshots, targetCount)
 	if !ok {
+		smallbankTracePrintf("%s event=app_sync_full_snapshot_no_quorum node=%d local_view=%d local_seq=%d required=%d snapshots=%d\n",
+			timestampedLogTag("trace"), n.id, local.View, local.Sequence, targetCount, len(snapshots))
 		n.logStateSyncSnapshot("no-quorum", local, 1, targetCount)
 		return bft.SyncResponse{Latest: cloneDecision(local.Latest)}
 	}
 
 	if compareStateSyncSnapshot(best, local) > 0 {
 		if err := n.installStateSyncSnapshot(best); err != nil {
-			fmt.Printf("%s app sync: node=%d install_failed source=%d view=%d seq=%d err=%v\n",
+			smallbankTracePrintf("%s app sync: node=%d install_failed source=%d view=%d seq=%d err=%v\n",
 				timestampedLogTag("sync"), n.id, best.NodeID, best.View, best.Sequence, err)
 			return bft.SyncResponse{Latest: cloneDecision(local.Latest)}
 		}
 		n.logStateSyncSnapshot("installed", best, count, targetCount)
+		smallbankTracePrintf("%s event=app_sync_full_snapshot_done node=%d result=installed latest_view=%d latest_seq=%d matches=%d required=%d\n",
+			timestampedLogTag("trace"), n.id, best.View, best.Sequence, count, targetCount)
 		return bft.SyncResponse{Latest: cloneDecision(best.Latest)}
 	}
 
 	n.logStateSyncSnapshot("current", local, count, targetCount)
+	smallbankTracePrintf("%s event=app_sync_full_snapshot_done node=%d result=current latest_view=%d latest_seq=%d matches=%d required=%d\n",
+		timestampedLogTag("trace"), n.id, local.View, local.Sequence, count, targetCount)
 	return bft.SyncResponse{Latest: cloneDecision(local.Latest)}
 }
 
@@ -147,7 +166,7 @@ func (n *node) installStateSyncSnapshot(snapshot stateSyncSnapshot) error {
 	n.lastDelivered = len(snapshot.Latest.Proposal.Metadata) > 0
 	n.lastView = snapshot.View
 	n.lastIndex = snapshot.Sequence
-	n.lastLeaderID = n.consensus.GetLeaderID()
+	n.lastLeaderID = n.leaderID()
 	n.lastDecision = cloneDecision(snapshot.Latest)
 	return nil
 }
@@ -275,7 +294,7 @@ func stateSyncMatchCount(nodeCount int) int {
 
 func (n *node) logStateSyncSnapshot(event string, snapshot stateSyncSnapshot, matches int, required int) {
 	available := len(snapshot.Latest.Proposal.Metadata) > 0
-	fmt.Printf("%s app sync: node=%d event=%s latest_available=%t latest_view=%d latest_seq=%d state_accounts=%d matches=%d required=%d checksum=%s source=%d\n",
+	smallbankTracePrintf("%s app sync: node=%d event=%s latest_available=%t latest_view=%d latest_seq=%d state_accounts=%d matches=%d required=%d checksum=%s source=%d\n",
 		timestampedLogTag("sync"), n.id, event, available, snapshot.View, snapshot.Sequence,
 		len(snapshot.Accounts), matches, required, snapshot.Checksum, snapshot.NodeID)
 }
