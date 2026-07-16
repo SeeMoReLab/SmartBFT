@@ -44,6 +44,12 @@ type learningSample struct {
 	Timeout      time.Duration
 }
 
+type throughputCalculation struct {
+	totalTransactions uint64
+	duration          time.Duration
+	throughput        float32
+}
+
 func newLearningWindowMetrics() *learningWindowMetrics {
 	return &learningWindowMetrics{}
 }
@@ -108,15 +114,7 @@ func (m *learningWindowMetrics) buildReport() *adaptivetimers.PbftReport {
 		return nil
 	}
 
-	throughput := float32(0)
-	throughputStart := m.firstDecisionTime
-	if !m.throughputStartTime.IsZero() {
-		throughputStart = m.throughputStartTime
-	}
-	duration := m.lastDecisionTime.Sub(throughputStart)
-	if duration > 0 {
-		throughput = float32(float64(m.totalTransactions) / duration.Seconds())
-	}
+	throughput := m.calculateThroughput()
 
 	avgBatchSize := float32(0)
 	if m.totalConsensus > 0 {
@@ -129,7 +127,7 @@ func (m *learningWindowMetrics) buildReport() *adaptivetimers.PbftReport {
 		AvgConsensusLatencyMs:     avgDurationMS(m.latencies),
 		P50ConsensusLatencyMs:     percentileDurationMS(m.latencies, 0.50),
 		P95ConsensusLatencyMs:     percentileDurationMS(m.latencies, 0.95),
-		ThroughputTps:             throughput,
+		ThroughputTps:             throughput.throughput,
 		AvgBatchSize:              avgBatchSize,
 		P95BatchSize:              percentileInt(m.batchSizes, 0.95),
 		LeaderChangeCount:         saturatingUint32(m.leaderChangeCount),
@@ -140,6 +138,23 @@ func (m *learningWindowMetrics) buildReport() *adaptivetimers.PbftReport {
 		P95InterCommitGapMs:       percentileDurationMS(m.interCommitGaps, 0.95),
 		ViewChangeCount:           saturatingUint32(m.viewChangeCount),
 		NoProgressViewChangeCount: saturatingUint32(m.noProgressViewChange),
+	}
+}
+
+func (m *learningWindowMetrics) calculateThroughput() throughputCalculation {
+	throughputStart := m.firstDecisionTime
+	if !m.throughputStartTime.IsZero() {
+		throughputStart = m.throughputStartTime
+	}
+	duration := m.lastDecisionTime.Sub(throughputStart)
+	throughput := float32(0)
+	if duration > 0 {
+		throughput = float32(float64(m.totalTransactions) / duration.Seconds())
+	}
+	return throughputCalculation{
+		totalTransactions: m.totalTransactions,
+		duration:          duration,
+		throughput:        throughput,
 	}
 }
 

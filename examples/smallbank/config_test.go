@@ -357,16 +357,76 @@ func TestLearningMetricsThroughputCanStartBeforeFirstDecision(t *testing.T) {
 	}
 }
 
+func TestLearningReportTickUsesEpisodeDeliveredCount(t *testing.T) {
+	manager := &learningManager{
+		episodeStartCount:  100,
+		reportTickInterval: 10,
+	}
+
+	for _, count := range []uint64{100, 101, 109, 111, 119} {
+		if manager.isReportTick(count) {
+			t.Fatalf("isReportTick(%d) = true, want false", count)
+		}
+	}
+	for _, count := range []uint64{110, 120, 130} {
+		if !manager.isReportTick(count) {
+			t.Fatalf("isReportTick(%d) = false, want true", count)
+		}
+	}
+}
+
+func TestLearningFeatureWindowUsesDeliveredCountAcrossSequenceGap(t *testing.T) {
+	manager := &learningManager{
+		enabled:            true,
+		metrics:            newLearningWindowMetrics(),
+		currentEpisode:     1,
+		currentTimeout:     800 * time.Millisecond,
+		reportTickInterval: 10,
+		reportTrigger:      time.Hour,
+		maxReportLength:    500,
+	}
+	start := time.Unix(100, 0)
+	sequences := []uint64{100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 530}
+	for index, sequence := range sequences {
+		manager.recordConsensus(learningSample{
+			Sequence:     sequence,
+			View:         0,
+			LeaderID:     1,
+			BatchSize:    1,
+			DecisionTime: start.Add(time.Duration(index) * time.Second),
+			Latencies:    []time.Duration{time.Millisecond},
+			Timeout:      manager.currentTimeout,
+		})
+	}
+
+	report := manager.metrics.buildReport()
+	if report == nil {
+		t.Fatalf("report is nil")
+	}
+	if got := report.TotalConsensusInstances; got != 10 {
+		t.Fatalf("TotalConsensusInstances = %d, want 10", got)
+	}
+	if got := report.ThroughputTps; got < 0.999 || got > 1.001 {
+		t.Fatalf("ThroughputTps = %f, want about 1.0", got)
+	}
+	if manager.episodeStartTick != 100 {
+		t.Fatalf("episodeStartTick = %d, want 100", manager.episodeStartTick)
+	}
+	if !manager.isReportTick(manager.deliveredCount) {
+		t.Fatalf("delivered count %d should be a report tick", manager.deliveredCount)
+	}
+}
+
 func TestLearningEpisodeWindow(t *testing.T) {
-	window := newLearningEpisodeWindow(10, 30, 20)
-	if window.applyTick != 40 {
-		t.Fatalf("applyTick = %d, want 40", window.applyTick)
+	window := newLearningEpisodeWindow(10, 30, 100, 20)
+	if window.applyCount != 110 {
+		t.Fatalf("applyCount = %d, want 110", window.applyCount)
 	}
-	if window.rewardStartTick != 50 {
-		t.Fatalf("rewardStartTick = %d, want 50", window.rewardStartTick)
+	if window.rewardStartCount != 120 {
+		t.Fatalf("rewardStartCount = %d, want 120", window.rewardStartCount)
 	}
-	if window.rewardTick != 70 {
-		t.Fatalf("rewardTick = %d, want 70", window.rewardTick)
+	if window.rewardEndCount != 140 {
+		t.Fatalf("rewardEndCount = %d, want 140", window.rewardEndCount)
 	}
 }
 
@@ -399,7 +459,8 @@ func TestLearningApplyRecommendedTimeoutAfterSkippedApplyTick(t *testing.T) {
 		currentEpisode:     1,
 		currentTimeout:     5 * time.Second,
 		reportTickInterval: 1000,
-		selectedWindow:     newLearningEpisodeWindow(0, 10, 10),
+		deliveredCount:     15,
+		selectedWindow:     newLearningEpisodeWindow(0, 10, 10, 10),
 		selectedTimeout:    700 * time.Millisecond,
 		applyTimeout: func(timeout time.Duration) error {
 			applied = timeout
@@ -423,14 +484,14 @@ func TestLearningApplyRecommendedTimeoutAfterSkippedApplyTick(t *testing.T) {
 	if manager.currentTimeout != 700*time.Millisecond {
 		t.Fatalf("currentTimeout = %s, want 700ms", manager.currentTimeout)
 	}
-	if manager.selectedWindow.applyTick != 16 {
-		t.Fatalf("rebased applyTick = %d, want 16", manager.selectedWindow.applyTick)
+	if manager.selectedWindow.applyCount != 16 {
+		t.Fatalf("rebased applyCount = %d, want 16", manager.selectedWindow.applyCount)
 	}
-	if manager.selectedWindow.rewardStartTick != 21 {
-		t.Fatalf("rebased rewardStartTick = %d, want 21", manager.selectedWindow.rewardStartTick)
+	if manager.selectedWindow.rewardStartCount != 21 {
+		t.Fatalf("rebased rewardStartCount = %d, want 21", manager.selectedWindow.rewardStartCount)
 	}
-	if manager.selectedWindow.rewardTick != 31 {
-		t.Fatalf("rebased rewardTick = %d, want 31", manager.selectedWindow.rewardTick)
+	if manager.selectedWindow.rewardEndCount != 31 {
+		t.Fatalf("rebased rewardEndCount = %d, want 31", manager.selectedWindow.rewardEndCount)
 	}
 }
 
@@ -441,7 +502,7 @@ func TestLearningRewardMetricsStartAfterWarmup(t *testing.T) {
 		currentEpisode:     1,
 		currentTimeout:     5 * time.Second,
 		reportTickInterval: 1000,
-		selectedWindow:     newLearningEpisodeWindow(0, 10, 10),
+		selectedWindow:     newLearningEpisodeWindow(0, 10, 10, 10),
 		selectedTimeout:    700 * time.Millisecond,
 	}
 
@@ -472,6 +533,9 @@ func TestLearningRewardMetricsStartAfterWarmup(t *testing.T) {
 	if manager.episodeStartTick != 30 {
 		t.Fatalf("next episode start tick = %d, want 30", manager.episodeStartTick)
 	}
+	if manager.episodeStartCount != 30 {
+		t.Fatalf("next episode start count = %d, want 30", manager.episodeStartCount)
+	}
 }
 
 func TestLearningLateApplyDoesNotCaptureStaleRewardWindow(t *testing.T) {
@@ -483,7 +547,8 @@ func TestLearningLateApplyDoesNotCaptureStaleRewardWindow(t *testing.T) {
 		currentTimeout:     5 * time.Second,
 		lastTimeout:        5 * time.Second,
 		reportTickInterval: 1000,
-		selectedWindow:     newLearningEpisodeWindow(0, 10, 10),
+		deliveredCount:     34,
+		selectedWindow:     newLearningEpisodeWindow(0, 10, 10, 10),
 		selectedTimeout:    700 * time.Millisecond,
 		applyTimeout: func(timeout time.Duration) error {
 			applied = timeout
@@ -510,17 +575,17 @@ func TestLearningLateApplyDoesNotCaptureStaleRewardWindow(t *testing.T) {
 	if manager.pendingReward != nil {
 		t.Fatalf("captured stale reward after late apply")
 	}
-	if manager.selectedWindow.applyTick != 35 {
-		t.Fatalf("rebased applyTick = %d, want 35", manager.selectedWindow.applyTick)
+	if manager.selectedWindow.applyCount != 35 {
+		t.Fatalf("rebased applyCount = %d, want 35", manager.selectedWindow.applyCount)
 	}
-	if manager.selectedWindow.rewardStartTick != 40 {
-		t.Fatalf("rebased rewardStartTick = %d, want 40", manager.selectedWindow.rewardStartTick)
+	if manager.selectedWindow.rewardStartCount != 40 {
+		t.Fatalf("rebased rewardStartCount = %d, want 40", manager.selectedWindow.rewardStartCount)
 	}
-	if manager.selectedWindow.rewardTick != 50 {
-		t.Fatalf("rebased rewardTick = %d, want 50", manager.selectedWindow.rewardTick)
+	if manager.selectedWindow.rewardEndCount != 50 {
+		t.Fatalf("rebased rewardEndCount = %d, want 50", manager.selectedWindow.rewardEndCount)
 	}
 
-	for seq := uint64(40); seq <= 50; seq++ {
+	for seq := uint64(36); seq <= 50; seq++ {
 		manager.recordConsensus(learningSample{
 			Sequence:     seq,
 			View:         0,
@@ -541,9 +606,12 @@ func TestLearningLateApplyDoesNotCaptureStaleRewardWindow(t *testing.T) {
 	if manager.episodeStartTick != 50 {
 		t.Fatalf("next episode start tick = %d, want 50", manager.episodeStartTick)
 	}
+	if manager.episodeStartCount != 50 {
+		t.Fatalf("next episode start count = %d, want 50", manager.episodeStartCount)
+	}
 }
 
-func TestLearningRewardMetricsCountsGapWhenRewardStartIsSkipped(t *testing.T) {
+func TestLearningRewardWindowUsesDeliveredCountAcrossSequenceGap(t *testing.T) {
 	manager := &learningManager{
 		enabled:                true,
 		metrics:                newLearningWindowMetrics(),
@@ -551,7 +619,8 @@ func TestLearningRewardMetricsCountsGapWhenRewardStartIsSkipped(t *testing.T) {
 		currentTimeout:         700 * time.Millisecond,
 		lastTimeout:            700 * time.Millisecond,
 		reportTickInterval:     1000,
-		selectedWindow:         newLearningEpisodeWindow(0, 10, 10),
+		deliveredCount:         19,
+		selectedWindow:         newLearningEpisodeWindow(0, 10, 10, 10),
 		selectedTimeout:        700 * time.Millisecond,
 		applyHandledForEpisode: true,
 	}
