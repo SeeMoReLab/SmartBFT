@@ -19,41 +19,50 @@ import (
 
 func main() {
 	var (
-		role           = flag.String("role", "inprocess", "run role: inprocess, server, or client")
-		nodeID         = flag.Uint64("node-id", 0, "SmartBFT node ID for --role server")
-		hostsConfig    = flag.String("hosts-config", "", "SmartBFT hosts config for network server/client roles")
-		configPath     = flag.String("config", filepath.Join("config", "pbft", workloadFileName), "SmallBank XML config file or directory containing smallbank.xml")
-		nodes          = flag.Int("nodes", 4, "number of SmartBFT nodes to run in-process")
-		batchSize      = flag.Uint64("batch-size", 100, "maximum SmartBFT request batch size")
-		batchTimeout   = flag.Duration("batch-timeout", 50*time.Millisecond, "maximum SmartBFT request batch interval")
-		requestTimeout = flag.Duration("request-timeout", 30*time.Second, "timeout waiting for a request to be delivered")
-		submitModeFlag = flag.String("submit-mode", string(submitModeBroadcast), "network client submit mode: broadcast or leader")
-		replyListen    = flag.String("client-reply-listen", "127.0.0.1:0", "client reply listener address for broadcast mode")
-		replyAdvertise = flag.String("client-reply-advertise-host", "", "host/IP advertised to servers for client replies; empty uses listener address")
-		create         = flag.Bool("create", false, "create initial SmallBank accounts before executing")
-		execute        = flag.Bool("execute", false, "execute workload phases")
-		createWorkers  = flag.Int("create-workers", 0, "number of account creation workers; 0 uses the first workload phase terminals")
-		startUnixMS    = flag.Int64("start-unix-ms", 0, "absolute Unix epoch time in ms for benchmark start")
-		failureSpec    = flag.String("failure-spec", "", "failure_spec.xml path; only pbft/proposalDelay is applied")
-		failureStartMS = flag.Int64("failure-start-unix-ms", -1, "absolute Unix epoch time in ms for failure schedule start")
-		learning       = flag.Bool("learning", false, "enable PBFT learning-agent reports and recommendation polling")
-		learningNodeID = flag.Uint64("learning-node-id", 1, "SmartBFT node ID that sends learning reports")
-		agentTarget    = flag.String("agent-target", "", "learning agent gRPC target, for example 127.0.0.1:50051")
-		initialTimeout = flag.Duration("learning-initial-election-timeout", 5*time.Second, "initial PBFT timeout value reported to the learning agent")
-		reportTicks    = flag.Uint64("learning-report-tick-interval", defaultLearningReportTickInterval, "consensus ticks between learning report checks")
-		reportTrigger  = flag.Duration("learning-report-trigger", defaultLearningReportTrigger, "minimum elapsed time before the first learning report")
-		maxReportLen   = flag.Uint64("learning-max-report-length", defaultLearningMaxReportLength, "maximum consensus ticks in one learning report window")
-		pollInterval   = flag.Duration("learning-poll-interval", defaultLearningPollInterval, "interval for polling the learning agent for timeout recommendations")
-		rpcTimeout     = flag.Duration("learning-rpc-timeout", defaultLearningRPCTimeout, "timeout for learning agent RPCs")
-		backoff        = flag.Bool("request-timeout-backoff", false, "enable request timeout backoff for SmartBFT forward/complain timers")
-		backoffMax     = flag.Duration("request-timeout-backoff-max", 10*time.Second, "maximum effective SmartBFT request timeout when backoff is enabled")
-		dataDir        = flag.String("data-dir", "", "directory for SmartBFT WAL data; defaults to a temporary directory")
-		keepData       = flag.Bool("keep-data", false, "keep generated WAL data when using a temporary data directory")
-		verbose        = flag.Bool("verbose", false, "enable SmartBFT debug logs")
+		role            = flag.String("role", "inprocess", "run role: inprocess, server, or client")
+		nodeID          = flag.Uint64("node-id", 0, "SmartBFT node ID for --role server")
+		hostsConfig     = flag.String("hosts-config", "", "SmartBFT hosts config for network server/client roles")
+		configPath      = flag.String("config", filepath.Join("config", "pbft", workloadFileName), "SmallBank XML config file or directory containing smallbank.xml")
+		nodes           = flag.Int("nodes", 4, "number of SmartBFT nodes to run in-process")
+		batchSize       = flag.Uint64("batch-size", 100, "maximum SmartBFT request batch size")
+		batchTimeout    = flag.Duration("batch-timeout", 50*time.Millisecond, "maximum SmartBFT request batch interval")
+		requestTimeout  = flag.Duration("request-timeout", 30*time.Second, "timeout waiting for a request to be delivered")
+		submitModeFlag  = flag.String("submit-mode", string(submitModeBroadcast), "network client submit mode: broadcast or leader")
+		replyListen     = flag.String("client-reply-listen", "127.0.0.1:0", "client reply listener address for broadcast mode")
+		replyAdvertise  = flag.String("client-reply-advertise-host", "", "host/IP advertised to servers for client replies; empty uses listener address")
+		create          = flag.Bool("create", false, "create initial SmallBank accounts before executing")
+		execute         = flag.Bool("execute", false, "execute workload phases")
+		createWorkers   = flag.Int("create-workers", 0, "number of account creation workers; 0 uses the first workload phase terminals")
+		startUnixMS     = flag.Int64("start-unix-ms", 0, "absolute Unix epoch time in ms for benchmark start")
+		failureSpec     = flag.String("failure-spec", "", "failure_spec.xml path; only pbft/proposalDelay is applied")
+		failureStartMS  = flag.Int64("failure-start-unix-ms", -1, "absolute Unix epoch time in ms for failure schedule start")
+		learning        = flag.Bool("learning", false, "enable PBFT learning-agent reports and recommendation polling")
+		learningNodeID  = flag.Uint64("learning-node-id", 1, "SmartBFT node ID that sends learning reports")
+		agentTarget     = flag.String("agent-target", "", "learning agent gRPC target, for example 127.0.0.1:50051")
+		initialTimeout  = flag.Duration("learning-initial-election-timeout", 5*time.Second, "initial PBFT timeout value reported to the learning agent")
+		windowModeFlag  = flag.String("learning-window-mode", string(learningWindowModeConsensus), "learning episode boundaries: consensus or wall-clock")
+		reportTicks     = flag.Uint64("learning-report-tick-interval", defaultLearningReportTickInterval, "consensus ticks between learning report checks")
+		reportTrigger   = flag.Duration("learning-report-trigger", defaultLearningReportTrigger, "minimum elapsed time before the first learning report")
+		maxReportLen    = flag.Uint64("learning-max-report-length", defaultLearningMaxReportLength, "maximum consensus ticks in one learning report window")
+		pollInterval    = flag.Duration("learning-poll-interval", defaultLearningPollInterval, "interval for polling the learning agent for timeout recommendations")
+		rpcTimeout      = flag.Duration("learning-rpc-timeout", defaultLearningRPCTimeout, "timeout for learning agent RPCs")
+		featureDuration = flag.Duration("learning-feature-duration", defaultLearningFeatureDuration, "feature collection duration in wall-clock mode")
+		replyWait       = flag.Duration("learning-reply-wait", defaultLearningReplyWait, "time to wait before applying a recommendation in wall-clock mode")
+		warmupDuration  = flag.Duration("learning-warmup-duration", defaultLearningWarmupDuration, "post-apply warm-up duration in wall-clock mode")
+		rewardDuration  = flag.Duration("learning-reward-duration", defaultLearningRewardDuration, "reward collection duration in wall-clock mode")
+		backoff         = flag.Bool("request-timeout-backoff", false, "enable request timeout backoff for SmartBFT forward/complain timers")
+		backoffMax      = flag.Duration("request-timeout-backoff-max", 10*time.Second, "maximum effective SmartBFT request timeout when backoff is enabled")
+		dataDir         = flag.String("data-dir", "", "directory for SmartBFT WAL data; defaults to a temporary directory")
+		keepData        = flag.Bool("keep-data", false, "keep generated WAL data when using a temporary data directory")
+		verbose         = flag.Bool("verbose", false, "enable SmartBFT debug logs")
 	)
 	flag.Parse()
 
 	mode, err := parseSubmitMode(*submitModeFlag)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	windowMode, err := parseLearningWindowMode(*windowModeFlag)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -68,11 +77,16 @@ func main() {
 		NodeID:             *learningNodeID,
 		AgentTarget:        *agentTarget,
 		InitialTimeout:     *initialTimeout,
+		WindowMode:         windowMode,
 		ReportTickInterval: *reportTicks,
 		ReportTrigger:      *reportTrigger,
 		MaxReportLength:    *maxReportLen,
 		PollInterval:       *pollInterval,
 		RPCTimeout:         *rpcTimeout,
+		FeatureDuration:    *featureDuration,
+		ReplyWait:          *replyWait,
+		WarmupDuration:     *warmupDuration,
+		RewardDuration:     *rewardDuration,
 	}
 	backoffOptions := requestTimeoutBackoffOptions{
 		Enabled:    *backoff,

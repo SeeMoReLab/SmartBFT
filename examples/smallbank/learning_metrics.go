@@ -110,11 +110,15 @@ func (m *learningWindowMetrics) recordNoProgressViewChange() {
 }
 
 func (m *learningWindowMetrics) buildReport() *adaptivetimers.PbftReport {
-	if len(m.latencies) == 0 {
+	return m.buildReportUntil(time.Time{}, false)
+}
+
+func (m *learningWindowMetrics) buildReportUntil(end time.Time, allowEmpty bool) *adaptivetimers.PbftReport {
+	if !allowEmpty && len(m.latencies) == 0 {
 		return nil
 	}
 
-	throughput := m.calculateThroughput()
+	throughput := m.calculateThroughputUntil(end)
 
 	avgBatchSize := float32(0)
 	if m.totalConsensus > 0 {
@@ -142,11 +146,19 @@ func (m *learningWindowMetrics) buildReport() *adaptivetimers.PbftReport {
 }
 
 func (m *learningWindowMetrics) calculateThroughput() throughputCalculation {
+	return m.calculateThroughputUntil(time.Time{})
+}
+
+func (m *learningWindowMetrics) calculateThroughputUntil(end time.Time) throughputCalculation {
 	throughputStart := m.firstDecisionTime
 	if !m.throughputStartTime.IsZero() {
 		throughputStart = m.throughputStartTime
 	}
-	duration := m.lastDecisionTime.Sub(throughputStart)
+	throughputEnd := m.lastDecisionTime
+	if !end.IsZero() {
+		throughputEnd = end
+	}
+	duration := throughputEnd.Sub(throughputStart)
 	throughput := float32(0)
 	if duration > 0 {
 		throughput = float32(float64(m.totalTransactions) / duration.Seconds())

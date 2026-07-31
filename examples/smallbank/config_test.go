@@ -357,6 +357,180 @@ func TestLearningMetricsThroughputCanStartBeforeFirstDecision(t *testing.T) {
 	}
 }
 
+func TestLearningWallClockMetricsUseFullWindow(t *testing.T) {
+	start := time.Unix(100, 0)
+	metrics := newLearningWindowMetrics()
+	metrics.resetWithThroughputStart(start)
+	metrics.timeout = 800 * time.Millisecond
+	metrics.record(learningSample{
+		Sequence:     1,
+		View:         0,
+		LeaderID:     1,
+		BatchSize:    40,
+		DecisionTime: start.Add(time.Second),
+		Latencies:    []time.Duration{10 * time.Millisecond},
+		Timeout:      800 * time.Millisecond,
+	})
+	metrics.record(learningSample{
+		Sequence:     2,
+		View:         0,
+		LeaderID:     1,
+		BatchSize:    60,
+		DecisionTime: start.Add(2 * time.Second),
+		Latencies:    []time.Duration{20 * time.Millisecond},
+		Timeout:      800 * time.Millisecond,
+	})
+
+	report := metrics.buildReportUntil(start.Add(5*time.Second), true)
+	if report == nil {
+		t.Fatalf("report is nil")
+	}
+	if got := report.ThroughputTps; got < 19.999 || got > 20.001 {
+		t.Fatalf("ThroughputTps = %f, want 20", got)
+	}
+}
+
+func TestLearningWallClockMetricsAllowZeroCommits(t *testing.T) {
+	start := time.Unix(100, 0)
+	metrics := newLearningWindowMetrics()
+	metrics.resetWithThroughputStart(start)
+	metrics.timeout = 700 * time.Millisecond
+	metrics.recordViewChange()
+
+	report := metrics.buildReportUntil(start.Add(5*time.Second), true)
+	if report == nil {
+		t.Fatalf("report is nil")
+	}
+	if report.TotalConsensusInstances != 0 || report.TotalTransactions != 0 {
+		t.Fatalf("zero-commit report has consensus=%d transactions=%d",
+			report.TotalConsensusInstances, report.TotalTransactions)
+	}
+	if report.ThroughputTps != 0 {
+		t.Fatalf("ThroughputTps = %f, want 0", report.ThroughputTps)
+	}
+	if report.TimeoutMs != 700 {
+		t.Fatalf("TimeoutMs = %d, want 700", report.TimeoutMs)
+	}
+	if report.ViewChangeCount != 1 {
+		t.Fatalf("ViewChangeCount = %d, want 1", report.ViewChangeCount)
+	}
+}
+
+func TestLearningWallClockAppliesDecisionAtReplyDeadline(t *testing.T) {
+	var applied time.Duration
+	manager := &learningManager{
+		enabled:        true,
+		metrics:        newLearningWindowMetrics(),
+		currentEpisode: 1,
+		windowMode:     learningWindowModeWallClock,
+		wallClockStage: wallClockLearningReplyWait,
+		warmupDuration: 3 * time.Second,
+		currentTimeout: 300 * time.Millisecond,
+		lastTimeout:    300 * time.Millisecond,
+		pollerEpisode:  1,
+		pollerDecision: &learningDecision{timeout: 800 * time.Millisecond},
+		applyTimeout: func(timeout time.Duration) error {
+			applied = timeout
+			return nil
+		},
+	}
+	deadline := time.Unix(100, 0)
+
+	if !manager.handleWallClockApplyDeadline(1, deadline) {
+		t.Fatalf("apply deadline was not handled")
+	}
+	if applied != 800*time.Millisecond {
+		t.Fatalf("applied timeout = %s, want 800ms", applied)
+	}
+	if manager.lastTimeout != 800*time.Millisecond {
+		t.Fatalf("last timeout = %s, want 800ms", manager.lastTimeout)
+	}
+	if manager.wallClockStage != wallClockLearningWarmup {
+		t.Fatalf("stage = %d, want warmup", manager.wallClockStage)
+	}
+	if got := manager.wallClockDeadline; !got.Equal(deadline.Add(3 * time.Second)) {
+		t.Fatalf("warmup deadline = %s, want %s", got, deadline.Add(3*time.Second))
+	}
+}
+
+func TestLearningWallClockMissingDecisionUsesCurrentTimeout(t *testing.T) {
+	manager := &learningManager{
+		enabled:        true,
+		metrics:        newLearningWindowMetrics(),
+		currentEpisode: 1,
+		windowMode:     learningWindowModeWallClock,
+		wallClockStage: wallClockLearningReplyWait,
+		warmupDuration: 3 * time.Second,
+		currentTimeout: 800 * time.Millisecond,
+		lastTimeout:    300 * time.Millisecond,
+		pollerEpisode:  1,
+	}
+
+	if !manager.handleWallClockApplyDeadline(1, time.Unix(100, 0)) {
+		t.Fatalf("apply deadline was not handled")
+	}
+	if manager.currentTimeout != 800*time.Millisecond {
+		t.Fatalf("current timeout = %s, want 800ms", manager.currentTimeout)
+	}
+	if manager.lastTimeout != 800*time.Millisecond {
+		t.Fatalf("last timeout = %s, want 800ms", manager.lastTimeout)
+	}
+}
+
+func TestLearningWallClockCompletesZeroCommitRewardWithoutDeliveryWakeup(t *testing.T) {
+	manager := &learningManager{
+		enabled:           true,
+		metrics:           newLearningWindowMetrics(),
+		currentEpisode:    1,
+		windowMode:        learningWindowModeWallClock,
+		featureDuration:   20 * time.Millisecond,
+		replyWait:         10 * time.Millisecond,
+		warmupDuration:    10 * time.Millisecond,
+		rewardDuration:    20 * time.Millisecond,
+		pollInterval:      time.Millisecond,
+		rpcTimeout:        time.Millisecond,
+		currentTimeout:    800 * time.Millisecond,
+		lastTimeout:       800 * time.Millisecond,
+		reportWindows:     make(map[uint64]learningReportWindow),
+		wallClockStage:    wallClockLearningIdle,
+		episodeStartCount: 0,
+	}
+	defer manager.close()
+
+	now := time.Now()
+	manager.recordConsensus(learningSample{
+		Sequence:     1,
+		View:         0,
+		LeaderID:     1,
+		BatchSize:    1,
+		DecisionTime: now,
+		Latencies:    []time.Duration{time.Millisecond},
+		Timeout:      manager.currentTimeoutValue(),
+	})
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		manager.lock.Lock()
+		pending := manager.pendingReward
+		episode := manager.currentEpisode
+		manager.lock.Unlock()
+		if pending != nil {
+			if episode != 2 {
+				t.Fatalf("current episode = %d, want 2", episode)
+			}
+			if pending.report.TotalConsensusInstances != 0 {
+				t.Fatalf("reward consensus instances = %d, want 0", pending.report.TotalConsensusInstances)
+			}
+			if pending.report.ThroughputTps != 0 {
+				t.Fatalf("reward throughput = %f, want 0", pending.report.ThroughputTps)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("wall-clock reward did not complete without another consensus delivery")
+}
+
 func TestLearningReportTickUsesEpisodeDeliveredCount(t *testing.T) {
 	manager := &learningManager{
 		episodeStartCount:  100,

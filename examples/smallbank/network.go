@@ -35,9 +35,10 @@ import (
 const (
 	defaultNetworkSendTimeout = 2 * time.Second
 	consensusQueueSize        = 4096
+	consensusStreamRetryDelay = 100 * time.Millisecond
 	asyncForwardLimit         = 1024
 	smallBankNetworkService   = "smallbank.SmallBankNetwork"
-	methodConsensus           = "/" + smallBankNetworkService + "/Consensus"
+	methodConsensusStream     = "/" + smallBankNetworkService + "/ConsensusStream"
 	methodTransaction         = "/" + smallBankNetworkService + "/Transaction"
 	methodSubmit              = "/" + smallBankNetworkService + "/Submit"
 	methodSubmitStream        = "/" + smallBankNetworkService + "/SubmitStream"
@@ -174,7 +175,7 @@ type grpcReplyRequest struct {
 }
 
 type smallBankNetworkServiceServer interface {
-	Consensus(context.Context, *grpcConsensusRequest) (*grpcAck, error)
+	ConsensusStream(smallBankConsensusStreamServer) error
 	Transaction(context.Context, *grpcTransactionRequest) (*grpcAck, error)
 	Submit(context.Context, *grpcSubmitRequest) (*response, error)
 	SubmitStream(smallBankSubmitStreamServer) error
@@ -193,7 +194,6 @@ var smallBankNetworkServiceDesc = grpc.ServiceDesc{
 	ServiceName: smallBankNetworkService,
 	HandlerType: (*smallBankNetworkServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
-		{MethodName: "Consensus", Handler: smallBankConsensusHandler},
 		{MethodName: "Transaction", Handler: smallBankTransactionHandler},
 		{MethodName: "Submit", Handler: smallBankSubmitHandler},
 		{MethodName: "Status", Handler: smallBankStatusHandler},
@@ -202,8 +202,15 @@ var smallBankNetworkServiceDesc = grpc.ServiceDesc{
 		{MethodName: "ApplyTimeout", Handler: smallBankApplyTimeoutHandler},
 	},
 	Streams: []grpc.StreamDesc{
+		smallBankConsensusStreamDesc,
 		smallBankSubmitStreamDesc,
 	},
+}
+
+var smallBankConsensusStreamDesc = grpc.StreamDesc{
+	StreamName:    "ConsensusStream",
+	Handler:       smallBankConsensusStreamHandler,
+	ClientStreams: true,
 }
 
 var smallBankSubmitStreamDesc = grpc.StreamDesc{
@@ -265,19 +272,25 @@ func smallBankClientReplyStreamHandler(srv any, stream grpc.ServerStream) error 
 	return srv.(smallBankClientServiceServer).ReplyStream(&smallBankClientReplyStream{ServerStream: stream})
 }
 
-func smallBankConsensusHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-	in := new(grpcConsensusRequest)
-	if err := dec(in); err != nil {
+type smallBankConsensusStreamServer interface {
+	Recv() (*grpcConsensusRequest, error)
+	grpc.ServerStream
+}
+
+type smallBankConsensusStream struct {
+	grpc.ServerStream
+}
+
+func (s *smallBankConsensusStream) Recv() (*grpcConsensusRequest, error) {
+	req := new(grpcConsensusRequest)
+	if err := s.ServerStream.RecvMsg(req); err != nil {
 		return nil, err
 	}
-	if interceptor == nil {
-		return srv.(smallBankNetworkServiceServer).Consensus(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: methodConsensus}
-	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(smallBankNetworkServiceServer).Consensus(ctx, req.(*grpcConsensusRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+	return req, nil
+}
+
+func smallBankConsensusStreamHandler(srv any, stream grpc.ServerStream) error {
+	return srv.(smallBankNetworkServiceServer).ConsensusStream(&smallBankConsensusStream{ServerStream: stream})
 }
 
 func smallBankTransactionHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
@@ -399,6 +412,8 @@ type networkTransport struct {
 	pending         map[uint64]map[networkCoalesceKey]struct{}
 	pendingLock     sync.Mutex
 	forwardInflight map[uint64]chan struct{}
+	streamContext   context.Context
+	cancelStreams   context.CancelFunc
 	stop            chan struct{}
 	workerWG        sync.WaitGroup
 	asyncWG         sync.WaitGroup
@@ -558,6 +573,7 @@ func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, e
 	for _, host := range hosts {
 		hostMap[host.ID] = host
 	}
+	streamContext, cancelStreams := context.WithCancel(context.Background())
 	t := &networkTransport{
 		selfID:          selfID,
 		hosts:           hostMap,
@@ -565,6 +581,8 @@ func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, e
 		queues:          make(map[uint64]chan networkOutbound),
 		pending:         make(map[uint64]map[networkCoalesceKey]struct{}),
 		forwardInflight: make(map[uint64]chan struct{}),
+		streamContext:   streamContext,
+		cancelStreams:   cancelStreams,
 		stop:            make(chan struct{}),
 	}
 	for _, host := range hosts {
@@ -604,6 +622,7 @@ func (t *networkTransport) close() {
 	default:
 		close(t.stop)
 	}
+	t.cancelStreams()
 	t.workerWG.Wait()
 	t.asyncWG.Wait()
 	for _, conn := range t.peers {
@@ -628,7 +647,7 @@ func (t *networkTransport) sendConsensus(targetID uint64, message *smartbftproto
 	key := smartBFTNetworkCoalesceKey(message)
 	trace := smartBFTTraceMessageSummary(message)
 	t.enqueue(targetID, networkOutbound{
-		method:   methodConsensus,
+		method:   methodConsensusStream,
 		coalesce: key,
 		trace:    trace,
 		request: &grpcConsensusRequest{
@@ -656,13 +675,13 @@ func (t *networkTransport) enqueue(targetID uint64, outbound networkOutbound) {
 		return
 	}
 	if !t.reservePending(targetID, outbound.coalesce) {
-		if outbound.method == methodConsensus {
+		if outbound.method == methodConsensusStream {
 			smallbankTracePrintf("%s event=send_consensus_drop_coalesced node=%d to=%d queue_len=%d queue_cap=%d %s\n",
 				timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
 		}
 		return
 	}
-	if outbound.method == methodConsensus {
+	if outbound.method == methodConsensusStream {
 		smallbankTracePrintf("%s event=send_consensus_enqueue_start node=%d to=%d queue_len=%d queue_cap=%d %s\n",
 			timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
 	} else if outbound.method == methodTransaction {
@@ -671,7 +690,7 @@ func (t *networkTransport) enqueue(targetID uint64, outbound networkOutbound) {
 	}
 	select {
 	case queue <- outbound:
-		if outbound.method == methodConsensus {
+		if outbound.method == methodConsensusStream {
 			smallbankTracePrintf("%s event=send_consensus_enqueue_done node=%d to=%d queue_len=%d queue_cap=%d %s\n",
 				timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
 		} else if outbound.method == methodTransaction {
@@ -680,7 +699,7 @@ func (t *networkTransport) enqueue(targetID uint64, outbound networkOutbound) {
 		}
 	case <-t.stop:
 		t.releasePending(targetID, outbound.coalesce)
-		if outbound.method == methodConsensus {
+		if outbound.method == methodConsensusStream {
 			smallbankTracePrintf("%s event=send_consensus_enqueue_stopped node=%d to=%d %s\n",
 				timestampedLogTag("trace"), t.selfID, targetID, outbound.trace)
 		} else if outbound.method == methodTransaction {
@@ -692,18 +711,35 @@ func (t *networkTransport) enqueue(targetID uint64, outbound networkOutbound) {
 
 func (t *networkTransport) worker(host hostEntry, conn *grpc.ClientConn, queue <-chan networkOutbound) {
 	defer t.workerWG.Done()
+	var consensusStream grpc.ClientStream
+	defer func() {
+		if consensusStream != nil {
+			_ = consensusStream.CloseSend()
+		}
+	}()
+
 	for {
 		select {
 		case <-t.stop:
 			return
 		case outbound := <-queue:
-			if outbound.method == methodConsensus {
+			if outbound.method == methodConsensusStream {
 				smallbankTracePrintf("%s event=send_consensus_dequeue node=%d to=%d queue_len=%d queue_cap=%d %s\n",
 					timestampedLogTag("trace"), t.selfID, host.ID, len(queue), cap(queue), outbound.trace)
 			} else if outbound.method == methodTransaction {
 				smallbankTracePrintf("%s event=forward_dequeue node=%d to=%d queue_len=%d queue_cap=%d %s\n",
 					timestampedLogTag("trace"), t.selfID, host.ID, len(queue), cap(queue), outbound.trace)
 			}
+
+			if outbound.method == methodConsensusStream {
+				sent := t.sendConsensusStream(host, conn, outbound, &consensusStream)
+				t.releasePending(host.ID, outbound.coalesce)
+				if !sent {
+					return
+				}
+				continue
+			}
+
 			t.releasePending(host.ID, outbound.coalesce)
 			if outbound.method == methodTransaction {
 				t.invokeForwardAsync(host, conn, outbound)
@@ -743,6 +779,57 @@ func (t *networkTransport) releasePending(targetID uint64, key *networkCoalesceK
 	t.pendingLock.Unlock()
 }
 
+func (t *networkTransport) sendConsensusStream(
+	host hostEntry,
+	conn *grpc.ClientConn,
+	outbound networkOutbound,
+	stream *grpc.ClientStream,
+) bool {
+	for {
+		if *stream == nil {
+			opened, err := conn.NewStream(t.streamContext, &smallBankConsensusStreamDesc, methodConsensusStream)
+			if err != nil {
+				smallbankTracePrintf("%s event=send_consensus_stream_open_failed node=%d to=%d err=%q %s\n",
+					timestampedLogTag("trace"), t.selfID, host.ID, err.Error(), outbound.trace)
+				if !t.waitForConsensusStreamRetry() {
+					return false
+				}
+				continue
+			}
+			*stream = opened
+			smallbankTracePrintf("%s event=send_consensus_stream_opened node=%d to=%d\n",
+				timestampedLogTag("trace"), t.selfID, host.ID)
+		}
+
+		start := time.Now()
+		err := (*stream).SendMsg(outbound.request)
+		if err == nil {
+			smallbankTracePrintf("%s event=send_consensus_stream_sent node=%d to=%d elapsed_ms=%d %s\n",
+				timestampedLogTag("trace"), t.selfID, host.ID, time.Since(start).Milliseconds(), outbound.trace)
+			return true
+		}
+
+		smallbankTracePrintf("%s event=send_consensus_stream_failed node=%d to=%d elapsed_ms=%d err=%q %s\n",
+			timestampedLogTag("trace"), t.selfID, host.ID, time.Since(start).Milliseconds(), err.Error(), outbound.trace)
+		_ = (*stream).CloseSend()
+		*stream = nil
+		if !t.waitForConsensusStreamRetry() {
+			return false
+		}
+	}
+}
+
+func (t *networkTransport) waitForConsensusStreamRetry() bool {
+	timer := time.NewTimer(consensusStreamRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-t.stop:
+		return false
+	}
+}
+
 func (t *networkTransport) invokeForwardAsync(host hostEntry, conn *grpc.ClientConn, outbound networkOutbound) {
 	inflight, exists := t.forwardInflight[host.ID]
 	if !exists {
@@ -773,24 +860,13 @@ func (t *networkTransport) invokeForwardAsync(host hostEntry, conn *grpc.ClientC
 func (t *networkTransport) invokeOnce(host hostEntry, conn *grpc.ClientConn, outbound networkOutbound) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
 	start := time.Now()
-	if outbound.method == methodConsensus {
-		smallbankTracePrintf("%s event=send_consensus_rpc_start node=%d to=%d method=%s %s\n",
-			timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, outbound.trace)
-	} else if outbound.method == methodTransaction {
+	if outbound.method == methodTransaction {
 		smallbankTracePrintf("%s event=forward_rpc_start node=%d to=%d method=%s %s\n",
 			timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, outbound.trace)
 	}
 	err := conn.Invoke(ctx, outbound.method, outbound.request, &grpcAck{})
 	cancel()
-	if outbound.method == methodConsensus {
-		if err != nil {
-			smallbankTracePrintf("%s event=send_consensus_rpc_done node=%d to=%d method=%s elapsed_ms=%d err=%q %s\n",
-				timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, time.Since(start).Milliseconds(), err.Error(), outbound.trace)
-		} else {
-			smallbankTracePrintf("%s event=send_consensus_rpc_done node=%d to=%d method=%s elapsed_ms=%d err=\"\" %s\n",
-				timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, time.Since(start).Milliseconds(), outbound.trace)
-		}
-	} else if outbound.method == methodTransaction {
+	if outbound.method == methodTransaction {
 		if err != nil {
 			smallbankTracePrintf("%s event=forward_rpc_done node=%d to=%d method=%s elapsed_ms=%d err=%q %s\n",
 				timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, time.Since(start).Milliseconds(), err.Error(), outbound.trace)
@@ -1338,11 +1414,19 @@ func (s *networkNodeServer) handleConsensusRequest(req *grpcConsensusRequest) er
 	return nil
 }
 
-func (s *networkNodeServer) Consensus(_ context.Context, req *grpcConsensusRequest) (*grpcAck, error) {
-	if err := s.handleConsensusRequest(req); err != nil {
-		return nil, err
+func (s *networkNodeServer) ConsensusStream(stream smallBankConsensusStreamServer) error {
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := s.handleConsensusRequest(req); err != nil {
+			return err
+		}
 	}
-	return &grpcAck{}, nil
 }
 
 func (s *networkNodeServer) Transaction(_ context.Context, req *grpcTransactionRequest) (*grpcAck, error) {
