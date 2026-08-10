@@ -114,11 +114,8 @@ func newNode(
 	config.RequestPoolSubmitTimeout = 5 * time.Millisecond
 	config.RequestForwardTimeout = 400 * time.Millisecond
 	config.RequestComplainTimeout = 400 * time.Millisecond
-	config.ViewChangeTimeout = 10 * time.Second
-	if opts.Backoff.Enabled {
-		config.ViewChangeTimeout = config.RequestForwardTimeout + config.RequestComplainTimeout
-		config.ViewChangeResendInterval = config.ViewChangeTimeout
-	}
+	config.ViewChangeTimeout = config.RequestForwardTimeout + config.RequestComplainTimeout
+	config.ViewChangeResendInterval = config.ViewChangeTimeout
 	config.LeaderHeartbeatTimeout = 30 * time.Second
 	config.LeaderRotation = false
 	config.DecisionsPerLeader = 0
@@ -469,13 +466,25 @@ func (n *node) applyBaseRequestTimeout(timeout time.Duration, source string) (bf
 		return n.applyEffectiveTimeouts(update.State, source)
 	}
 
-	config, err := n.consensus.ApplyRequestTimeout(timeout)
+	// Keep the view-change timers tied to the learned request timeout, mirroring
+	// applyEffectiveTimeouts. ApplyViewChangeTimeout must run first: it clamps the
+	// resend interval down to the new timeout, and the explicit resend call after it
+	// raises the interval again when the timeout grows.
+	config, err := n.consensus.ApplyViewChangeTimeout(timeout)
+	if err != nil {
+		return config, err
+	}
+	if err := n.consensus.ApplyViewChangeResendInterval(timeout); err != nil {
+		return config, err
+	}
+	config, err = n.consensus.ApplyRequestTimeout(timeout)
 	if err != nil {
 		return config, err
 	}
 	n.configuration = config
-	fmt.Printf("[learning] applied SmartBFT request timeout: node=%d source=%s total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d\n",
-		n.id, source, timeout.Milliseconds(), config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds())
+	fmt.Printf("[learning] applied SmartBFT request timeout: node=%d source=%s total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d view_change_timeout_ms=%d view_change_resend_ms=%d\n",
+		n.id, source, timeout.Milliseconds(), config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds(),
+		config.ViewChangeTimeout.Milliseconds(), timeout.Milliseconds())
 	return config, nil
 }
 
