@@ -156,6 +156,12 @@ func newNode(
 		n.viewClock.Stop()
 		return nil, fmt.Errorf("start consensus for node %d: %w", id, err)
 	}
+	if n.learning != nil && n.learning.enabled {
+		learningPrintf("SmartBFT request timeout active: node=%d source=initial-configuration total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d view_change_timeout_ms=%d view_change_resend_ms=%d\n",
+			n.id, (config.RequestForwardTimeout + config.RequestComplainTimeout).Milliseconds(),
+			config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds(),
+			config.ViewChangeTimeout.Milliseconds(), config.ViewChangeResendInterval.Milliseconds())
+	}
 	n.start()
 
 	return n, nil
@@ -482,7 +488,7 @@ func (n *node) applyBaseRequestTimeout(timeout time.Duration, source string) (bf
 		return config, err
 	}
 	n.configuration = config
-	fmt.Printf("[learning] applied SmartBFT request timeout: node=%d source=%s total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d view_change_timeout_ms=%d view_change_resend_ms=%d\n",
+	learningPrintf("applied SmartBFT request timeout: node=%d source=%s total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d view_change_timeout_ms=%d view_change_resend_ms=%d\n",
 		n.id, source, timeout.Milliseconds(), config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds(),
 		config.ViewChangeTimeout.Milliseconds(), timeout.Milliseconds())
 	return config, nil

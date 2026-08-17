@@ -158,6 +158,13 @@ type learningManager struct {
 	applyTimeout func(time.Duration) error
 }
 
+func learningPrintf(format string, args ...any) {
+	prefixedArgs := make([]any, 0, len(args)+1)
+	prefixedArgs = append(prefixedArgs, timestampedLogTag("learning"))
+	prefixedArgs = append(prefixedArgs, args...)
+	fmt.Printf("%s "+format, prefixedArgs...)
+}
+
 func newLearningManager(opts learningOptions) (*learningManager, error) {
 	if !opts.Enabled {
 		return disabledLearningManager(), nil
@@ -228,10 +235,10 @@ func newLearningManager(opts learningOptions) (*learningManager, error) {
 		applyTimeout:       opts.ApplyTimeout,
 		reportWindows:      make(map[uint64]learningReportWindow),
 	}
-	fmt.Printf("[learning] node %d target %s protocol=PBFT initial_timeout_ms=%d window_mode=%s\n",
+	learningPrintf("node %d target %s protocol=PBFT initial_timeout_ms=%d window_mode=%s\n",
 		opts.NodeID, opts.AgentTarget, opts.InitialTimeout.Milliseconds(), opts.WindowMode)
 	if opts.WindowMode == learningWindowModeWallClock {
-		fmt.Printf("[learning] wall-clock windows: feature=%s reply_wait=%s warmup=%s reward=%s\n",
+		learningPrintf("wall-clock windows: feature=%s reply_wait=%s warmup=%s reward=%s\n",
 			opts.FeatureDuration, opts.ReplyWait, opts.WarmupDuration, opts.RewardDuration)
 	}
 	return m, nil
@@ -463,7 +470,7 @@ func (m *learningManager) handleWallClockApplyDeadline(episode uint32, deadline 
 	applied := false
 	if decision != nil && decision.timeout > 0 {
 		if err := m.applyRecommendedTimeoutLocked(decision.timeout); err != nil {
-			fmt.Printf("[learning] failed to apply wall-clock recommendation: episode=%d timeout_ms=%d err=%v\n",
+			learningPrintf("failed to apply wall-clock recommendation: episode=%d timeout_ms=%d err=%v\n",
 				episode, decision.timeout.Milliseconds(), err)
 		} else {
 			applied = true
@@ -473,10 +480,10 @@ func (m *learningManager) handleWallClockApplyDeadline(episode uint32, deadline 
 	m.wallClockStage = wallClockLearningWarmup
 	m.wallClockDeadline = deadline.Add(m.warmupDuration)
 	if applied {
-		fmt.Printf("[learning] applied wall-clock recommendation: episode=%d timeout_ms=%d\n",
+		learningPrintf("applied wall-clock recommendation: episode=%d timeout_ms=%d\n",
 			episode, m.currentTimeout.Milliseconds())
 	} else {
-		fmt.Printf("[learning] wall-clock reply deadline reached without recommendation update: episode=%d timeout_ms=%d\n",
+		learningPrintf("wall-clock reply deadline reached without recommendation update: episode=%d timeout_ms=%d\n",
 			episode, m.currentTimeout.Milliseconds())
 	}
 	return true
@@ -496,7 +503,7 @@ func (m *learningManager) handleWallClockRewardStart(episode uint32, start time.
 	m.rewardMetricsStarted = true
 	m.wallClockStage = wallClockLearningReward
 	m.wallClockDeadline = start.Add(m.rewardDuration)
-	fmt.Printf("[learning] started wall-clock reward measurement: episode=%d duration=%s timeout_ms=%d\n",
+	learningPrintf("started wall-clock reward measurement: episode=%d duration=%s timeout_ms=%d\n",
 		episode, m.rewardDuration, m.lastTimeout.Milliseconds())
 	return true
 }
@@ -514,7 +521,7 @@ func (m *learningManager) handleWallClockRewardDeadline(episode uint32, end time
 	m.rewardCapturedForEpisode = true
 	rewardConsensus := m.metrics.totalConsensus
 	rewardTransactions := m.metrics.totalTransactions
-	fmt.Printf("[learning] captured wall-clock reward: episode=%d duration=%s total_consensus=%d total_transactions=%d timeout_ms=%d\n",
+	learningPrintf("captured wall-clock reward: episode=%d duration=%s total_consensus=%d total_transactions=%d timeout_ms=%d\n",
 		episode, m.rewardDuration, rewardConsensus, rewardTransactions, m.lastTimeout.Milliseconds())
 	m.startNextWallClockEpisodeLocked(end)
 	return true
@@ -589,13 +596,13 @@ func (m *learningManager) maybeConsumeRecommendationLocked(sequence uint64, deli
 	m.selectedTimeout = decision.timeout
 	m.waitingForRecommendation = false
 	m.stopTimeoutPollingLocked()
-	fmt.Printf("[learning] received recommendation: episode=%d report_seq=%d apply_count=%d reward_start_count=%d reward_end_count=%d timeout_ms=%d current_seq=%d delivered_count=%d\n",
+	learningPrintf("received recommendation: episode=%d report_seq=%d apply_count=%d reward_start_count=%d reward_end_count=%d timeout_ms=%d current_seq=%d delivered_count=%d\n",
 		m.currentEpisode, window.reportSeq, window.applyCount, window.rewardStartCount, window.rewardEndCount, decision.timeout.Milliseconds(), sequence, deliveredCount)
 
 	if deliveredCount > window.applyCount {
 		m.applyHandledForEpisode = true
 		m.lastTimeout = m.currentTimeout
-		fmt.Printf("[learning] ignored late recommendation: episode=%d report_seq=%d apply_count=%d current_seq=%d delivered_count=%d\n",
+		learningPrintf("ignored late recommendation: episode=%d report_seq=%d apply_count=%d current_seq=%d delivered_count=%d\n",
 			m.currentEpisode, window.reportSeq, window.applyCount, sequence, deliveredCount)
 	}
 }
@@ -614,7 +621,7 @@ func (m *learningManager) maybeHandleApplyDeadlineLocked(sequence uint64, delive
 		if recommendedTimeout > 0 {
 			if err := m.applyRecommendedTimeoutLocked(recommendedTimeout); err != nil {
 				applyErr = err
-				fmt.Printf("[learning] failed to apply recommendation: episode=%d report_seq=%d apply_count=%d current_seq=%d delivered_count=%d timeout_ms=%d err=%v\n",
+				learningPrintf("failed to apply recommendation: episode=%d report_seq=%d apply_count=%d current_seq=%d delivered_count=%d timeout_ms=%d err=%v\n",
 					m.currentEpisode, m.selectedWindow.reportSeq, m.selectedWindow.applyCount, sequence, deliveredCount, recommendedTimeout.Milliseconds(), err)
 			} else {
 				applied = true
@@ -625,13 +632,13 @@ func (m *learningManager) maybeHandleApplyDeadlineLocked(sequence uint64, delive
 		if applied {
 			m.rebaseSelectedWindowAfterApplyLocked(deliveredCount)
 			m.metrics.resetWithThroughputStart(time.Now())
-			fmt.Printf("[learning] applied recommendation: episode=%d report_seq=%d apply_count=%d reward_start_count=%d reward_end_count=%d current_seq=%d delivered_count=%d timeout_ms=%d\n",
+			learningPrintf("applied recommendation: episode=%d report_seq=%d apply_count=%d reward_start_count=%d reward_end_count=%d current_seq=%d delivered_count=%d timeout_ms=%d\n",
 				m.currentEpisode, m.selectedWindow.reportSeq, m.selectedWindow.applyCount, m.selectedWindow.rewardStartCount, m.selectedWindow.rewardEndCount, sequence, deliveredCount, m.currentTimeout.Milliseconds())
 		} else if applyErr != nil {
-			fmt.Printf("[learning] apply deadline reached with recommendation apply failure: episode=%d report_seq=%d apply_count=%d current_seq=%d delivered_count=%d recommended_timeout_ms=%d current_timeout_ms=%d err=%v\n",
+			learningPrintf("apply deadline reached with recommendation apply failure: episode=%d report_seq=%d apply_count=%d current_seq=%d delivered_count=%d recommended_timeout_ms=%d current_timeout_ms=%d err=%v\n",
 				m.currentEpisode, m.selectedWindow.reportSeq, m.selectedWindow.applyCount, sequence, deliveredCount, recommendedTimeout.Milliseconds(), m.currentTimeout.Milliseconds(), applyErr)
 		} else {
-			fmt.Printf("[learning] apply deadline reached without recommendation update: episode=%d report_seq=%d apply_count=%d current_seq=%d delivered_count=%d timeout_ms=%d\n",
+			learningPrintf("apply deadline reached without recommendation update: episode=%d report_seq=%d apply_count=%d current_seq=%d delivered_count=%d timeout_ms=%d\n",
 				m.currentEpisode, m.selectedWindow.reportSeq, m.selectedWindow.applyCount, sequence, deliveredCount, m.currentTimeout.Milliseconds())
 		}
 		return
@@ -641,7 +648,7 @@ func (m *learningManager) maybeHandleApplyDeadlineLocked(sequence uint64, delive
 		m.applyHandledForEpisode = true
 		m.lastTimeout = m.currentTimeout
 		m.stopTimeoutPollingLocked()
-		fmt.Printf("[learning] recommendation unavailable at cap apply deadline: episode=%d cap_apply_count=%d current_seq=%d delivered_count=%d timeout_ms=%d\n",
+		learningPrintf("recommendation unavailable at cap apply deadline: episode=%d cap_apply_count=%d current_seq=%d delivered_count=%d timeout_ms=%d\n",
 			m.currentEpisode, m.capApplyDeadlineCount, sequence, deliveredCount, m.currentTimeout.Milliseconds())
 	}
 }
@@ -675,7 +682,7 @@ func (m *learningManager) maybeHandleRewardStartLocked(sample learningSample, de
 
 	m.metrics.resetWithThroughputStart(sample.DecisionTime)
 	m.rewardMetricsStarted = true
-	fmt.Printf("[learning] started reward measurement: episode=%d reward_start_count=%d current_seq=%d delivered_count=%d source=%s timeout_ms=%d\n",
+	learningPrintf("started reward measurement: episode=%d reward_start_count=%d current_seq=%d delivered_count=%d source=%s timeout_ms=%d\n",
 		m.currentEpisode, rewardStartCount, sample.Sequence, deliveredCount, source, m.lastTimeout.Milliseconds())
 }
 
@@ -715,7 +722,7 @@ func (m *learningManager) maybeHandleRewardDeadlineLocked(sample learningSample,
 	m.captureRewardLocked(m.currentEpisode)
 	m.rewardCapturedForEpisode = true
 	m.stopTimeoutPollingLocked()
-	fmt.Printf("[learning] captured reward: episode=%d reward_end_count=%d current_seq=%d delivered_count=%d source=%s timeout_ms=%d\n",
+	learningPrintf("captured reward: episode=%d reward_end_count=%d current_seq=%d delivered_count=%d source=%s timeout_ms=%d\n",
 		m.currentEpisode, rewardDeadlineCount, sample.Sequence, deliveredCount, source, m.lastTimeout.Milliseconds())
 	m.startNextEpisodeLocked(sample.Sequence, deliveredCount, sample.DecisionTime)
 }
@@ -723,7 +730,7 @@ func (m *learningManager) maybeHandleRewardDeadlineLocked(sample learningSample,
 func (m *learningManager) sendStateReportLocked(episode uint32, startTick uint64, reportSeq uint64, reportLength uint64) {
 	report := m.metrics.buildReport()
 	if report == nil {
-		fmt.Printf("[learning] episode %d skipped report: metrics unavailable\n", episode)
+		learningPrintf("episode %d skipped report: metrics unavailable\n", episode)
 		return
 	}
 	reportThroughput := m.metrics.calculateThroughput()
@@ -754,13 +761,13 @@ func (m *learningManager) sendStateReportLocked(episode uint32, startTick uint64
 	ctx, cancel := context.WithTimeout(context.Background(), m.rpcTimeout)
 	defer cancel()
 	if err := m.client.sendReport(ctx, local); err != nil {
-		fmt.Printf("[learning] SendReport failed: episode=%d target_node=%d err=%v\n", episode, m.nodeID, err)
+		learningPrintf("SendReport failed: episode=%d target_node=%d err=%v\n", episode, m.nodeID, err)
 		return
 	}
-	fmt.Printf("[learning] sent report: node=%d episode=%d start_tick=%d report_seq=%d window_consensus_count=%d total_transactions=%d throughput_duration_s=%.6f throughput_tps=%.6f\n",
+	learningPrintf("sent report: node=%d episode=%d start_tick=%d report_seq=%d window_consensus_count=%d total_transactions=%d throughput_duration_s=%.6f throughput_tps=%.6f\n",
 		m.nodeID, episode, startTick, reportSeq, reportLength, reportThroughput.totalTransactions, reportThroughput.duration.Seconds(), report.ThroughputTps)
 	if m.pendingReward != nil {
-		fmt.Printf("[learning] sent reward: node=%d episode=%d total_transactions=%d throughput_duration_s=%.6f throughput_tps=%.6f\n",
+		learningPrintf("sent reward: node=%d episode=%d total_transactions=%d throughput_duration_s=%.6f throughput_tps=%.6f\n",
 			m.nodeID, m.pendingReward.episode, m.pendingReward.throughputTransactions, m.pendingReward.throughputDuration.Seconds(), m.pendingReward.report.ThroughputTps)
 		m.pendingReward = nil
 	}
@@ -801,20 +808,20 @@ func (m *learningManager) sendWallClockStateReport(local *adaptivetimers.ReportL
 	ctx, cancel := context.WithTimeout(context.Background(), m.rpcTimeout)
 	defer cancel()
 	if err := m.client.sendReport(ctx, local); err != nil {
-		fmt.Printf("[learning] SendReport failed: episode=%d target_node=%d window_mode=wall-clock err=%v\n",
+		learningPrintf("SendReport failed: episode=%d target_node=%d window_mode=wall-clock err=%v\n",
 			local.Episode, m.nodeID, err)
 		return
 	}
 
 	report := local.GetPbftState()
-	fmt.Printf("[learning] sent report: node=%d episode=%d start_tick=%d report_seq=%d window_mode=wall-clock total_consensus=%d total_transactions=%d throughput_duration_s=%.6f throughput_tps=%.6f\n",
+	learningPrintf("sent report: node=%d episode=%d start_tick=%d report_seq=%d window_mode=wall-clock total_consensus=%d total_transactions=%d throughput_duration_s=%.6f throughput_tps=%.6f\n",
 		m.nodeID, local.Episode, local.StartTick, local.ReportSeq, report.TotalConsensusInstances,
 		throughput.totalTransactions, throughput.duration.Seconds(), report.ThroughputTps)
 	if pendingReward == nil {
 		return
 	}
 
-	fmt.Printf("[learning] sent reward: node=%d episode=%d total_transactions=%d throughput_duration_s=%.6f throughput_tps=%.6f\n",
+	learningPrintf("sent reward: node=%d episode=%d total_transactions=%d throughput_duration_s=%.6f throughput_tps=%.6f\n",
 		m.nodeID, pendingReward.episode, pendingReward.throughputTransactions,
 		pendingReward.throughputDuration.Seconds(), pendingReward.report.ThroughputTps)
 	m.lock.Lock()
@@ -890,10 +897,10 @@ func (m *learningManager) pollForTimeout(ctx context.Context, episode uint32) {
 					reportEndCount: reportWindow.endCount,
 					reportLength:   reportWindow.length,
 				}
-				fmt.Printf("[learning] timeout READY: episode=%d start_tick=%d report_seq=%d window_consensus_count=%d report_end_count=%d timeout_ms=%d\n",
+				learningPrintf("timeout READY: episode=%d start_tick=%d report_seq=%d window_consensus_count=%d report_end_count=%d timeout_ms=%d\n",
 					episode, startTick, reportSeq, windowConsensusCount, reportWindow.endCount, timeout.Milliseconds())
 			} else if m.pollerEpisode == episode && m.pollerDecision == nil && !found && !reportedUnknownWindow {
-				fmt.Printf("[learning] ignored timeout for unknown local report window: episode=%d start_tick=%d report_seq=%d window_consensus_count=%d\n",
+				learningPrintf("ignored timeout for unknown local report window: episode=%d start_tick=%d report_seq=%d window_consensus_count=%d\n",
 					episode, startTick, reportSeq, windowConsensusCount)
 				reportedUnknownWindow = true
 			}
