@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	gogotypes "github.com/gogo/protobuf/types"
+	"github.com/hyperledger-labs/SmartBFT/examples/internal/fabrictransport"
 	algorithm "github.com/hyperledger-labs/SmartBFT/internal/bft"
 	smart "github.com/hyperledger-labs/SmartBFT/pkg/api"
 	adaptivetimers "github.com/hyperledger-labs/SmartBFT/proto/adaptive_timers"
@@ -103,14 +104,70 @@ func newSharingServer(opts sharingOptions) (*sharingServer, error) {
 		node:          node,
 		agent:         agent,
 		host:          host,
-		peerServer:    grpc.NewServer(grpc.ForceServerCodec(sharingCodec)),
+		peerServer:    grpc.NewServer(),
 		peerListener:  peerListener,
 		agentServer:   grpc.NewServer(),
 		agentListener: agentListener,
 	}
-	s.peerServer.RegisterService(&reportChainServiceDesc, s)
+	if err := fabrictransport.RegisterServer(s.peerServer, s, fabrictransport.ServerConfig{
+		SendTimeout: reportSendTimeout,
+		OnError: func(operation string, err error) {
+			fmt.Printf("%s peer stream failed: node=%d operation=%s err=%v\n", logTag("transport"), host.ID, operation, err)
+		},
+	}); err != nil {
+		_ = peerListener.Close()
+		_ = agentListener.Close()
+		node.stop()
+		agent.close()
+		transport.close()
+		return nil, err
+	}
 	adaptivetimers.RegisterConsensusServer(s.agentServer, s)
 	return s, nil
+}
+
+// Handle dispatches every non-agent request received on the shared
+// Fabric-style Step service. The envelope's sender ID replaces the redundant
+// sender field that the old unary RPC transport trusted.
+func (s *sharingServer) Handle(ctx context.Context, from uint64, operation string, payload []byte) ([]byte, error) {
+	switch operation {
+	case operationReportConsensus:
+		request := new(reportConsensusRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode report consensus request: %w", err)
+		}
+		request.From = from
+		_, err := s.Consensus(ctx, request)
+		return nil, err
+	case operationReportTransaction:
+		request := new(reportTransactionRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode report transaction request: %w", err)
+		}
+		request.From = from
+		_, err := s.Transaction(ctx, request)
+		return nil, err
+	case operationReportSubmit:
+		request := new(reportSubmitRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode report submission: %w", err)
+		}
+		request.From = from
+		_, err := s.Submit(ctx, request)
+		return nil, err
+	case operationReportStateTransfer:
+		request := new(latestDecisionRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode report state-transfer request: %w", err)
+		}
+		response, err := s.Latest(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		return fabrictransport.Marshal(response)
+	default:
+		return nil, fmt.Errorf("unknown sharing transport operation %q", operation)
+	}
 }
 
 func (s *sharingServer) serve() error {

@@ -6,11 +6,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/gob"
+	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"sort"
@@ -20,14 +18,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hyperledger-labs/SmartBFT/examples/internal/fabrictransport"
 	smart "github.com/hyperledger-labs/SmartBFT/pkg/api"
 	"github.com/hyperledger-labs/SmartBFT/pkg/metrics/disabled"
 	"github.com/hyperledger-labs/SmartBFT/pkg/wal"
 	"github.com/hyperledger-labs/SmartBFT/smartbftprotos"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/encoding"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -36,43 +33,16 @@ const (
 	defaultNetworkSendTimeout = 2 * time.Second
 	syncMaxReceiveMessageSize = 64 << 20
 	consensusQueueSize        = 4096
-	consensusStreamRetryDelay = 100 * time.Millisecond
-	asyncForwardLimit         = 1024
-	smallBankNetworkService   = "smallbank.SmallBankNetwork"
-	methodConsensusStream     = "/" + smallBankNetworkService + "/ConsensusStream"
-	methodTransaction         = "/" + smallBankNetworkService + "/Transaction"
-	methodSubmit              = "/" + smallBankNetworkService + "/Submit"
-	methodSubmitStream        = "/" + smallBankNetworkService + "/SubmitStream"
-	methodStatus              = "/" + smallBankNetworkService + "/Status"
-	methodChecksum            = "/" + smallBankNetworkService + "/Checksum"
-	methodStateSnapshot       = "/" + smallBankNetworkService + "/StateSnapshot"
-	methodApplyTimeout        = "/" + smallBankNetworkService + "/ApplyTimeout"
-	smallBankClientService    = "smallbank.SmallBankClient"
-	methodClientReply         = "/" + smallBankClientService + "/Reply"
-	methodClientReplyStream   = "/" + smallBankClientService + "/ReplyStream"
+	clientQueueSize           = 65536
+	operationConsensus        = "smallbank-consensus"
+	operationTransaction      = "smallbank-transaction"
+	operationSubmit           = "smallbank-submit"
+	operationStatus           = "smallbank-status"
+	operationChecksum         = "smallbank-checksum"
+	operationStateTransfer    = "smallbank-state-transfer"
+	operationApplyTimeout     = "smallbank-apply-timeout"
+	operationClientReply      = "smallbank-client-reply"
 )
-
-var smallBankCodec = smallBankGobCodec{}
-
-func init() {
-	encoding.RegisterCodec(smallBankCodec)
-}
-
-type smallBankGobCodec struct{}
-
-func (smallBankGobCodec) Marshal(v any) ([]byte, error) {
-	var out bytes.Buffer
-	err := gob.NewEncoder(&out).Encode(v)
-	return out.Bytes(), err
-}
-
-func (smallBankGobCodec) Unmarshal(data []byte, v any) error {
-	return gob.NewDecoder(bytes.NewReader(data)).Decode(v)
-}
-
-func (smallBankGobCodec) Name() string {
-	return "smallbank-gob"
-}
 
 type hostEntry struct {
 	ID   uint64
@@ -185,261 +155,11 @@ type grpcReplyRequest struct {
 	Response response
 }
 
-type smallBankNetworkServiceServer interface {
-	ConsensusStream(smallBankConsensusStreamServer) error
-	Transaction(context.Context, *grpcTransactionRequest) (*grpcAck, error)
-	Submit(context.Context, *grpcSubmitRequest) (*response, error)
-	SubmitStream(smallBankSubmitStreamServer) error
-	Status(context.Context, *grpcStatusRequest) (*grpcStatusResponse, error)
-	Checksum(context.Context, *grpcChecksumRequest) (*grpcChecksumResponse, error)
-	StateSnapshot(context.Context, *grpcStateSnapshotRequest) (*stateSyncSnapshot, error)
-	ApplyTimeout(context.Context, *grpcApplyTimeoutRequest) (*grpcAck, error)
-}
-
-type smallBankClientServiceServer interface {
-	Reply(context.Context, *grpcReplyRequest) (*grpcAck, error)
-	ReplyStream(smallBankClientReplyStreamServer) error
-}
-
-var smallBankNetworkServiceDesc = grpc.ServiceDesc{
-	ServiceName: smallBankNetworkService,
-	HandlerType: (*smallBankNetworkServiceServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{MethodName: "Transaction", Handler: smallBankTransactionHandler},
-		{MethodName: "Submit", Handler: smallBankSubmitHandler},
-		{MethodName: "Status", Handler: smallBankStatusHandler},
-		{MethodName: "Checksum", Handler: smallBankChecksumHandler},
-		{MethodName: "StateSnapshot", Handler: smallBankStateSnapshotHandler},
-		{MethodName: "ApplyTimeout", Handler: smallBankApplyTimeoutHandler},
-	},
-	Streams: []grpc.StreamDesc{
-		smallBankConsensusStreamDesc,
-		smallBankSubmitStreamDesc,
-	},
-}
-
-var smallBankConsensusStreamDesc = grpc.StreamDesc{
-	StreamName:    "ConsensusStream",
-	Handler:       smallBankConsensusStreamHandler,
-	ClientStreams: true,
-}
-
-var smallBankSubmitStreamDesc = grpc.StreamDesc{
-	StreamName:    "SubmitStream",
-	Handler:       smallBankSubmitStreamHandler,
-	ClientStreams: true,
-}
-
-var smallBankClientServiceDesc = grpc.ServiceDesc{
-	ServiceName: smallBankClientService,
-	HandlerType: (*smallBankClientServiceServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{MethodName: "Reply", Handler: smallBankClientReplyHandler},
-	},
-	Streams: []grpc.StreamDesc{
-		smallBankClientReplyStreamDesc,
-	},
-}
-
-var smallBankClientReplyStreamDesc = grpc.StreamDesc{
-	StreamName:    "ReplyStream",
-	Handler:       smallBankClientReplyStreamHandler,
-	ClientStreams: true,
-}
-
-func smallBankClientReplyHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-	in := new(grpcReplyRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(smallBankClientServiceServer).Reply(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: methodClientReply}
-	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(smallBankClientServiceServer).Reply(ctx, req.(*grpcReplyRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-type smallBankClientReplyStreamServer interface {
-	Recv() (*grpcReplyRequest, error)
-	grpc.ServerStream
-}
-
-type smallBankClientReplyStream struct {
-	grpc.ServerStream
-}
-
-func (s *smallBankClientReplyStream) Recv() (*grpcReplyRequest, error) {
-	req := new(grpcReplyRequest)
-	if err := s.ServerStream.RecvMsg(req); err != nil {
-		return nil, err
-	}
-	return req, nil
-}
-
-func smallBankClientReplyStreamHandler(srv any, stream grpc.ServerStream) error {
-	return srv.(smallBankClientServiceServer).ReplyStream(&smallBankClientReplyStream{ServerStream: stream})
-}
-
-type smallBankConsensusStreamServer interface {
-	Recv() (*grpcConsensusRequest, error)
-	grpc.ServerStream
-}
-
-type smallBankConsensusStream struct {
-	grpc.ServerStream
-}
-
-func (s *smallBankConsensusStream) Recv() (*grpcConsensusRequest, error) {
-	req := new(grpcConsensusRequest)
-	if err := s.ServerStream.RecvMsg(req); err != nil {
-		return nil, err
-	}
-	return req, nil
-}
-
-func smallBankConsensusStreamHandler(srv any, stream grpc.ServerStream) error {
-	return srv.(smallBankNetworkServiceServer).ConsensusStream(&smallBankConsensusStream{ServerStream: stream})
-}
-
-func smallBankTransactionHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-	in := new(grpcTransactionRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(smallBankNetworkServiceServer).Transaction(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: methodTransaction}
-	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(smallBankNetworkServiceServer).Transaction(ctx, req.(*grpcTransactionRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func smallBankSubmitHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-	in := new(grpcSubmitRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(smallBankNetworkServiceServer).Submit(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: methodSubmit}
-	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(smallBankNetworkServiceServer).Submit(ctx, req.(*grpcSubmitRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-type smallBankSubmitStreamServer interface {
-	Recv() (*grpcSubmitRequest, error)
-	grpc.ServerStream
-}
-
-type smallBankSubmitStream struct {
-	grpc.ServerStream
-}
-
-func (s *smallBankSubmitStream) Recv() (*grpcSubmitRequest, error) {
-	req := new(grpcSubmitRequest)
-	if err := s.ServerStream.RecvMsg(req); err != nil {
-		return nil, err
-	}
-	return req, nil
-}
-
-func smallBankSubmitStreamHandler(srv any, stream grpc.ServerStream) error {
-	return srv.(smallBankNetworkServiceServer).SubmitStream(&smallBankSubmitStream{ServerStream: stream})
-}
-
-func smallBankStatusHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-	in := new(grpcStatusRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(smallBankNetworkServiceServer).Status(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: methodStatus}
-	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(smallBankNetworkServiceServer).Status(ctx, req.(*grpcStatusRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func smallBankChecksumHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-	in := new(grpcChecksumRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(smallBankNetworkServiceServer).Checksum(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: methodChecksum}
-	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(smallBankNetworkServiceServer).Checksum(ctx, req.(*grpcChecksumRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func smallBankStateSnapshotHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-	in := new(grpcStateSnapshotRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(smallBankNetworkServiceServer).StateSnapshot(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: methodStateSnapshot}
-	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(smallBankNetworkServiceServer).StateSnapshot(ctx, req.(*grpcStateSnapshotRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func smallBankApplyTimeoutHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-	in := new(grpcApplyTimeoutRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(smallBankNetworkServiceServer).ApplyTimeout(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: methodApplyTimeout}
-	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(smallBankNetworkServiceServer).ApplyTimeout(ctx, req.(*grpcApplyTimeoutRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 type networkTransport struct {
-	selfID          uint64
-	hosts           map[uint64]hostEntry
-	peers           map[uint64]*grpc.ClientConn
-	queues          map[uint64]chan networkOutbound
-	pending         map[uint64]map[networkCoalesceKey]struct{}
-	pendingLock     sync.Mutex
-	forwardInflight map[uint64]chan struct{}
-	streamContext   context.Context
-	cancelStreams   context.CancelFunc
-	stop            chan struct{}
-	workerWG        sync.WaitGroup
-	asyncWG         sync.WaitGroup
-}
-
-type networkOutbound struct {
-	method   string
-	request  any
-	coalesce *networkCoalesceKey
-	trace    string
-}
-
-type networkCoalesceKey struct {
-	kind string
-	view uint64
+	selfID    uint64
+	hosts     map[uint64]hostEntry
+	clients   map[uint64]*fabrictransport.Client
+	closeOnce sync.Once
 }
 
 func smallBankRequestTrace(raw []byte) string {
@@ -448,48 +168,6 @@ func smallBankRequestTrace(raw []byte) string {
 		return fmt.Sprintf("request_decode_error=%q request_bytes=%d", err.Error(), len(raw))
 	}
 	return fmt.Sprintf("request={%s %s}", req.ClientID, req.ID)
-}
-
-func smartBFTNetworkCoalesceKey(message *smartbftprotos.Message) *networkCoalesceKey {
-	kind, view, ok := smartBFTViewMessageTarget(message)
-	if !ok {
-		return nil
-	}
-	return &networkCoalesceKey{kind: kind, view: view}
-}
-
-func smartBFTViewMessageTarget(message *smartbftprotos.Message) (string, uint64, bool) {
-	if message == nil {
-		return "", 0, false
-	}
-	if vc := message.GetViewChange(); vc != nil {
-		return "view_change", vc.GetNextView(), true
-	}
-	if vd := message.GetViewData(); vd != nil {
-		target, ok := smartBFTSignedViewDataTarget(vd)
-		return "view_data", target, ok
-	}
-	if nv := message.GetNewView(); nv != nil {
-		for _, svd := range nv.GetSignedViewData() {
-			target, ok := smartBFTSignedViewDataTarget(svd)
-			if ok {
-				return "new_view", target, true
-			}
-		}
-		return "new_view", 0, false
-	}
-	return "", 0, false
-}
-
-func smartBFTSignedViewDataTarget(svd *smartbftprotos.SignedViewData) (uint64, bool) {
-	if svd == nil {
-		return 0, false
-	}
-	vd := &smartbftprotos.ViewData{}
-	if err := proto.Unmarshal(svd.GetRawViewData(), vd); err != nil {
-		return 0, false
-	}
-	return vd.GetNextView(), true
 }
 
 func smartBFTTraceMessageSummary(message *smartbftprotos.Message) string {
@@ -580,69 +258,58 @@ func smartBFTTraceMessageSummary(message *smartbftprotos.Message) string {
 }
 
 func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, error) {
-	hostMap := make(map[uint64]hostEntry, len(hosts))
-	for _, host := range hosts {
-		hostMap[host.ID] = host
-	}
-	streamContext, cancelStreams := context.WithCancel(context.Background())
 	t := &networkTransport{
-		selfID:          selfID,
-		hosts:           hostMap,
-		peers:           make(map[uint64]*grpc.ClientConn),
-		queues:          make(map[uint64]chan networkOutbound),
-		pending:         make(map[uint64]map[networkCoalesceKey]struct{}),
-		forwardInflight: make(map[uint64]chan struct{}),
-		streamContext:   streamContext,
-		cancelStreams:   cancelStreams,
-		stop:            make(chan struct{}),
+		selfID:  selfID,
+		hosts:   make(map[uint64]hostEntry, len(hosts)),
+		clients: make(map[uint64]*fabrictransport.Client),
 	}
 	for _, host := range hosts {
+		t.hosts[host.ID] = host
 		if host.ID == selfID {
 			continue
 		}
-		conn, err := newSmallBankGRPCClientConn(host.address())
+		peerID := host.ID
+		client, err := newSmallBankFabricClient(selfID, host.address(), consensusQueueSize, func(operation string, err error) {
+			smallbankTracePrintf("%s event=stream_failed node=%d to=%d operation=%s err=%q\n",
+				timestampedLogTag("trace"), selfID, peerID, operation, err.Error())
+		})
 		if err != nil {
 			t.close()
-			return nil, fmt.Errorf("connect to node %d at %s: %w", host.ID, host.address(), err)
+			return nil, fmt.Errorf("create transport to node %d at %s: %w", host.ID, host.address(), err)
 		}
-		queue := make(chan networkOutbound, consensusQueueSize)
-		t.peers[host.ID] = conn
-		t.queues[host.ID] = queue
-		t.pending[host.ID] = make(map[networkCoalesceKey]struct{})
-		t.forwardInflight[host.ID] = make(chan struct{}, asyncForwardLimit)
-		t.workerWG.Add(1)
-		go t.worker(host, conn, queue)
+		t.clients[host.ID] = client
 	}
 	return t, nil
 }
 
-func newSmallBankGRPCClientConn(target string) (*grpc.ClientConn, error) {
-	return grpc.NewClient(
-		target,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.ForceCodec(smallBankCodec),
-			grpc.WaitForReady(true),
-			grpc.MaxCallRecvMsgSize(syncMaxReceiveMessageSize),
-		),
-	)
+func newSmallBankFabricClient(
+	selfID uint64,
+	target string,
+	queueSize int,
+	onError func(operation string, err error),
+) (*fabrictransport.Client, error) {
+	return fabrictransport.NewClient(fabrictransport.ClientConfig{
+		SelfID:            selfID,
+		Address:           target,
+		QueueSize:         queueSize,
+		SendTimeout:       defaultNetworkSendTimeout,
+		MaxReceiveMsgSize: syncMaxReceiveMessageSize,
+		OnError:           onError,
+	})
 }
 
 func (t *networkTransport) close() {
 	if t == nil {
 		return
 	}
-	select {
-	case <-t.stop:
-	default:
-		close(t.stop)
-	}
-	t.cancelStreams()
-	t.workerWG.Wait()
-	t.asyncWG.Wait()
-	for _, conn := range t.peers {
-		_ = conn.Close()
-	}
+	t.closeOnce.Do(func() {
+		for id, client := range t.clients {
+			if err := client.Close(); err != nil {
+				smallbankTracePrintf("%s event=transport_close_failed node=%d to=%d err=%q\n",
+					timestampedLogTag("trace"), t.selfID, id, err.Error())
+			}
+		}
+	})
 }
 
 func (t *networkTransport) nodeIDs() []uint64 {
@@ -655,249 +322,76 @@ func (t *networkTransport) nodeIDs() []uint64 {
 }
 
 func (t *networkTransport) sendConsensus(targetID uint64, message *smartbftprotos.Message) {
-	raw, err := proto.Marshal(message)
+	client := t.clients[targetID]
+	if client == nil {
+		smallbankTracePrintf("%s event=send_consensus_drop node=%d to=%d reason=no_route %s\n",
+			timestampedLogTag("trace"), t.selfID, targetID, smartBFTTraceMessageSummary(message))
+		return
+	}
+	messageRaw, err := proto.Marshal(message)
 	if err != nil {
+		smallbankTracePrintf("%s event=send_consensus_drop node=%d to=%d reason=marshal_message err=%q\n",
+			timestampedLogTag("trace"), t.selfID, targetID, err.Error())
 		return
 	}
-	key := smartBFTNetworkCoalesceKey(message)
+	payload, err := fabrictransport.Marshal(&grpcConsensusRequest{Message: messageRaw})
+	if err != nil {
+		smallbankTracePrintf("%s event=send_consensus_drop node=%d to=%d reason=marshal_envelope err=%q\n",
+			timestampedLogTag("trace"), t.selfID, targetID, err.Error())
+		return
+	}
 	trace := smartBFTTraceMessageSummary(message)
-	t.enqueue(targetID, networkOutbound{
-		method:   methodConsensusStream,
-		coalesce: key,
-		trace:    trace,
-		request: &grpcConsensusRequest{
-			From:    t.selfID,
-			Message: raw,
-		},
-	})
-}
-
-func (t *networkTransport) sendTransaction(targetID uint64, payload []byte) {
-	trace := smallBankRequestTrace(payload)
-	t.enqueue(targetID, networkOutbound{
-		method: methodTransaction,
-		trace:  trace,
-		request: &grpcTransactionRequest{
-			From:    t.selfID,
-			Payload: append([]byte(nil), payload...),
-		},
-	})
-}
-
-func (t *networkTransport) enqueue(targetID uint64, outbound networkOutbound) {
-	queue, exists := t.queues[targetID]
-	if !exists {
-		return
-	}
-	if !t.reservePending(targetID, outbound.coalesce) {
-		if outbound.method == methodConsensusStream {
-			smallbankTracePrintf("%s event=send_consensus_drop_coalesced node=%d to=%d queue_len=%d queue_cap=%d %s\n",
-				timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
-		}
-		return
-	}
-	if outbound.method == methodConsensusStream {
-		smallbankTracePrintf("%s event=send_consensus_enqueue_start node=%d to=%d queue_len=%d queue_cap=%d %s\n",
-			timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
-	} else if outbound.method == methodTransaction {
-		smallbankTracePrintf("%s event=forward_enqueue_start node=%d to=%d queue_len=%d queue_cap=%d %s\n",
-			timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
-	}
-	select {
-	case queue <- outbound:
-		if outbound.method == methodConsensusStream {
-			smallbankTracePrintf("%s event=send_consensus_enqueue_done node=%d to=%d queue_len=%d queue_cap=%d %s\n",
-				timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
-		} else if outbound.method == methodTransaction {
-			smallbankTracePrintf("%s event=forward_enqueue_done node=%d to=%d queue_len=%d queue_cap=%d %s\n",
-				timestampedLogTag("trace"), t.selfID, targetID, len(queue), cap(queue), outbound.trace)
-		}
-	case <-t.stop:
-		t.releasePending(targetID, outbound.coalesce)
-		if outbound.method == methodConsensusStream {
-			smallbankTracePrintf("%s event=send_consensus_enqueue_stopped node=%d to=%d %s\n",
-				timestampedLogTag("trace"), t.selfID, targetID, outbound.trace)
-		} else if outbound.method == methodTransaction {
-			smallbankTracePrintf("%s event=forward_enqueue_stopped node=%d to=%d %s\n",
-				timestampedLogTag("trace"), t.selfID, targetID, outbound.trace)
-		}
-	}
-}
-
-func (t *networkTransport) worker(host hostEntry, conn *grpc.ClientConn, queue <-chan networkOutbound) {
-	defer t.workerWG.Done()
-	var consensusStream grpc.ClientStream
-	defer func() {
-		if consensusStream != nil {
-			_ = consensusStream.CloseSend()
-		}
-	}()
-
-	for {
-		select {
-		case <-t.stop:
+	smallbankTracePrintf("%s event=send_consensus_enqueue node=%d to=%d %s\n",
+		timestampedLogTag("trace"), t.selfID, targetID, trace)
+	err = client.Send(operationConsensus, payload, true, func(sendErr error) {
+		if sendErr != nil {
+			smallbankTracePrintf("%s event=send_consensus_failed node=%d to=%d err=%q %s\n",
+				timestampedLogTag("trace"), t.selfID, targetID, sendErr.Error(), trace)
 			return
-		case outbound := <-queue:
-			if outbound.method == methodConsensusStream {
-				smallbankTracePrintf("%s event=send_consensus_dequeue node=%d to=%d queue_len=%d queue_cap=%d %s\n",
-					timestampedLogTag("trace"), t.selfID, host.ID, len(queue), cap(queue), outbound.trace)
-			} else if outbound.method == methodTransaction {
-				smallbankTracePrintf("%s event=forward_dequeue node=%d to=%d queue_len=%d queue_cap=%d %s\n",
-					timestampedLogTag("trace"), t.selfID, host.ID, len(queue), cap(queue), outbound.trace)
-			}
-
-			if outbound.method == methodConsensusStream {
-				sent := t.sendConsensusStream(host, conn, outbound, &consensusStream)
-				t.releasePending(host.ID, outbound.coalesce)
-				if !sent {
-					return
-				}
-				continue
-			}
-
-			t.releasePending(host.ID, outbound.coalesce)
-			if outbound.method == methodTransaction {
-				t.invokeForwardAsync(host, conn, outbound)
-				continue
-			}
-			t.invokeOnce(host, conn, outbound)
 		}
+		smallbankTracePrintf("%s event=send_consensus_sent node=%d to=%d %s\n",
+			timestampedLogTag("trace"), t.selfID, targetID, trace)
+	})
+	if err != nil {
+		smallbankTracePrintf("%s event=send_consensus_drop node=%d to=%d reason=enqueue err=%q %s\n",
+			timestampedLogTag("trace"), t.selfID, targetID, err.Error(), trace)
 	}
 }
 
-func (t *networkTransport) reservePending(targetID uint64, key *networkCoalesceKey) bool {
-	if key == nil {
-		return true
-	}
-	t.pendingLock.Lock()
-	defer t.pendingLock.Unlock()
-	pending := t.pending[targetID]
-	if pending == nil {
-		pending = make(map[networkCoalesceKey]struct{})
-		t.pending[targetID] = pending
-	}
-	if _, exists := pending[*key]; exists {
-		return false
-	}
-	pending[*key] = struct{}{}
-	return true
-}
-
-func (t *networkTransport) releasePending(targetID uint64, key *networkCoalesceKey) {
-	if key == nil {
+func (t *networkTransport) sendTransaction(targetID uint64, raw []byte) {
+	client := t.clients[targetID]
+	trace := smallBankRequestTrace(raw)
+	if client == nil {
+		smallbankTracePrintf("%s event=forward_failed node=%d to=%d reason=no_route %s\n",
+			timestampedLogTag("trace"), t.selfID, targetID, trace)
 		return
 	}
-	t.pendingLock.Lock()
-	if pending := t.pending[targetID]; pending != nil {
-		delete(pending, *key)
-	}
-	t.pendingLock.Unlock()
-}
-
-func (t *networkTransport) sendConsensusStream(
-	host hostEntry,
-	conn *grpc.ClientConn,
-	outbound networkOutbound,
-	stream *grpc.ClientStream,
-) bool {
-	for {
-		if *stream == nil {
-			opened, err := conn.NewStream(t.streamContext, &smallBankConsensusStreamDesc, methodConsensusStream)
-			if err != nil {
-				smallbankTracePrintf("%s event=send_consensus_stream_open_failed node=%d to=%d err=%q %s\n",
-					timestampedLogTag("trace"), t.selfID, host.ID, err.Error(), outbound.trace)
-				if !t.waitForConsensusStreamRetry() {
-					return false
-				}
-				continue
-			}
-			*stream = opened
-			smallbankTracePrintf("%s event=send_consensus_stream_opened node=%d to=%d\n",
-				timestampedLogTag("trace"), t.selfID, host.ID)
-		}
-
-		start := time.Now()
-		err := (*stream).SendMsg(outbound.request)
-		if err == nil {
-			smallbankTracePrintf("%s event=send_consensus_stream_sent node=%d to=%d elapsed_ms=%d %s\n",
-				timestampedLogTag("trace"), t.selfID, host.ID, time.Since(start).Milliseconds(), outbound.trace)
-			return true
-		}
-
-		smallbankTracePrintf("%s event=send_consensus_stream_failed node=%d to=%d elapsed_ms=%d err=%q %s\n",
-			timestampedLogTag("trace"), t.selfID, host.ID, time.Since(start).Milliseconds(), err.Error(), outbound.trace)
-		_ = (*stream).CloseSend()
-		*stream = nil
-		if !t.waitForConsensusStreamRetry() {
-			return false
-		}
-	}
-}
-
-func (t *networkTransport) waitForConsensusStreamRetry() bool {
-	timer := time.NewTimer(consensusStreamRetryDelay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return true
-	case <-t.stop:
-		return false
-	}
-}
-
-func (t *networkTransport) invokeForwardAsync(host hostEntry, conn *grpc.ClientConn, outbound networkOutbound) {
-	inflight, exists := t.forwardInflight[host.ID]
-	if !exists {
-		smallbankTracePrintf("%s event=forward_drop node=%d to=%d reason=no_inflight_bucket %s\n",
-			timestampedLogTag("trace"), t.selfID, host.ID, outbound.trace)
+	payload, err := fabrictransport.Marshal(&grpcTransactionRequest{Payload: append([]byte(nil), raw...)})
+	if err != nil {
+		smallbankTracePrintf("%s event=forward_failed node=%d to=%d reason=marshal err=%q %s\n",
+			timestampedLogTag("trace"), t.selfID, targetID, err.Error(), trace)
 		return
 	}
-	select {
-	case inflight <- struct{}{}:
-	case <-t.stop:
-		smallbankTracePrintf("%s event=forward_drop node=%d to=%d reason=transport_stopped %s\n",
-			timestampedLogTag("trace"), t.selfID, host.ID, outbound.trace)
-		return
-	default:
-		smallbankTracePrintf("%s event=forward_drop node=%d to=%d reason=inflight_full inflight_len=%d inflight_cap=%d %s\n",
-			timestampedLogTag("trace"), t.selfID, host.ID, len(inflight), cap(inflight), outbound.trace)
-		return
-	}
-
-	t.asyncWG.Add(1)
-	go func() {
-		defer t.asyncWG.Done()
-		defer func() { <-inflight }()
-		t.invokeOnce(host, conn, outbound)
-	}()
-}
-
-func (t *networkTransport) invokeOnce(host hostEntry, conn *grpc.ClientConn, outbound networkOutbound) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
-	start := time.Now()
-	if outbound.method == methodTransaction {
-		smallbankTracePrintf("%s event=forward_rpc_start node=%d to=%d method=%s %s\n",
-			timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, outbound.trace)
-	}
-	err := conn.Invoke(ctx, outbound.method, outbound.request, &grpcAck{})
-	cancel()
-	if outbound.method == methodTransaction {
-		if err != nil {
-			smallbankTracePrintf("%s event=forward_rpc_done node=%d to=%d method=%s elapsed_ms=%d err=%q %s\n",
-				timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, time.Since(start).Milliseconds(), err.Error(), outbound.trace)
-		} else {
-			smallbankTracePrintf("%s event=forward_rpc_done node=%d to=%d method=%s elapsed_ms=%d err=\"\" %s\n",
-				timestampedLogTag("trace"), t.selfID, host.ID, outbound.method, time.Since(start).Milliseconds(), outbound.trace)
+	smallbankTracePrintf("%s event=forward_enqueue node=%d to=%d %s\n",
+		timestampedLogTag("trace"), t.selfID, targetID, trace)
+	err = client.Send(operationTransaction, payload, false, func(sendErr error) {
+		if sendErr != nil {
+			smallbankTracePrintf("%s event=forward_send_failed node=%d to=%d err=%q %s\n",
+				timestampedLogTag("trace"), t.selfID, targetID, sendErr.Error(), trace)
+			return
 		}
-	}
-	if err == nil {
-		return
+		smallbankTracePrintf("%s event=forward_sent node=%d to=%d %s\n",
+			timestampedLogTag("trace"), t.selfID, targetID, trace)
+	})
+	if err != nil {
+		smallbankTracePrintf("%s event=forward_failed node=%d to=%d reason=enqueue err=%q %s\n",
+			timestampedLogTag("trace"), t.selfID, targetID, err.Error(), trace)
 	}
 }
 
 func (t *networkTransport) fetchStateSnapshot(ctx context.Context, targetID uint64, req grpcStateSnapshotRequest, timeout time.Duration) (stateSyncSnapshot, error) {
-	conn, exists := t.peers[targetID]
-	if !exists {
+	client := t.clients[targetID]
+	if client == nil {
 		return stateSyncSnapshot{}, fmt.Errorf("no route to target node %d", targetID)
 	}
 	if ctx == nil {
@@ -906,26 +400,32 @@ func (t *networkTransport) fetchStateSnapshot(ctx context.Context, targetID uint
 	if timeout <= 0 {
 		return stateSyncSnapshot{}, fmt.Errorf("state snapshot request to node %d has invalid timeout %s", targetID, timeout)
 	}
+	request, err := fabrictransport.Marshal(&req)
+	if err != nil {
+		return stateSyncSnapshot{}, fmt.Errorf("encode state snapshot request to node %d: %w", targetID, err)
+	}
 	rpcCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	start := time.Now()
-	smallbankTracePrintf("%s event=sync_rpc_start node=%d to=%d method=StateSnapshot\n",
-		timestampedLogTag("trace"), t.selfID, targetID)
-	var snapshot stateSyncSnapshot
-	if err := conn.Invoke(rpcCtx, methodStateSnapshot, &req, &snapshot); err != nil {
-		smallbankTracePrintf("%s event=sync_rpc_done node=%d to=%d method=StateSnapshot elapsed_ms=%d err=%q\n",
-			timestampedLogTag("trace"), t.selfID, targetID, time.Since(start).Milliseconds(), err.Error())
+	smallbankTracePrintf("%s event=sync_stream_start node=%d to=%d operation=%s\n",
+		timestampedLogTag("trace"), t.selfID, targetID, operationStateTransfer)
+	raw, err := client.Call(rpcCtx, operationStateTransfer, request)
+	if err != nil {
+		smallbankTracePrintf("%s event=sync_stream_done node=%d to=%d operation=%s elapsed_ms=%d err=%q\n",
+			timestampedLogTag("trace"), t.selfID, targetID, operationStateTransfer, time.Since(start).Milliseconds(), err.Error())
 		return stateSyncSnapshot{}, err
 	}
+	var snapshot stateSyncSnapshot
+	if err := fabrictransport.Unmarshal(raw, &snapshot); err != nil {
+		return stateSyncSnapshot{}, fmt.Errorf("decode state snapshot from node %d: %w", targetID, err)
+	}
 	// Bind the application-level identity to the peer selected by the transport.
-	// A response is never allowed to redirect a later checkpoint/range request to
-	// an arbitrary node ID.
 	if snapshot.NodeID != targetID {
 		return stateSyncSnapshot{}, fmt.Errorf("target node %d returned identity %d", targetID, snapshot.NodeID)
 	}
-	smallbankTracePrintf("%s event=sync_rpc_done node=%d to=%d method=StateSnapshot elapsed_ms=%d err=\"\" view=%d seq=%d source=%d\n",
-		timestampedLogTag("trace"), t.selfID, targetID, time.Since(start).Milliseconds(), snapshot.LatestView, snapshot.LatestSequence, snapshot.NodeID)
+	smallbankTracePrintf("%s event=sync_stream_done node=%d to=%d operation=%s elapsed_ms=%d err=\"\" view=%d seq=%d source=%d\n",
+		timestampedLogTag("trace"), t.selfID, targetID, operationStateTransfer, time.Since(start).Milliseconds(), snapshot.LatestView, snapshot.LatestSequence, snapshot.NodeID)
 	return snapshot, nil
 }
 
@@ -1008,28 +508,20 @@ type clientReplyServer struct {
 	tracker *replyTracker
 }
 
-func (s *clientReplyServer) Reply(_ context.Context, req *grpcReplyRequest) (*grpcAck, error) {
-	if req.From == 0 {
-		return nil, grpcstatus.Error(codes.InvalidArgument, "missing sender id")
+func (s *clientReplyServer) Handle(_ context.Context, from uint64, operation string, payload []byte) ([]byte, error) {
+	if operation != operationClientReply {
+		return nil, fmt.Errorf("unknown SmallBank client operation %q", operation)
 	}
-	s.tracker.observe(req.From, req.Response)
-	return &grpcAck{}, nil
-}
-
-func (s *clientReplyServer) ReplyStream(stream smallBankClientReplyStreamServer) error {
-	for {
-		req, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if req.From == 0 {
-			continue
-		}
-		s.tracker.observe(req.From, req.Response)
+	if from == 0 {
+		return nil, errors.New("client reply is missing its sender ID")
 	}
+	request := new(grpcReplyRequest)
+	if err := fabrictransport.Unmarshal(payload, request); err != nil {
+		return nil, fmt.Errorf("decode client reply: %w", err)
+	}
+	request.From = from
+	s.tracker.observe(request.From, request.Response)
+	return nil, nil
 }
 
 type clientReplyDispatcher struct {
@@ -1041,24 +533,13 @@ type clientReplyDispatcher struct {
 
 type replySender struct {
 	address string
-	conn    *grpc.ClientConn
-	queue   chan response
-	stop    chan struct{}
-	wg      sync.WaitGroup
+	client  *fabrictransport.Client
 }
 
 type submitSender struct {
 	host         hostEntry
-	conn         *grpc.ClientConn
+	client       *fabrictransport.Client
 	replyAddress string
-	queue        chan broadcastSubmit
-	stop         chan struct{}
-	wg           sync.WaitGroup
-}
-
-type broadcastSubmit struct {
-	req request
-	raw []byte
 }
 
 func newClientReplyDispatcher(selfID uint64) *clientReplyDispatcher {
@@ -1096,6 +577,7 @@ func (d *clientReplyDispatcher) reply(resp response) {
 		var err error
 		sender, err = newReplySender(address, d.selfID)
 		if err != nil {
+			fmt.Printf("SmallBank reply transport to %s failed: %v\n", address, err)
 		} else {
 			d.senders[address] = sender
 		}
@@ -1125,188 +607,54 @@ func (d *clientReplyDispatcher) close() {
 }
 
 func newReplySender(address string, selfID uint64) (*replySender, error) {
-	conn, err := newSmallBankGRPCClientConn(address)
+	client, err := newSmallBankFabricClient(selfID, address, clientQueueSize, func(operation string, err error) {
+		fmt.Printf("SmallBank reply stream to %s failed: operation=%s err=%v\n", address, operation, err)
+	})
 	if err != nil {
 		return nil, err
 	}
-	s := &replySender{
-		address: address,
-		conn:    conn,
-		queue:   make(chan response, 65536),
-		stop:    make(chan struct{}),
-	}
-	workers := 4
-	for i := 0; i < workers; i++ {
-		s.wg.Add(1)
-		go s.worker(selfID)
-	}
-	return s, nil
+	return &replySender{address: address, client: client}, nil
 }
 
 func (s *replySender) enqueue(resp response) {
-	select {
-	case s.queue <- resp:
-	case <-s.stop:
-	default:
-	}
-}
-
-func (s *replySender) worker(selfID uint64) {
-	defer s.wg.Done()
-	var stream grpc.ClientStream
-	var cancel context.CancelFunc
-	defer func() {
-		if cancel != nil {
-			cancel()
-		}
-	}()
-	for {
-		select {
-		case <-s.stop:
-			return
-		case resp := <-s.queue:
-			if stream == nil {
-				var err error
-				stream, cancel, err = s.openStream()
-				if err != nil {
-					s.sendUnary(selfID, resp)
-					continue
-				}
-			}
-			if err := stream.SendMsg(&grpcReplyRequest{From: selfID, Response: resp}); err != nil {
-				cancel()
-				stream = nil
-				cancel = nil
-				s.sendUnary(selfID, resp)
-			}
-		}
-	}
-}
-
-func (s *replySender) openStream() (grpc.ClientStream, context.CancelFunc, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := s.conn.NewStream(ctx, &smallBankClientReplyStreamDesc, methodClientReplyStream)
+	payload, err := fabrictransport.Marshal(&grpcReplyRequest{Response: resp})
 	if err != nil {
-		cancel()
-		return nil, nil, err
+		fmt.Printf("SmallBank reply encoding for %s failed: %v\n", s.address, err)
+		return
 	}
-	return stream, cancel, nil
-}
-
-func (s *replySender) sendUnary(selfID uint64, resp response) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
-	_ = s.conn.Invoke(ctx, methodClientReply, &grpcReplyRequest{
-		From:     selfID,
-		Response: resp,
-	}, &grpcAck{})
-	cancel()
+	// A disconnected benchmark client must not block replica delivery. This is
+	// equivalent to Fabric ending that client's Deliver stream.
+	if err := s.client.Send(operationClientReply, payload, true, nil); err != nil {
+		fmt.Printf("SmallBank reply enqueue for %s failed: %v\n", s.address, err)
+	}
 }
 
 func (s *replySender) close() {
-	select {
-	case <-s.stop:
-	default:
-		close(s.stop)
-	}
-	s.wg.Wait()
-	_ = s.conn.Close()
-}
-
-func newSubmitSender(host hostEntry, conn *grpc.ClientConn, replyAddress string) *submitSender {
-	s := &submitSender{
-		host:         host,
-		conn:         conn,
-		replyAddress: replyAddress,
-		queue:        make(chan broadcastSubmit, 65536),
-		stop:         make(chan struct{}),
-	}
-	workers := 2
-	for i := 0; i < workers; i++ {
-		s.wg.Add(1)
-		go s.worker()
-	}
-	return s
-}
-
-func (s *submitSender) enqueue(req request, raw []byte) {
-	submit := broadcastSubmit{
-		req: req,
-		raw: append([]byte(nil), raw...),
-	}
-	select {
-	case s.queue <- submit:
-	case <-s.stop:
-	default:
+	if err := s.client.Close(); err != nil {
+		fmt.Printf("SmallBank reply transport close for %s failed: %v\n", s.address, err)
 	}
 }
 
-func (s *submitSender) worker() {
-	defer s.wg.Done()
-	var stream grpc.ClientStream
-	var cancel context.CancelFunc
-	defer func() {
-		if cancel != nil {
-			cancel()
-		}
-	}()
-	for {
-		select {
-		case <-s.stop:
-			return
-		case submit := <-s.queue:
-			if stream == nil {
-				var err error
-				stream, cancel, err = s.openStream()
-				if err != nil {
-					s.sendUnary(submit)
-					continue
-				}
-			}
-			err := stream.SendMsg(&grpcSubmitRequest{
-				Payload:      submit.raw,
-				Mode:         string(submitModeBroadcast),
-				ReplyAddress: s.replyAddress,
-			})
-			if err != nil {
-				cancel()
-				stream = nil
-				cancel = nil
-				s.sendUnary(submit)
-			}
-		}
-	}
+func newSubmitSender(host hostEntry, client *fabrictransport.Client, replyAddress string) *submitSender {
+	return &submitSender{host: host, client: client, replyAddress: replyAddress}
 }
 
-func (s *submitSender) openStream() (grpc.ClientStream, context.CancelFunc, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := s.conn.NewStream(ctx, &smallBankSubmitStreamDesc, methodSubmitStream)
-	if err != nil {
-		cancel()
-		return nil, nil, err
-	}
-	return stream, cancel, nil
-}
-
-func (s *submitSender) sendUnary(submit broadcastSubmit) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
-	var out response
-	err := s.conn.Invoke(ctx, methodSubmit, &grpcSubmitRequest{
-		Payload:      submit.raw,
+func (s *submitSender) enqueue(_ request, raw []byte) {
+	payload, err := fabrictransport.Marshal(&grpcSubmitRequest{
+		Payload:      append([]byte(nil), raw...),
 		Mode:         string(submitModeBroadcast),
 		ReplyAddress: s.replyAddress,
-	}, &out)
-	cancel()
-	_ = err
+	})
+	if err != nil {
+		fmt.Printf("SmallBank submit encoding for node %d failed: %v\n", s.host.ID, err)
+		return
+	}
+	if err := s.client.Send(operationSubmit, payload, false, nil); err != nil {
+		fmt.Printf("SmallBank submit enqueue for node %d failed: %v\n", s.host.ID, err)
+	}
 }
 
-func (s *submitSender) close() {
-	select {
-	case <-s.stop:
-	default:
-		close(s.stop)
-	}
-	s.wg.Wait()
-}
+func (s *submitSender) close() {}
 
 type networkNodeServer struct {
 	node           *node
@@ -1387,10 +735,21 @@ func newNetworkNodeServer(
 		node:           n,
 		host:           host,
 		listener:       listener,
-		grpcServer:     grpc.NewServer(grpc.ForceServerCodec(smallBankCodec)),
+		grpcServer:     grpc.NewServer(),
 		requestTimeout: requestTimeout,
 	}
-	s.grpcServer.RegisterService(&smallBankNetworkServiceDesc, s)
+	if err := fabrictransport.RegisterServer(s.grpcServer, s, fabrictransport.ServerConfig{
+		SendTimeout: defaultNetworkSendTimeout,
+		OnError: func(operation string, err error) {
+			smallbankTracePrintf("%s event=server_stream_failed node=%d operation=%s err=%q\n",
+				timestampedLogTag("trace"), id, operation, err.Error())
+		},
+	}); err != nil {
+		_ = listener.Close()
+		n.stop()
+		transport.close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -1425,6 +784,91 @@ func (s *networkNodeServer) closeOnceClose(ctx context.Context) {
 	s.node.stop()
 }
 
+// Handle dispatches all node, client, control, and state-transfer traffic from
+// the shared Fabric-style Step service.
+func (s *networkNodeServer) Handle(ctx context.Context, from uint64, operation string, payload []byte) ([]byte, error) {
+	switch operation {
+	case operationConsensus:
+		request := new(grpcConsensusRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode consensus request: %w", err)
+		}
+		request.From = from
+		return nil, s.handleConsensusRequest(request)
+	case operationTransaction:
+		request := new(grpcTransactionRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode forwarded transaction: %w", err)
+		}
+		request.From = from
+		_, err := s.Transaction(ctx, request)
+		return nil, err
+	case operationSubmit:
+		request := new(grpcSubmitRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode client submission: %w", err)
+		}
+		mode, err := parseSubmitMode(request.Mode)
+		if err != nil {
+			return nil, err
+		}
+		if mode == submitModeBroadcast {
+			decoded, err := decodeRequest(request.Payload)
+			if err != nil {
+				return nil, fmt.Errorf("decode broadcast submission: %w", err)
+			}
+			if err := s.acceptBroadcastSubmit(decoded, request); err != nil {
+				return nil, err
+			}
+			return fabrictransport.Marshal(&response{ClientID: decoded.ClientID, ID: decoded.ID, Status: statusSuccess})
+		}
+		result, err := s.Submit(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		return fabrictransport.Marshal(result)
+	case operationStatus:
+		request := new(grpcStatusRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode status request: %w", err)
+		}
+		result, err := s.Status(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		return fabrictransport.Marshal(result)
+	case operationChecksum:
+		request := new(grpcChecksumRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode checksum request: %w", err)
+		}
+		result, err := s.Checksum(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		return fabrictransport.Marshal(result)
+	case operationStateTransfer:
+		request := new(grpcStateSnapshotRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode state-transfer request: %w", err)
+		}
+		result, err := s.StateSnapshot(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		return fabrictransport.Marshal(result)
+	case operationApplyTimeout:
+		request := new(grpcApplyTimeoutRequest)
+		if err := fabrictransport.Unmarshal(payload, request); err != nil {
+			return nil, fmt.Errorf("decode timeout request: %w", err)
+		}
+		_, err := s.ApplyTimeout(ctx, request)
+		return nil, err
+	default:
+		return nil, fmt.Errorf("unknown SmallBank transport operation %q", operation)
+	}
+}
+
 func (s *networkNodeServer) handleConsensusRequest(req *grpcConsensusRequest) error {
 	msg := &smartbftprotos.Message{}
 	if err := proto.Unmarshal(req.Message, msg); err != nil {
@@ -1439,21 +883,6 @@ func (s *networkNodeServer) handleConsensusRequest(req *grpcConsensusRequest) er
 	}()
 	s.node.consensus.HandleMessage(req.From, msg)
 	return nil
-}
-
-func (s *networkNodeServer) ConsensusStream(stream smallBankConsensusStreamServer) error {
-	for {
-		req, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if err := s.handleConsensusRequest(req); err != nil {
-			return err
-		}
-	}
 }
 
 func (s *networkNodeServer) Transaction(_ context.Context, req *grpcTransactionRequest) (*grpcAck, error) {
@@ -1518,23 +947,6 @@ func (s *networkNodeServer) Submit(ctx context.Context, req *grpcSubmitRequest) 
 	}
 }
 
-func (s *networkNodeServer) SubmitStream(stream smallBankSubmitStreamServer) error {
-	for {
-		req, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		decoded, err := decodeRequest(req.Payload)
-		if err != nil {
-			continue
-		}
-		_ = s.acceptBroadcastSubmit(decoded, req)
-	}
-}
-
 func (s *networkNodeServer) acceptBroadcastSubmit(decoded request, req *grpcSubmitRequest) error {
 	if req.ReplyAddress == "" {
 		return fmt.Errorf("broadcast submit missing reply address")
@@ -1586,7 +998,7 @@ func (s *networkNodeServer) ApplyTimeout(_ context.Context, req *grpcApplyTimeou
 
 type networkSmallBankClient struct {
 	hosts          []hostEntry
-	conns          map[uint64]*grpc.ClientConn
+	clients        map[uint64]*fabrictransport.Client
 	next           atomic.Uint64
 	leader         atomic.Uint64
 	requestTimeout time.Duration
@@ -1621,20 +1033,23 @@ func parseSubmitMode(value string) (submitMode, error) {
 }
 
 func newNetworkSmallBankClient(hosts []hostEntry, requestTimeout time.Duration, mode submitMode, replyListen string, replyAdvertise string) (*networkSmallBankClient, error) {
-	conns := make(map[uint64]*grpc.ClientConn, len(hosts))
+	clients := make(map[uint64]*fabrictransport.Client, len(hosts))
 	for _, host := range hosts {
-		conn, err := newSmallBankGRPCClientConn(host.address())
+		hostID := host.ID
+		client, err := newSmallBankFabricClient(0, host.address(), clientQueueSize, func(operation string, err error) {
+			fmt.Printf("SmallBank client stream to node %d failed: operation=%s err=%v\n", hostID, operation, err)
+		})
 		if err != nil {
-			for _, existing := range conns {
+			for _, existing := range clients {
 				_ = existing.Close()
 			}
-			return nil, fmt.Errorf("connect to node %d at %s: %w", host.ID, host.address(), err)
+			return nil, fmt.Errorf("create client transport to node %d at %s: %w", host.ID, host.address(), err)
 		}
-		conns[host.ID] = conn
+		clients[host.ID] = client
 	}
 	client := &networkSmallBankClient{
 		hosts:          hosts,
-		conns:          conns,
+		clients:        clients,
 		requestTimeout: requestTimeout,
 		submitMode:     mode,
 		replyListen:    replyListen,
@@ -1660,8 +1075,10 @@ func (c *networkSmallBankClient) close() {
 	if c.replyListener != nil {
 		_ = c.replyListener.Close()
 	}
-	for _, conn := range c.conns {
-		_ = conn.Close()
+	for id, client := range c.clients {
+		if err := client.Close(); err != nil {
+			fmt.Printf("SmallBank client transport close for node %d failed: %v\n", id, err)
+		}
 	}
 }
 
@@ -1685,8 +1102,16 @@ func (c *networkSmallBankClient) startReplyServer() error {
 		}
 		c.replyAddress = net.JoinHostPort(c.replyAdvertise, port)
 	}
-	c.replyServer = grpc.NewServer(grpc.ForceServerCodec(smallBankCodec))
-	c.replyServer.RegisterService(&smallBankClientServiceDesc, &clientReplyServer{tracker: c.replyTracker})
+	c.replyServer = grpc.NewServer()
+	if err := fabrictransport.RegisterServer(c.replyServer, &clientReplyServer{tracker: c.replyTracker}, fabrictransport.ServerConfig{
+		SendTimeout: defaultNetworkSendTimeout,
+		OnError: func(operation string, err error) {
+			fmt.Printf("SmallBank client reply server stream failed: operation=%s err=%v\n", operation, err)
+		},
+	}); err != nil {
+		_ = listener.Close()
+		return err
+	}
 	go func() {
 		_ = c.replyServer.Serve(listener)
 	}()
@@ -1697,7 +1122,7 @@ func (c *networkSmallBankClient) startReplyServer() error {
 func (c *networkSmallBankClient) startSubmitSenders() {
 	c.submitSenders = make(map[uint64]*submitSender, len(c.hosts))
 	for _, host := range c.hosts {
-		c.submitSenders[host.ID] = newSubmitSender(host, c.conns[host.ID], c.replyAddress)
+		c.submitSenders[host.ID] = newSubmitSender(host, c.clients[host.ID], c.replyAddress)
 	}
 }
 
@@ -1722,7 +1147,7 @@ func (c *networkSmallBankClient) invokeLeader(ctx context.Context, raw []byte) (
 			host = c.hosts[start]
 		}
 		var out response
-		err := c.conns[host.ID].Invoke(ctx, methodSubmit, &grpcSubmitRequest{
+		err := callSmallBank(ctx, c.clients[host.ID], operationSubmit, &grpcSubmitRequest{
 			Payload: raw,
 			Mode:    string(submitModeLeader),
 		}, &out)
@@ -1777,12 +1202,12 @@ func (c *networkSmallBankClient) refreshLeader(ctx context.Context) uint64 {
 	for _, host := range c.hosts {
 		statusCtx, cancel := context.WithTimeout(ctx, time.Second)
 		var status grpcStatusResponse
-		err := c.conns[host.ID].Invoke(statusCtx, methodStatus, &grpcStatusRequest{}, &status)
+		err := callSmallBank(statusCtx, c.clients[host.ID], operationStatus, &grpcStatusRequest{}, &status)
 		cancel()
 		if err != nil || !status.Running || status.Leader == 0 {
 			continue
 		}
-		if _, ok := c.conns[status.Leader]; ok {
+		if _, ok := c.clients[status.Leader]; ok {
 			c.leader.Store(status.Leader)
 			return status.Leader
 		}
@@ -1799,7 +1224,7 @@ func (c *networkSmallBankClient) waitForServers(timeout time.Duration) error {
 		for _, host := range c.hosts {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			var status grpcStatusResponse
-			err := c.conns[host.ID].Invoke(ctx, methodStatus, &grpcStatusRequest{}, &status)
+			err := callSmallBank(ctx, c.clients[host.ID], operationStatus, &grpcStatusRequest{}, &status)
 			cancel()
 			if err != nil {
 				lastErr = err
@@ -1827,7 +1252,7 @@ func (c *networkSmallBankClient) stateChecksums() map[uint64]string {
 	for _, host := range c.hosts {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
 		var checksum grpcChecksumResponse
-		err := c.conns[host.ID].Invoke(ctx, methodChecksum, &grpcChecksumRequest{}, &checksum)
+		err := callSmallBank(ctx, c.clients[host.ID], operationChecksum, &grpcChecksumRequest{}, &checksum)
 		cancel()
 		if err != nil {
 			checksums[host.ID] = fmt.Sprintf("ERROR:%v", err)
@@ -1836,4 +1261,25 @@ func (c *networkSmallBankClient) stateChecksums() map[uint64]string {
 		checksums[host.ID] = checksum.Checksum
 	}
 	return checksums
+}
+
+func callSmallBank(ctx context.Context, client *fabrictransport.Client, operation string, request any, response any) error {
+	if client == nil {
+		return fmt.Errorf("no client for operation %s", operation)
+	}
+	payload, err := fabrictransport.Marshal(request)
+	if err != nil {
+		return fmt.Errorf("encode %s request: %w", operation, err)
+	}
+	raw, err := client.Call(ctx, operation, payload)
+	if err != nil {
+		return err
+	}
+	if response == nil {
+		return nil
+	}
+	if err := fabrictransport.Unmarshal(raw, response); err != nil {
+		return fmt.Errorf("decode %s response: %w", operation, err)
+	}
+	return nil
 }

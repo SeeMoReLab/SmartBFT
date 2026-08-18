@@ -10,9 +10,9 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/hyperledger-labs/SmartBFT/examples/internal/fabrictransport"
 	bft "github.com/hyperledger-labs/SmartBFT/pkg/types"
 	"github.com/hyperledger-labs/SmartBFT/smartbftprotos"
-	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -116,22 +116,33 @@ func (t *reportTransport) fetchLatestDecisions() []latestDecisionResponse {
 		responses []latestDecisionResponse
 	)
 
-	for id, conn := range t.peers {
+	request, err := fabrictransport.Marshal(&latestDecisionRequest{})
+	if err != nil {
+		fmt.Printf("%s sync: encoding tip request failed: %v\n", logTag("transport"), err)
+		return nil
+	}
+	for id, client := range t.clients {
 		wg.Add(1)
-		go func(id uint64, conn *grpc.ClientConn) {
+		go func(id uint64, client *fabrictransport.Client) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), reportSendTimeout)
 			defer cancel()
-			response := &latestDecisionResponse{}
-			if err := conn.Invoke(ctx, methodLatest, &latestDecisionRequest{}, response); err != nil {
+			raw, err := client.Call(ctx, operationReportStateTransfer, request)
+			if err != nil {
 				fmt.Printf("%s sync: fetching tip from sharing node %d failed: %v\n",
+					logTag("transport"), id, err)
+				return
+			}
+			response := &latestDecisionResponse{}
+			if err := fabrictransport.Unmarshal(raw, response); err != nil {
+				fmt.Printf("%s sync: decoding tip from sharing node %d failed: %v\n",
 					logTag("transport"), id, err)
 				return
 			}
 			lock.Lock()
 			responses = append(responses, *response)
 			lock.Unlock()
-		}(id, conn)
+		}(id, client)
 	}
 	wg.Wait()
 	return responses
