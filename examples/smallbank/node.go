@@ -60,6 +60,18 @@ type node struct {
 	network        *networkTransport
 	replies        *clientReplyDispatcher
 	timeoutBackoff *requestTimeoutBackoff
+
+	// State transfer history is authoritative for sync discovery. It keeps a
+	// small number of immutable checkpoint generations and the certified
+	// decisions following the oldest retained checkpoint. The latest fields are
+	// updated under the same lock, so a sync header cannot combine a new frontier
+	// with an older log (or the reverse).
+	historyLock           sync.Mutex
+	checkpoints           []stateCheckpoint
+	decisionLog           []loggedDecision
+	historyLatestView     uint64
+	historyLatestSequence uint64
+	historyLatestDecision bft.Decision
 }
 
 type nodeOptions struct {
@@ -106,6 +118,10 @@ func newNode(
 		network:   opts.Network,
 		replies:   opts.Replies,
 	}
+	// The genesis checkpoint must capture the complete deterministic initial
+	// application state. SmallBank starts empty and creates accounts through
+	// transactions, so initialization belongs here before consensus can deliver.
+	n.initializeSyncHistory()
 
 	config := bft.DefaultConfig
 	config.SelfID = id
@@ -239,20 +255,6 @@ func (n *node) stop() {
 	n.replies.close()
 	n.doneWG.Wait()
 	n.printShutdownState()
-}
-
-func (n *node) recordLastDecision(md *smartbftprotos.ViewMetadata, proposal bft.Proposal, signatures []bft.Signature) {
-	n.lastLock.Lock()
-	defer n.lastLock.Unlock()
-
-	n.lastDelivered = true
-	n.lastView = md.GetViewId()
-	n.lastIndex = md.GetLatestSequence()
-	n.lastLeaderID = n.consensus.GetLeaderID()
-	n.lastDecision = bft.Decision{
-		Proposal:   cloneProposal(proposal),
-		Signatures: cloneSignatures(signatures),
-	}
 }
 
 func (n *node) recordObservedView(currentView uint64, nextView uint64, proposalSeq uint64) {
@@ -465,17 +467,28 @@ func (n *node) pruneExecutedFromPool() {
 // inside a proposal, where a duplicate must not invalidate the whole batch and
 // depose the leader. Duplicates in a proposal are skipped at execution instead.
 func verifyRequestPayload(raw []byte) (bft.RequestInfo, error) {
-	req, err := decodeRequest(raw)
+	req, err := decodeValidRequest(raw)
 	if err != nil {
 		return bft.RequestInfo{}, err
 	}
+	return bft.RequestInfo{ClientID: req.ClientID, ID: req.ID}, nil
+}
+
+// decodeValidRequest performs every request check needed before execution.
+// applyDecision uses it during preflight so no malformed request can cause a
+// partial batch application.
+func decodeValidRequest(raw []byte) (request, error) {
+	req, err := decodeRequest(raw)
+	if err != nil {
+		return request{}, err
+	}
 	if !validTxType(req.Type) {
-		return bft.RequestInfo{}, fmt.Errorf("unknown transaction type: %s", req.Type)
+		return request{}, fmt.Errorf("unknown transaction type: %s", req.Type)
 	}
 	if _, err := parseClientSeq(req.ID); err != nil {
-		return bft.RequestInfo{}, err
+		return request{}, err
 	}
-	return bft.RequestInfo{ClientID: req.ClientID, ID: req.ID}, nil
+	return req, nil
 }
 
 // VerifyRequest is the admission check the consensus layer runs before a
@@ -554,71 +567,128 @@ func (n *node) AssembleProposal(metadata []byte, requests [][]byte) bft.Proposal
 	}
 }
 
-func (n *node) Deliver(proposal bft.Proposal, signatures []bft.Signature) bft.Reconfig {
+// decisionApplication reports what applying one committed decision did, so that
+// the caller can attribute it to live consensus or to state-transfer replay.
+type decisionApplication struct {
+	metadata  *smartbftprotos.ViewMetadata
+	batchSize int
+	latencies []time.Duration
+	elapsed   time.Duration
+}
+
+// applyDecision applies one committed decision to the application state. It is
+// the shared core of Deliver and of state-transfer replay, so that a replayed
+// decision produces exactly the same state transition as a delivered one.
+func (n *node) applyDecision(proposal bft.Proposal, signatures []bft.Signature) (decisionApplication, error) {
 	data, err := decodeBlockData(proposal.Payload)
 	if err != nil {
-		n.logger.Errorf("node %d failed to decode proposal payload: %v", n.id, err)
-		return bft.Reconfig{}
+		return decisionApplication{}, fmt.Errorf("decode proposal payload: %w", err)
 	}
 
 	md := &smartbftprotos.ViewMetadata{}
-	metadataOK := false
 	if err := proto.Unmarshal(proposal.Metadata, md); err != nil {
-		n.logger.Errorf("node %d failed to decode proposal metadata: %v", n.id, err)
-	} else {
-		metadataOK = true
+		return decisionApplication{}, fmt.Errorf("decode proposal metadata: %w", err)
+	}
+	if len(proposal.Metadata) == 0 {
+		return decisionApplication{}, fmt.Errorf("proposal metadata is empty")
 	}
 
 	decisionTime := time.Now()
 	latencies := make([]time.Duration, 0, len(data.Requests))
 	decoded := make([]request, 0, len(data.Requests))
-	decodeErrors := make([]error, 0)
-	for _, rawReq := range data.Requests {
-		req, err := decodeRequest(rawReq)
+	for i, rawReq := range data.Requests {
+		req, err := decodeValidRequest(rawReq)
 		if err != nil {
-			decodeErrors = append(decodeErrors, err)
-			continue
+			return decisionApplication{}, fmt.Errorf("decode request %d: %w", i, err)
 		}
 		decoded = append(decoded, req)
 		if latency, exists := n.pending.latencyFor(req, decisionTime); exists {
 			latencies = append(latencies, latency)
 		}
 	}
+	decision := bft.Decision{
+		Proposal:   cloneProposal(proposal),
+		Signatures: cloneSignatures(signatures),
+	}
 
 	postDecisionStart := time.Now()
-	n.stateLock.Lock()
-	for _, err := range decodeErrors {
-		n.pending.complete(response{
-			Status: statusSystemError,
-			Error:  err.Error(),
-		})
+	responses, err := n.commitDecision(md, decision, decoded)
+	if err != nil {
+		return decisionApplication{}, err
 	}
-	for _, req := range decoded {
-		resp := n.state.apply(req)
+	for _, resp := range responses {
 		n.pending.complete(resp)
 		n.replies.reply(resp)
 	}
-	n.prevHash = proposal.Digest()
-	if metadataOK {
-		n.recordLastDecision(md, proposal, signatures)
+
+	return decisionApplication{
+		metadata:  md,
+		batchSize: len(data.Requests),
+		latencies: latencies,
+		elapsed:   time.Since(postDecisionStart),
+	}, nil
+}
+
+// commitDecision changes application state, last-decision state, and sync
+// history as one lock-protected operation. All data-dependent validation must
+// finish before this function is called. After the sequence check succeeds,
+// the remaining operations are deterministic and have no ordinary error path.
+func (n *node) commitDecision(md *smartbftprotos.ViewMetadata, decision bft.Decision, requests []request) ([]response, error) {
+	leaderID := n.leaderID()
+	n.stateLock.Lock()
+	defer n.stateLock.Unlock()
+	n.lastLock.Lock()
+	defer n.lastLock.Unlock()
+	n.historyLock.Lock()
+	defer n.historyLock.Unlock()
+
+	sequence := md.GetLatestSequence()
+	expected := n.historyLatestSequence + 1
+	if sequence != expected {
+		return nil, fmt.Errorf("state history sequence gap: expected %d, got %d", expected, sequence)
 	}
-	n.stateLock.Unlock()
-	postDecision := time.Since(postDecisionStart)
+
+	responses := make([]response, 0, len(requests))
+	for _, req := range requests {
+		responses = append(responses, n.state.apply(req))
+	}
+	n.prevHash = decision.Proposal.Digest()
+	n.lastDelivered = true
+	n.lastView = md.GetViewId()
+	n.lastIndex = sequence
+	n.lastLeaderID = leaderID
+	n.lastDecision = decision
+
+	var image *stateSnapshot
+	if isCheckpointSequence(sequence) {
+		captured := n.state.deterministicStateSnapshot()
+		image = &captured
+	}
+	n.appendHistoryLocked(md, decision, image)
+	return responses, nil
+}
+
+func (n *node) Deliver(proposal bft.Proposal, signatures []bft.Signature) bft.Reconfig {
+	applied, err := n.applyDecision(proposal, signatures)
+	if err != nil {
+		panic(fmt.Sprintf("node %d cannot apply committed decision: %v", n.id, err))
+	}
+	md := applied.metadata
 
 	n.learning.recordConsensus(learningSample{
 		Sequence:     md.GetLatestSequence(),
 		View:         md.GetViewId(),
 		LeaderID:     n.consensus.GetLeaderID(),
-		BatchSize:    len(data.Requests),
-		DecisionTime: decisionTime,
-		Latencies:    latencies,
+		BatchSize:    applied.batchSize,
+		DecisionTime: time.Now(),
+		Latencies:    applied.latencies,
 		Timeout:      n.learning.currentTimeoutValue(),
 	})
 	n.onCommitBackoff(md.GetViewId(), md.GetLatestSequence())
-	if md.GetLatestSequence() == 1 || md.GetLatestSequence()%500 == 0 || postDecision > 100*time.Millisecond {
+	if md.GetLatestSequence() == 1 || md.GetLatestSequence()%500 == 0 || applied.elapsed > 100*time.Millisecond {
 		fmt.Printf("%s delivered: node=%d view=%d seq=%d batch=%d post_decision_ms=%d state_accounts=%d\n",
-			timestampedLogTag("sync"), n.id, md.GetViewId(), md.GetLatestSequence(), len(data.Requests),
-			postDecision.Milliseconds(), n.stateAccountCount())
+			timestampedLogTag("sync"), n.id, md.GetViewId(), md.GetLatestSequence(), applied.batchSize,
+			applied.elapsed.Milliseconds(), n.stateAccountCount())
 	}
 
 	return bft.Reconfig{InLatestDecision: false}

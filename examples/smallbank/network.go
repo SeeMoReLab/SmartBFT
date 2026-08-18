@@ -34,6 +34,7 @@ import (
 
 const (
 	defaultNetworkSendTimeout = 2 * time.Second
+	syncMaxReceiveMessageSize = 64 << 20
 	consensusQueueSize        = 4096
 	consensusStreamRetryDelay = 100 * time.Millisecond
 	asyncForwardLimit         = 1024
@@ -163,7 +164,17 @@ type grpcChecksumResponse struct {
 	Checksum string
 }
 
-type grpcStateSnapshotRequest struct{}
+// grpcStateSnapshotRequest selects an immutable checkpoint or an exact,
+// inclusive decision range. HeaderOnly returns only the peer's certified
+// frontier and retained checkpoint descriptors.
+type grpcStateSnapshotRequest struct {
+	HeaderOnly         bool
+	WantCheckpoint     bool
+	CheckpointSequence uint64
+	CheckpointChecksum string
+	FromSequence       uint64
+	ThroughSequence    uint64
+}
 
 type grpcApplyTimeoutRequest struct {
 	TimeoutMS int64
@@ -609,7 +620,11 @@ func newSmallBankGRPCClientConn(target string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(
 		target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(smallBankCodec), grpc.WaitForReady(true)),
+		grpc.WithDefaultCallOptions(
+			grpc.ForceCodec(smallBankCodec),
+			grpc.WaitForReady(true),
+			grpc.MaxCallRecvMsgSize(syncMaxReceiveMessageSize),
+		),
 	)
 }
 
@@ -880,25 +895,37 @@ func (t *networkTransport) invokeOnce(host hostEntry, conn *grpc.ClientConn, out
 	}
 }
 
-func (t *networkTransport) fetchStateSnapshot(targetID uint64) (stateSyncSnapshot, error) {
+func (t *networkTransport) fetchStateSnapshot(ctx context.Context, targetID uint64, req grpcStateSnapshotRequest, timeout time.Duration) (stateSyncSnapshot, error) {
 	conn, exists := t.peers[targetID]
 	if !exists {
 		return stateSyncSnapshot{}, fmt.Errorf("no route to target node %d", targetID)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), defaultNetworkSendTimeout)
+	if ctx == nil {
+		return stateSyncSnapshot{}, fmt.Errorf("state snapshot request to node %d has no context", targetID)
+	}
+	if timeout <= 0 {
+		return stateSyncSnapshot{}, fmt.Errorf("state snapshot request to node %d has invalid timeout %s", targetID, timeout)
+	}
+	rpcCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	start := time.Now()
 	smallbankTracePrintf("%s event=sync_rpc_start node=%d to=%d method=StateSnapshot\n",
 		timestampedLogTag("trace"), t.selfID, targetID)
 	var snapshot stateSyncSnapshot
-	if err := conn.Invoke(ctx, methodStateSnapshot, &grpcStateSnapshotRequest{}, &snapshot); err != nil {
+	if err := conn.Invoke(rpcCtx, methodStateSnapshot, &req, &snapshot); err != nil {
 		smallbankTracePrintf("%s event=sync_rpc_done node=%d to=%d method=StateSnapshot elapsed_ms=%d err=%q\n",
 			timestampedLogTag("trace"), t.selfID, targetID, time.Since(start).Milliseconds(), err.Error())
 		return stateSyncSnapshot{}, err
 	}
+	// Bind the application-level identity to the peer selected by the transport.
+	// A response is never allowed to redirect a later checkpoint/range request to
+	// an arbitrary node ID.
+	if snapshot.NodeID != targetID {
+		return stateSyncSnapshot{}, fmt.Errorf("target node %d returned identity %d", targetID, snapshot.NodeID)
+	}
 	smallbankTracePrintf("%s event=sync_rpc_done node=%d to=%d method=StateSnapshot elapsed_ms=%d err=\"\" view=%d seq=%d source=%d\n",
-		timestampedLogTag("trace"), t.selfID, targetID, time.Since(start).Milliseconds(), snapshot.View, snapshot.Sequence, snapshot.NodeID)
+		timestampedLogTag("trace"), t.selfID, targetID, time.Since(start).Milliseconds(), snapshot.LatestView, snapshot.LatestSequence, snapshot.NodeID)
 	return snapshot, nil
 }
 
@@ -1532,13 +1559,17 @@ func (s *networkNodeServer) Checksum(context.Context, *grpcChecksumRequest) (*gr
 	return &grpcChecksumResponse{NodeID: s.node.id, Checksum: hashBytes(raw)}, nil
 }
 
-func (s *networkNodeServer) StateSnapshot(context.Context, *grpcStateSnapshotRequest) (*stateSyncSnapshot, error) {
+func (s *networkNodeServer) StateSnapshot(_ context.Context, req *grpcStateSnapshotRequest) (*stateSyncSnapshot, error) {
 	start := time.Now()
-	smallbankTracePrintf("%s event=recv_sync_start node=%d method=StateSnapshot\n",
-		timestampedLogTag("trace"), s.node.id)
-	snapshot := s.node.localStateSyncSnapshot()
-	smallbankTracePrintf("%s event=recv_sync_done node=%d method=StateSnapshot elapsed_ms=%d view=%d seq=%d\n",
-		timestampedLogTag("trace"), s.node.id, time.Since(start).Milliseconds(), snapshot.View, snapshot.Sequence)
+	smallbankTracePrintf("%s event=recv_sync_start node=%d method=StateSnapshot header_only=%t want_checkpoint=%t checkpoint=%d from=%d through=%d\n",
+		timestampedLogTag("trace"), s.node.id, req.HeaderOnly, req.WantCheckpoint,
+		req.CheckpointSequence, req.FromSequence, req.ThroughSequence)
+	snapshot, err := s.node.serveSyncSnapshot(*req)
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.FailedPrecondition, "serve state snapshot: %v", err)
+	}
+	smallbankTracePrintf("%s event=recv_sync_done node=%d method=StateSnapshot elapsed_ms=%d checkpoint_seq=%d latest_seq=%d decisions=%d\n",
+		timestampedLogTag("trace"), s.node.id, time.Since(start).Milliseconds(), snapshot.Checkpoint.Sequence, snapshot.LatestSequence, len(snapshot.Decisions))
 	return &snapshot, nil
 }
 
