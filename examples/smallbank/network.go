@@ -1438,7 +1438,7 @@ func (s *networkNodeServer) Transaction(_ context.Context, req *grpcTransactionR
 		smallbankTracePrintf("%s event=recv_forward_done node=%d from=%d elapsed_ms=%d %s\n",
 			timestampedLogTag("trace"), s.node.id, req.From, time.Since(start).Milliseconds(), trace)
 	}()
-	if err := s.node.consensus.HandleRequest(req.From, req.Payload); err != nil {
+	if err := s.node.handleRequest(req.From, req.Payload); err != nil {
 		smallbankTracePrintf("%s event=recv_forward_submit_result node=%d from=%d result=rejected err=%q %s\n",
 			timestampedLogTag("trace"), s.node.id, req.From, err.Error(), trace)
 		return &grpcAck{}, nil
@@ -1476,7 +1476,7 @@ func (s *networkNodeServer) Submit(ctx context.Context, req *grpcSubmitRequest) 
 	respCh, cancel := s.node.pending.register(decoded)
 	defer cancel()
 
-	if err := s.node.consensus.SubmitRequest(req.Payload); err != nil {
+	if err := s.node.submitRequest(decoded.ClientID, decoded.ID, req.Payload); err != nil {
 		s.node.pending.fail(decoded, err)
 		return nil, grpcstatus.Errorf(codes.Unavailable, "submit request: %v", err)
 	}
@@ -1514,7 +1514,7 @@ func (s *networkNodeServer) acceptBroadcastSubmit(decoded request, req *grpcSubm
 	}
 	s.node.replies.remember(decoded, req.ReplyAddress)
 	s.node.pending.markSubmitted(decoded)
-	return s.node.consensus.SubmitRequest(req.Payload)
+	return s.node.submitRequest(decoded.ClientID, decoded.ID, req.Payload)
 }
 
 func (s *networkNodeServer) Status(context.Context, *grpcStatusRequest) (*grpcStatusResponse, error) {
@@ -1527,7 +1527,7 @@ func (s *networkNodeServer) Status(context.Context, *grpcStatusRequest) (*grpcSt
 
 func (s *networkNodeServer) Checksum(context.Context, *grpcChecksumRequest) (*grpcChecksumResponse, error) {
 	s.node.stateLock.Lock()
-	raw := mustJSON(s.node.state.deterministicSnapshot())
+	raw := mustJSON(s.node.state.deterministicStateSnapshot())
 	s.node.stateLock.Unlock()
 	return &grpcChecksumResponse{NodeID: s.node.id, Checksum: hashBytes(raw)}, nil
 }

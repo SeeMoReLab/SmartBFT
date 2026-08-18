@@ -6,6 +6,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -185,7 +186,7 @@ func (n *node) start() {
 					smallbankTracePrintf("%s event=local_consensus_done node=%d from=%d elapsed_ms=%d %s\n",
 						timestampedLogTag("trace"), n.id, wm.from, time.Since(start).Milliseconds(), smartBFTTraceMessageSummary(msg))
 				case forwardedRequest:
-					n.consensus.HandleRequest(wm.from, msg.payload)
+					_ = n.handleRequest(wm.from, msg.payload)
 				}
 			}
 		}
@@ -265,6 +266,13 @@ func (n *node) recordObservedView(currentView uint64, nextView uint64, proposalS
 }
 
 func (n *node) printShutdownState() {
+	// Read the execution state before taking lastLock: the rest of the file
+	// acquires stateLock first, and reversing that order here would deadlock.
+	n.stateLock.Lock()
+	duplicatesSkipped := n.state.duplicatesSkipped
+	clientsTracked := len(n.state.lastExecuted)
+	n.stateLock.Unlock()
+
 	n.lastLock.Lock()
 	defer n.lastLock.Unlock()
 
@@ -276,11 +284,18 @@ func (n *node) printShutdownState() {
 	if !n.lastDelivered {
 		fmt.Printf("%s SmartBFT SmallBank shutdown: node=%d current_view_known=%t current_view=%d next_view=%d proposal_seq=%d last_committed=false\n",
 			timestampedLogTag("shutdown"), n.id, n.viewObserved, n.currentView, n.nextView, n.proposalSeq)
+		n.printDedupState(duplicatesSkipped, clientsTracked)
 		return
 	}
 	fmt.Printf("%s SmartBFT SmallBank shutdown: node=%d current_view_known=%t current_view=%d next_view=%d proposal_seq=%d last_committed_view=%d last_committed_seq=%d last_committed_leader=%d\n",
 		timestampedLogTag("shutdown"), n.id, n.viewObserved, n.currentView, n.nextView, n.proposalSeq,
 		n.lastView, n.lastIndex, n.lastLeaderID)
+	n.printDedupState(duplicatesSkipped, clientsTracked)
+}
+
+func (n *node) printDedupState(duplicatesSkipped uint64, clientsTracked int) {
+	fmt.Printf("%s request dedup: node=%d duplicates_skipped=%d clients_tracked=%d\n",
+		timestampedLogTag("dedup"), n.id, duplicatesSkipped, clientsTracked)
 }
 
 func (n *node) Nodes() []uint64 {
@@ -323,7 +338,133 @@ func (n *node) RequestID(raw []byte) bft.RequestInfo {
 	return bft.RequestInfo{ClientID: req.ClientID, ID: req.ID}
 }
 
-func (n *node) VerifyRequest(raw []byte) (bft.RequestInfo, error) {
+// errRequestAlreadyExecuted rejects a request whose client sequence number the
+// application has already applied.
+var errRequestAlreadyExecuted = errors.New("request was already executed")
+
+// isExecuted reports whether the client sequence number has already been
+// applied. Used to keep replays out of the request pool.
+func (n *node) isExecuted(clientID, requestID string) bool {
+	n.stateLock.Lock()
+	defer n.stateLock.Unlock()
+
+	return n.state.isExecuted(clientID, requestID)
+}
+
+// submitRequest admits a client request into consensus unless this node has
+// already executed it. This is the client-facing half of the same filter
+// VerifyRequest applies to requests forwarded by peers.
+func (n *node) submitRequest(clientID, requestID string, raw []byte) error {
+	info, err := verifyRequestPayload(raw)
+	if err != nil {
+		return err
+	}
+	if info.ClientID != clientID || info.ID != requestID {
+		return fmt.Errorf("request identity mismatch: payload=%s:%s argument=%s:%s", info.ClientID, info.ID, clientID, requestID)
+	}
+	if n.isExecuted(clientID, requestID) {
+		n.completeExecutedRequest(info)
+		return nil
+	}
+	if err := n.consensus.SubmitRequest(raw); err != nil {
+		return err
+	}
+
+	// Delivery or state transfer can advance the watermark after the first
+	// check but before request-pool insertion. Recheck after insertion so either
+	// this path removes the stale request or a later state-transfer prune does.
+	if n.removeFromPoolIfExecuted(info) {
+		n.completeExecutedRequest(info)
+	}
+	return nil
+}
+
+// handleRequest applies the same post-insertion watermark check to requests
+// forwarded by another replica. Controller.HandleRequest validates before it
+// inserts, but state transfer can advance the watermark between those steps.
+func (n *node) handleRequest(sender uint64, raw []byte) error {
+	info, err := verifyRequestPayload(raw)
+	if err != nil {
+		return err
+	}
+	if n.removeFromPoolIfExecuted(info) {
+		n.completeExecutedRequest(info)
+		return nil
+	}
+	if err := n.consensus.HandleRequest(sender, raw); err != nil {
+		return err
+	}
+	if n.removeFromPoolIfExecuted(info) {
+		n.completeExecutedRequest(info)
+	}
+	return nil
+}
+
+// completeExecutedRequest resolves a local or remote retry without executing
+// it again. The most recent request for a client reuses its original response;
+// older requests receive a deterministic duplicate response.
+func (n *node) completeExecutedRequest(info bft.RequestInfo) {
+	n.stateLock.Lock()
+	if !n.state.isExecuted(info.ClientID, info.ID) {
+		n.stateLock.Unlock()
+		return
+	}
+	resp, hit := n.state.lastResponse[info.ClientID]
+	if !hit || resp.ID != info.ID {
+		resp = response{
+			ClientID: info.ClientID,
+			ID:       info.ID,
+			Status:   statusDuplicate,
+		}
+	}
+	n.stateLock.Unlock()
+
+	if n.pending != nil {
+		n.pending.complete(resp)
+	}
+	n.replies.reply(resp)
+}
+
+// removeFromPoolIfExecuted removes info when the application watermark
+// advanced concurrently with admission. Returning true means the request is
+// covered by replicated application state regardless of whether another path
+// already removed it from the pool.
+func (n *node) removeFromPoolIfExecuted(info bft.RequestInfo) bool {
+	if !n.isExecuted(info.ClientID, info.ID) {
+		return false
+	}
+	if n.consensus != nil && n.consensus.Pool != nil {
+		_ = n.consensus.Pool.RemoveRequest(info)
+	}
+	return true
+}
+
+// pruneExecutedFromPool drops requests the node has already executed from the
+// request pool. A state transfer installs a checkpoint without delivering the
+// batches it skipped, so requests belonging to those batches are never removed
+// by delivery and would hold pool slots until they were proposed again.
+func (n *node) pruneExecutedFromPool() {
+	if n.consensus == nil || n.consensus.Pool == nil {
+		return
+	}
+
+	n.consensus.Pool.Prune(func(raw []byte) error {
+		info, err := verifyRequestPayload(raw)
+		if err != nil {
+			return err
+		}
+		if n.isExecuted(info.ClientID, info.ID) {
+			return errRequestAlreadyExecuted
+		}
+		return nil
+	})
+}
+
+// verifyRequestPayload checks that a request is well formed. It deliberately
+// does not consider execution history: it is the check applied to requests
+// inside a proposal, where a duplicate must not invalidate the whole batch and
+// depose the leader. Duplicates in a proposal are skipped at execution instead.
+func verifyRequestPayload(raw []byte) (bft.RequestInfo, error) {
 	req, err := decodeRequest(raw)
 	if err != nil {
 		return bft.RequestInfo{}, err
@@ -331,7 +472,27 @@ func (n *node) VerifyRequest(raw []byte) (bft.RequestInfo, error) {
 	if !validTxType(req.Type) {
 		return bft.RequestInfo{}, fmt.Errorf("unknown transaction type: %s", req.Type)
 	}
+	if _, err := parseClientSeq(req.ID); err != nil {
+		return bft.RequestInfo{}, err
+	}
 	return bft.RequestInfo{ClientID: req.ClientID, ID: req.ID}, nil
+}
+
+// VerifyRequest is the admission check the consensus layer runs before a
+// request enters the request pool, which is where requests forwarded by a peer
+// arrive. Rejecting requests this node has already executed keeps replays -
+// copies that arrive after the original was committed, and entries a peer's
+// pool kept across a state transfer - from occupying pool slots until they are
+// proposed and committed a second time.
+func (n *node) VerifyRequest(raw []byte) (bft.RequestInfo, error) {
+	info, err := verifyRequestPayload(raw)
+	if err != nil {
+		return bft.RequestInfo{}, err
+	}
+	if n.isExecuted(info.ClientID, info.ID) {
+		return bft.RequestInfo{}, fmt.Errorf("%w: %s:%s", errRequestAlreadyExecuted, info.ClientID, info.ID)
+	}
+	return info, nil
 }
 
 func (n *node) VerifyProposal(proposal bft.Proposal) ([]bft.RequestInfo, error) {
@@ -341,7 +502,7 @@ func (n *node) VerifyProposal(proposal bft.Proposal) ([]bft.RequestInfo, error) 
 	}
 	requests := make([]bft.RequestInfo, 0, len(data.Requests))
 	for _, raw := range data.Requests {
-		info, err := n.VerifyRequest(raw)
+		info, err := verifyRequestPayload(raw)
 		if err != nil {
 			return nil, err
 		}

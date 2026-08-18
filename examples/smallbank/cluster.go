@@ -137,7 +137,7 @@ func (c *cluster) invoke(ctx context.Context, req request) (response, error) {
 		c.pending.fail(req, err)
 		return response{}, err
 	}
-	if err := leader.consensus.SubmitRequest(raw); err != nil {
+	if err := leader.submitRequest(req.ClientID, req.ID, raw); err != nil {
 		c.pending.fail(req, err)
 		return response{}, err
 	}
@@ -178,7 +178,7 @@ func (c *cluster) stateChecksums() map[uint64]string {
 	checksums := make(map[uint64]string, len(c.nodes))
 	for id, n := range c.nodes {
 		n.stateLock.Lock()
-		raw := mustJSON(n.state.deterministicSnapshot())
+		raw := mustJSON(n.state.deterministicStateSnapshot())
 		n.stateLock.Unlock()
 		checksums[id] = hashBytes(raw)
 	}

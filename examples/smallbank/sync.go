@@ -21,6 +21,7 @@ type stateSyncSnapshot struct {
 	Sequence uint64
 	Checksum string
 	Accounts []accountSnapshot
+	Clients  []clientSnapshot
 	Latest   bft.Decision
 }
 
@@ -113,6 +114,9 @@ func (n *node) fullSnapshotSync(local stateSyncSnapshot, targetCount int) bft.Sy
 				timestampedLogTag("sync"), n.id, best.NodeID, best.View, best.Sequence, err)
 			return bft.SyncResponse{Latest: cloneDecision(local.Latest)}
 		}
+		// The installed snapshot covers batches this node never delivered, so
+		// their requests were never removed from the pool by delivery.
+		n.pruneExecutedFromPool()
 		n.logStateSyncSnapshot("installed", best, count, targetCount)
 		smallbankTracePrintf("%s event=app_sync_full_snapshot_done node=%d result=installed latest_view=%d latest_seq=%d matches=%d required=%d\n",
 			timestampedLogTag("trace"), n.id, best.View, best.Sequence, count, targetCount)
@@ -131,13 +135,14 @@ func (n *node) localStateSyncSnapshot() stateSyncSnapshot {
 	n.lastLock.Lock()
 	defer n.lastLock.Unlock()
 
-	accounts := n.state.deterministicSnapshot()
+	image := n.state.deterministicStateSnapshot()
 	return stateSyncSnapshot{
 		NodeID:   n.id,
 		View:     n.lastView,
 		Sequence: n.lastIndex,
-		Checksum: hashBytes(mustJSON(accounts)),
-		Accounts: cloneAccountSnapshots(accounts),
+		Checksum: hashBytes(mustJSON(image)),
+		Accounts: cloneAccountSnapshots(image.Accounts),
+		Clients:  cloneClientSnapshots(image.Clients),
 		Latest:   cloneDecision(n.lastDecision),
 	}
 }
@@ -147,7 +152,7 @@ func (n *node) installStateSyncSnapshot(snapshot stateSyncSnapshot) error {
 		return err
 	}
 
-	state, err := stateFromAccountSnapshots(snapshot.Accounts)
+	state, err := stateFromSnapshots(snapshot.Accounts, snapshot.Clients)
 	if err != nil {
 		return err
 	}
@@ -157,6 +162,8 @@ func (n *node) installStateSyncSnapshot(snapshot stateSyncSnapshot) error {
 	n.lastLock.Lock()
 	defer n.lastLock.Unlock()
 
+	// Carry the diagnostic count across the state replacement.
+	state.duplicatesSkipped = n.state.duplicatesSkipped
 	n.state = state
 	if len(snapshot.Latest.Proposal.Metadata) > 0 {
 		n.prevHash = snapshot.Latest.Proposal.Digest()
@@ -172,10 +179,11 @@ func (n *node) installStateSyncSnapshot(snapshot stateSyncSnapshot) error {
 }
 
 func validateStateSyncSnapshot(snapshot stateSyncSnapshot) error {
-	if snapshot.Checksum != hashBytes(mustJSON(snapshot.Accounts)) {
+	image := stateSnapshot{Accounts: snapshot.Accounts, Clients: snapshot.Clients}
+	if snapshot.Checksum != hashBytes(mustJSON(image)) {
 		return fmt.Errorf("checksum mismatch")
 	}
-	if _, err := stateFromAccountSnapshots(snapshot.Accounts); err != nil {
+	if _, err := stateFromSnapshots(snapshot.Accounts, snapshot.Clients); err != nil {
 		return err
 	}
 	view, sequence, ok, err := decisionViewSequence(snapshot.Latest)
@@ -310,7 +318,7 @@ func decisionViewSequence(decision bft.Decision) (uint64, uint64, bool, error) {
 	return md.GetViewId(), md.GetLatestSequence(), true, nil
 }
 
-func stateFromAccountSnapshots(accounts []accountSnapshot) (*smallBankState, error) {
+func stateFromSnapshots(accounts []accountSnapshot, clients []clientSnapshot) (*smallBankState, error) {
 	state := newSmallBankState()
 	var previous uint64
 	for i, account := range accounts {
@@ -322,6 +330,21 @@ func stateFromAccountSnapshots(accounts []accountSnapshot) (*smallBankState, err
 		state.checking[account.CustomerID] = account.CheckingBalanceCents
 		state.savings[account.CustomerID] = account.SavingsBalanceCents
 	}
+
+	var previousClient string
+	for i, client := range clients {
+		if client.ClientID == "" {
+			return nil, fmt.Errorf("client snapshot has empty client id at index %d", i)
+		}
+		if i > 0 && client.ClientID <= previousClient {
+			return nil, fmt.Errorf("client snapshot is not strictly sorted at index %d", i)
+		}
+		previousClient = client.ClientID
+		state.lastExecuted[client.ClientID] = client.LastID
+		if client.Response.ID != "" {
+			state.lastResponse[client.ClientID] = client.Response
+		}
+	}
 	return state, nil
 }
 
@@ -331,6 +354,15 @@ func cloneAccountSnapshots(accounts []accountSnapshot) []accountSnapshot {
 	}
 	cloned := append([]accountSnapshot(nil), accounts...)
 	sort.Slice(cloned, func(i, j int) bool { return cloned[i].CustomerID < cloned[j].CustomerID })
+	return cloned
+}
+
+func cloneClientSnapshots(clients []clientSnapshot) []clientSnapshot {
+	if len(clients) == 0 {
+		return nil
+	}
+	cloned := append([]clientSnapshot(nil), clients...)
+	sort.Slice(cloned, func(i, j int) bool { return cloned[i].ClientID < cloned[j].ClientID })
 	return cloned
 }
 
