@@ -36,6 +36,7 @@ func TestControllerBasic(t *testing.T) {
 	batcher.On("Close")
 	pool := &mocks.RequestPool{}
 	pool.On("Close")
+	pool.On("RestartTimers")
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMon.On("ChangeRole", mock.Anything, mock.Anything, mock.Anything)
 	leaderMon.On("Close")
@@ -93,6 +94,7 @@ func TestControllerLeaderBasic(t *testing.T) {
 	}).Return([][]byte{})
 	pool := &mocks.RequestPool{}
 	pool.On("Close")
+	pool.On("RestartTimers")
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMon.On("ChangeRole", bft.Leader, mock.Anything, mock.Anything)
 	leaderMon.On("Close")
@@ -178,6 +180,7 @@ func TestLeaderPropose(t *testing.T) {
 	reqPool := &mocks.RequestPool{}
 	reqPool.On("Prune", mock.Anything)
 	reqPool.On("Close")
+	reqPool.On("RestartTimers")
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMon.On("ChangeRole", bft.Leader, mock.Anything, mock.Anything)
 	leaderMon.On("HeartbeatWasSent")
@@ -313,6 +316,7 @@ func TestViewChanged(t *testing.T) {
 	reqPool := &mocks.RequestPool{}
 	reqPool.On("Prune", mock.Anything)
 	reqPool.On("Close")
+	reqPool.On("RestartTimers")
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMon.On("ChangeRole", bft.Follower, mock.Anything, mock.Anything)
 	leaderMon.On("ChangeRole", bft.Leader, mock.Anything, mock.Anything)
@@ -398,6 +402,7 @@ func TestSyncPrevView(t *testing.T) {
 	pool := &mocks.RequestPool{}
 	pool.On("Close")
 	pool.On("Prune", mock.Anything)
+	pool.On("RestartTimers")
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMon.On("InjectArtificialHeartbeat", mock.Anything, mock.Anything)
 	leaderMonWG := sync.WaitGroup{}
@@ -592,6 +597,7 @@ func TestControllerLeaderRequestHandling(t *testing.T) {
 
 			pool := &mocks.RequestPool{}
 			pool.On("Close")
+			pool.On("RestartTimers")
 			leaderMon := &mocks.LeaderMonitor{}
 			leaderMon.On("ChangeRole", bft.Follower, mock.Anything, mock.Anything)
 			leaderMon.On("ChangeRole", bft.Leader, mock.Anything, mock.Anything)
@@ -747,6 +753,7 @@ func TestSyncInform(t *testing.T) {
 
 	reqPool := &mocks.RequestPool{}
 	reqPool.On("Close")
+	reqPool.On("RestartTimers")
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMon.On("ChangeRole", bft.Follower, mock.Anything, mock.Anything)
 	leaderMon.On("ChangeRole", bft.Leader, mock.Anything, mock.Anything)
@@ -1255,6 +1262,7 @@ func TestDeliverTwiceOnceFromSyncAndOnceFromViewData(t *testing.T) {
 
 	reqPool := &mocks.RequestPool{}
 	reqPool.On("Close")
+	reqPool.On("RestartTimers")
 
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMonWG := sync.WaitGroup{}

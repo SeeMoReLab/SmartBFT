@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hyperledger-labs/SmartBFT/pkg/api"
 	"github.com/hyperledger-labs/SmartBFT/pkg/types"
@@ -58,6 +59,112 @@ func proposalSequence(m *protos.Message) uint64 {
 	}
 
 	return math.MaxUint64
+}
+
+const traceEnabled = false
+
+func traceLogTag(component string) string {
+	if !traceEnabled {
+		return ""
+	}
+	return fmt.Sprintf("[%s %s]", component, time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
+}
+
+func tracePrintf(format string, args ...any) {
+	if !traceEnabled {
+		return
+	}
+	// fmt.Printf(format, args...)
+}
+
+func traceMessageSummary(m *protos.Message) string {
+	if !traceEnabled {
+		return ""
+	}
+	if m == nil {
+		return "type=nil view=na seq=na"
+	}
+	switch msg := m.GetContent().(type) {
+	case *protos.Message_PrePrepare:
+		pp := msg.PrePrepare
+		if pp == nil {
+			return "type=pre_prepare view=na seq=na"
+		}
+		batchSize := 0
+		if pp.Proposal != nil {
+			batchSize = len(pp.Proposal.Payload)
+		}
+		return fmt.Sprintf("type=pre_prepare view=%d seq=%d proposal_bytes=%d", pp.GetView(), pp.GetSeq(), batchSize)
+	case *protos.Message_Prepare:
+		prepare := msg.Prepare
+		if prepare == nil {
+			return "type=prepare view=na seq=na"
+		}
+		return fmt.Sprintf("type=prepare view=%d seq=%d", prepare.GetView(), prepare.GetSeq())
+	case *protos.Message_Commit:
+		commit := msg.Commit
+		if commit == nil {
+			return "type=commit view=na seq=na"
+		}
+		signer := uint64(0)
+		if commit.GetSignature() != nil {
+			signer = commit.GetSignature().GetSigner()
+		}
+		return fmt.Sprintf("type=commit view=%d seq=%d signer=%d", commit.GetView(), commit.GetSeq(), signer)
+	case *protos.Message_ViewChange:
+		vc := msg.ViewChange
+		if vc == nil {
+			return "type=view_change next_view=na"
+		}
+		return fmt.Sprintf("type=view_change next_view=%d", vc.GetNextView())
+	case *protos.Message_ViewData:
+		vd := &protos.ViewData{}
+		nextView := uint64(0)
+		signer := uint64(0)
+		if msg.ViewData != nil {
+			signer = msg.ViewData.GetSigner()
+			if err := proto.Unmarshal(msg.ViewData.GetRawViewData(), vd); err == nil {
+				nextView = vd.GetNextView()
+			}
+		}
+		return fmt.Sprintf("type=view_data next_view=%d signer=%d", nextView, signer)
+	case *protos.Message_NewView:
+		count := 0
+		nextView := uint64(0)
+		if msg.NewView != nil {
+			count = len(msg.NewView.GetSignedViewData())
+			for _, svd := range msg.NewView.GetSignedViewData() {
+				vd := &protos.ViewData{}
+				if err := proto.Unmarshal(svd.GetRawViewData(), vd); err == nil {
+					nextView = vd.GetNextView()
+					break
+				}
+			}
+		}
+		return fmt.Sprintf("type=new_view next_view=%d view_data_count=%d", nextView, count)
+	case *protos.Message_HeartBeat:
+		hb := msg.HeartBeat
+		if hb == nil {
+			return "type=heartbeat view=na seq=na"
+		}
+		return fmt.Sprintf("type=heartbeat view=%d seq=%d", hb.GetView(), hb.GetSeq())
+	case *protos.Message_HeartBeatResponse:
+		hbr := msg.HeartBeatResponse
+		if hbr == nil {
+			return "type=heartbeat_response view=na"
+		}
+		return fmt.Sprintf("type=heartbeat_response view=%d", hbr.GetView())
+	case *protos.Message_StateTransferRequest:
+		return "type=state_transfer_request"
+	case *protos.Message_StateTransferResponse:
+		st := msg.StateTransferResponse
+		if st == nil {
+			return "type=state_transfer_response view=na seq=na"
+		}
+		return fmt.Sprintf("type=state_transfer_response view=%d seq=%d", st.GetViewNum(), st.GetSequence())
+	default:
+		return fmt.Sprintf("type=%T", msg)
+	}
 }
 
 // MarshalOrPanic marshals or panics when an error occurs
@@ -157,7 +264,48 @@ func (nv *nextViews) sendRecv(next uint64, sender uint64) bool {
 
 type incMsg struct {
 	*protos.Message
+	sender   uint64
+	coalesce *viewMessageCoalesceKey
+}
+
+type viewMessageCoalesceKey struct {
 	sender uint64
+	kind   string
+	view   uint64
+}
+
+func viewMessageTargetView(m *protos.Message) (string, uint64, bool) {
+	if m == nil {
+		return "", 0, false
+	}
+	if vc := m.GetViewChange(); vc != nil {
+		return "view_change", vc.GetNextView(), true
+	}
+	if vd := m.GetViewData(); vd != nil {
+		target, ok := signedViewDataTargetView(vd)
+		return "view_data", target, ok
+	}
+	if nv := m.GetNewView(); nv != nil {
+		for _, svd := range nv.GetSignedViewData() {
+			target, ok := signedViewDataTargetView(svd)
+			if ok {
+				return "new_view", target, true
+			}
+		}
+		return "new_view", 0, false
+	}
+	return "", 0, false
+}
+
+func signedViewDataTargetView(svd *protos.SignedViewData) (uint64, bool) {
+	if svd == nil {
+		return 0, false
+	}
+	vd := &protos.ViewData{}
+	if err := proto.Unmarshal(svd.GetRawViewData(), vd); err != nil {
+		return 0, false
+	}
+	return vd.GetNextView(), true
 }
 
 // computeQuorum calculates the quorums size Q, given a cluster size N.

@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<failureSpec>
+    <warmUpTime>0</warmUpTime>
+    <phases>
+        <phase>
+            <atTime>0</atTime>
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>25</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTimeMs>1000</atTimeMs>
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>2</id>
+                            <delayMs>75</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+    </phases>
+</failureSpec>

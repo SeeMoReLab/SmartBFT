@@ -6,6 +6,7 @@
 package bft
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -114,6 +115,8 @@ type Controller struct {
 	State              State
 	InFlight           *InFlightData
 	MetricsView        *api.MetricsView
+	RequestTimeout     func(view uint64)
+	ViewEvent          func(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string)
 	quorum             int
 
 	currView Proposer
@@ -132,7 +135,6 @@ type Controller struct {
 
 	syncChan             chan struct{}
 	decisionChan         chan decision
-	deliverChan          chan struct{}
 	leaderToken          chan struct{}
 	verificationSequence atomic.Uint64
 
@@ -223,6 +225,34 @@ func (c *Controller) setCurrentDecisionsInView(decisions uint64) {
 	c.currDecisionsInView = decisions
 }
 
+func (c *Controller) emitViewEvent(event string, currentView uint64, nextView uint64, proposalSeq uint64, detail string) {
+	if c.ViewEvent != nil {
+		c.ViewEvent(event, c.ID, currentView, nextView, proposalSeq, 0, detail)
+	}
+}
+
+func (c *Controller) diagnosticProposalSeq() uint64 {
+	if c.ViewSequences == nil {
+		return 0
+	}
+	vs := c.ViewSequences.Load()
+	if vs == nil {
+		return 0
+	}
+	if viewSeq, ok := vs.(ViewSequence); ok {
+		return viewSeq.ProposalSeq
+	}
+	return 0
+}
+
+func (c *Controller) abortCurrentViewWithReason(reason string) {
+	if aborter, ok := c.currView.(interface{ AbortWithReason(string) }); ok {
+		aborter.AbortWithReason(reason)
+		return
+	}
+	c.currView.Abort()
+}
+
 // thread safe
 func (c *Controller) iAmTheLeader() (bool, uint64) {
 	leader := c.leaderID()
@@ -238,20 +268,21 @@ func (c *Controller) GetLeaderID() uint64 {
 	return c.leaderID()
 }
 
-// HandleRequest handles a request from the client
-func (c *Controller) HandleRequest(sender uint64, req []byte) {
+// HandleRequest handles a request from the client.
+func (c *Controller) HandleRequest(sender uint64, req []byte) error {
 	iAm, leaderID := c.iAmTheLeader()
 	if !iAm {
+		err := fmt.Errorf("not leader: leader=%d", leaderID)
 		c.Logger.Warnf("Got request from %d but the leader is %d, dropping request", sender, leaderID)
-		return
+		return err
 	}
 	reqInfo, err := c.Verifier.VerifyRequest(req)
 	if err != nil {
 		c.Logger.Warnf("Got bad request from %d: %v", sender, err)
-		return
+		return fmt.Errorf("verify request: %w", err)
 	}
 	c.Logger.Debugf("Got request from %d", sender)
-	c.addRequest(reqInfo, req)
+	return c.addRequest(reqInfo, req)
 }
 
 // SubmitRequest submits a request to go through consensus.
@@ -275,7 +306,13 @@ func (c *Controller) addRequest(info types.RequestInfo, request []byte) error {
 // OnRequestTimeout is called when request-timeout expires and forwards the request to leader.
 // Called by the request-pool timeout goroutine. Upon return, the leader-forward timeout is started.
 func (c *Controller) OnRequestTimeout(request []byte, info types.RequestInfo) {
+	if c.RequestTimeout != nil {
+		c.RequestTimeout(c.getCurrentViewNumber())
+	}
+
 	iAm, leaderID := c.iAmTheLeader()
+	tracePrintf("%s event=election_trigger node=%d reason=request_timeout curr_view=%d next_view=%d last_committed_seq=%d proposal_seq=%d leader=%d i_am_leader=%t stop_view=false request=%s\n",
+		traceLogTag("trace"), c.ID, c.getCurrentViewNumber(), c.getCurrentViewNumber()+1, c.latestSeq(), c.diagnosticProposalSeq(), leaderID, iAm, info)
 	if iAm {
 		c.Logger.Infof("Request %s timeout expired, this node is the leader, nothing to do", info)
 		return
@@ -289,6 +326,8 @@ func (c *Controller) OnRequestTimeout(request []byte, info types.RequestInfo) {
 // Called by the request-pool timeout goroutine. Upon return, the auto-remove timeout is started.
 func (c *Controller) OnLeaderFwdRequestTimeout(request []byte, info types.RequestInfo) {
 	iAm, leaderID := c.iAmTheLeader()
+	tracePrintf("%s event=election_trigger node=%d reason=leader_forward_timeout curr_view=%d next_view=%d last_committed_seq=%d proposal_seq=%d leader=%d i_am_leader=%t stop_view=%t request=%s\n",
+		traceLogTag("trace"), c.ID, c.getCurrentViewNumber(), c.getCurrentViewNumber()+1, c.latestSeq(), c.diagnosticProposalSeq(), leaderID, iAm, !iAm, info)
 	if iAm {
 		c.Logger.Infof("Request %s leader-forwarding timeout expired, this node is the leader, stop send heartbeat message", info)
 		c.LeaderMonitor.StopLeaderSendMsg()
@@ -296,6 +335,8 @@ func (c *Controller) OnLeaderFwdRequestTimeout(request []byte, info types.Reques
 	}
 
 	c.Logger.Warnf("Request %s leader-forwarding timeout expired, complaining about leader: %d", info, leaderID)
+	view := c.getCurrentViewNumber()
+	c.emitViewEvent("request_complain", view, view+1, 0, fmt.Sprintf("leader=%d", leaderID))
 	c.FailureDetector.Complain(c.getCurrentViewNumber(), true)
 }
 
@@ -311,6 +352,8 @@ func (c *Controller) OnHeartbeatTimeout(view uint64, leaderID uint64) {
 	c.Logger.Debugf("Heartbeat timeout expired, reported-view: %d, reported-leader: %d", view, leaderID)
 
 	iAm, currentLeaderID := c.iAmTheLeader()
+	tracePrintf("%s event=election_trigger node=%d reason=heartbeat_timeout reported_view=%d curr_view=%d next_view=%d last_committed_seq=%d proposal_seq=%d reported_leader=%d current_leader=%d i_am_leader=%t stop_view=%t\n",
+		traceLogTag("trace"), c.ID, view, c.getCurrentViewNumber(), c.getCurrentViewNumber()+1, c.latestSeq(), c.diagnosticProposalSeq(), leaderID, currentLeaderID, iAm, !iAm && leaderID == currentLeaderID)
 	if iAm {
 		c.Logger.Debugf("Heartbeat timeout expired, this node is the leader, nothing to do; current-view: %d, current-leader: %d",
 			c.getCurrentViewNumber(), currentLeaderID)
@@ -329,8 +372,20 @@ func (c *Controller) OnHeartbeatTimeout(view uint64, leaderID uint64) {
 // ProcessMessages dispatches the incoming message to the required component
 func (c *Controller) ProcessMessages(sender uint64, m *protos.Message) {
 	c.Logger.Debugf("%d got message from %d: %s", c.ID, sender, MsgToString(m))
+	start := time.Now()
+	tracePrintf("%s event=controller_process_start node=%d from=%d %s\n",
+		traceLogTag("trace"), c.ID, sender, traceMessageSummary(m))
+	defer func() {
+		tracePrintf("%s event=controller_process_done node=%d from=%d elapsed_ms=%d %s\n",
+			traceLogTag("trace"), c.ID, sender, time.Since(start).Milliseconds(), traceMessageSummary(m))
+	}()
 	switch m.GetContent().(type) {
 	case *protos.Message_PrePrepare, *protos.Message_Prepare, *protos.Message_Commit:
+		if c.dropStaleConsensusMessage(sender, m) {
+			tracePrintf("%s event=controller_drop_stale_consensus node=%d from=%d %s\n",
+				traceLogTag("trace"), c.ID, sender, traceMessageSummary(m))
+			return
+		}
 		c.currViewLock.RLock()
 		view := c.currView
 		c.currViewLock.RUnlock()
@@ -352,6 +407,17 @@ func (c *Controller) ProcessMessages(sender uint64, m *protos.Message) {
 	}
 }
 
+func (c *Controller) dropStaleConsensusMessage(sender uint64, m *protos.Message) bool {
+	msgView := viewNumber(m)
+	c.currViewLock.RLock()
+	currentView := c.currViewNumber
+	c.currViewLock.RUnlock()
+	if msgView < currentView {
+		return true
+	}
+	return false
+}
+
 func (c *Controller) respondToStateTransferRequest(sender uint64) {
 	vs := c.ViewSequences.Load()
 	if vs == nil {
@@ -366,6 +432,8 @@ func (c *Controller) respondToStateTransferRequest(sender uint64) {
 		},
 	}
 	c.Comm.SendConsensus(sender, msg)
+	tracePrintf("%s event=state_transfer_response_sent node=%d to=%d %s\n",
+		traceLogTag("trace"), c.ID, sender, traceMessageSummary(msg))
 }
 
 func (c *Controller) convertViewMessageToHeartbeat(m *protos.Message) *protos.Message {
@@ -401,6 +469,7 @@ func (c *Controller) startView(proposalSequence uint64) {
 		role = Leader
 	}
 	c.LeaderMonitor.ChangeRole(role, c.currViewNumber, c.leaderID())
+	c.emitViewEvent("start_view", c.currViewNumber, c.currViewNumber, proposalSequence, fmt.Sprintf("leader=%d decisions_in_view=%d", c.leaderID(), c.currDecisionsInView))
 	c.Logger.Infof("Starting view with number %d, sequence %d, and decisions %d", c.currViewNumber, proposalSequence, c.currDecisionsInView)
 }
 
@@ -428,6 +497,8 @@ func (c *Controller) changeView(newViewNumber uint64, newProposalSequence uint64
 	c.setCurrentDecisionsInView(newDecisionsInView)
 	c.Logger.Debugf("Starting view after setting decisions in view to %d", newDecisionsInView)
 	c.startView(newProposalSequence)
+	c.Logger.Debugf("Restarting request timers after starting view %d", newViewNumber)
+	c.RequestPool.RestartTimers()
 
 	if iAm, _ := c.iAmTheLeader(); iAm {
 		c.Batcher.Reset()
@@ -437,9 +508,13 @@ func (c *Controller) changeView(newViewNumber uint64, newProposalSequence uint64
 func (c *Controller) abortView(view uint64) bool {
 	currView := c.getCurrentViewNumber()
 	c.Logger.Debugf("view for abort %d, current view %d", view, currView)
+	tracePrintf("%s event=controller_abort_view_start node=%d request_view=%d curr_view=%d last_committed_seq=%d proposal_seq=%d\n",
+		traceLogTag("trace"), c.ID, view, currView, c.latestSeq(), c.diagnosticProposalSeq())
 
 	if view < currView {
 		c.Logger.Debugf("Was asked to abort view %d but the current view with number %d", view, currView)
+		tracePrintf("%s event=controller_abort_view_skip node=%d reason=old_view request_view=%d curr_view=%d\n",
+			traceLogTag("trace"), c.ID, view, currView)
 		return false
 	}
 
@@ -449,15 +524,22 @@ func (c *Controller) abortView(view uint64) bool {
 
 	// Kill current view
 	c.Logger.Debugf("Aborting current view with number %d", c.currViewNumber)
-	c.currView.Abort()
+	c.abortCurrentViewWithReason(fmt.Sprintf("controller_abort_view request_view=%d curr_view=%d", view, currView))
+	tracePrintf("%s event=controller_abort_view_done node=%d request_view=%d curr_view=%d last_committed_seq=%d proposal_seq=%d\n",
+		traceLogTag("trace"), c.ID, view, currView, c.latestSeq(), c.diagnosticProposalSeq())
 
 	return true
 }
 
 // Sync initiates a synchronization
 func (c *Controller) Sync() {
-	if iAmLeader, _ := c.iAmTheLeader(); iAmLeader {
+	iAmLeader, leaderID := c.iAmTheLeader()
+	tracePrintf("%s event=sync_trigger node=%d reason=controller_sync_request curr_view=%d last_committed_seq=%d proposal_seq=%d leader=%d i_am_leader=%t\n",
+		traceLogTag("trace"), c.ID, c.getCurrentViewNumber(), c.latestSeq(), c.diagnosticProposalSeq(), leaderID, iAmLeader)
+	if iAmLeader {
 		c.Batcher.Close()
+		tracePrintf("%s event=leader_propose_skip node=%d reason=sync_closed_batcher curr_view=%d last_committed_seq=%d proposal_seq=%d leader=%d\n",
+			traceLogTag("trace"), c.ID, c.getCurrentViewNumber(), c.latestSeq(), c.diagnosticProposalSeq(), leaderID)
 	}
 	c.grabSyncToken()
 }
@@ -465,6 +547,8 @@ func (c *Controller) Sync() {
 // AbortView makes the controller abort the current view
 func (c *Controller) AbortView(view uint64) {
 	c.Logger.Debugf("AbortView, the current view num is %d", c.getCurrentViewNumber())
+	tracePrintf("%s event=controller_abort_view_request node=%d request_view=%d curr_view=%d last_committed_seq=%d proposal_seq=%d\n",
+		traceLogTag("trace"), c.ID, view, c.getCurrentViewNumber(), c.latestSeq(), c.diagnosticProposalSeq())
 
 	c.Batcher.Close()
 
@@ -474,6 +558,7 @@ func (c *Controller) AbortView(view uint64) {
 // ViewChanged makes the controller abort the current view and start a new one with the given numbers
 func (c *Controller) ViewChanged(newViewNumber uint64, newProposalSequence uint64) {
 	c.Logger.Debugf("ViewChanged, the new view is %d", newViewNumber)
+	c.emitViewEvent("controller_view_changed", c.getCurrentViewNumber(), newViewNumber, newProposalSequence, "")
 	amILeader, _ := c.iAmTheLeader()
 	if amILeader {
 		c.Batcher.Close()
@@ -482,14 +567,30 @@ func (c *Controller) ViewChanged(newViewNumber uint64, newProposalSequence uint6
 }
 
 func (c *Controller) propose() {
-	if c.stopped() || c.Batcher.Closed() {
+	iAmLeader, leaderID := c.iAmTheLeader()
+	stopped := c.stopped()
+	batcherClosed := c.Batcher.Closed()
+	tracePrintf("%s event=leader_propose_check node=%d curr_view=%d last_committed_seq=%d proposal_seq=%d leader=%d i_am_leader=%t stopped=%t batcher_closed=%t\n",
+		traceLogTag("trace"), c.ID, c.getCurrentViewNumber(), c.latestSeq(), c.diagnosticProposalSeq(), leaderID, iAmLeader, stopped, batcherClosed)
+	if stopped {
+		tracePrintf("%s event=leader_propose_skip node=%d reason=controller_stopped curr_view=%d last_committed_seq=%d proposal_seq=%d leader=%d\n",
+			traceLogTag("trace"), c.ID, c.getCurrentViewNumber(), c.latestSeq(), c.diagnosticProposalSeq(), leaderID)
+		return
+	}
+	if batcherClosed {
+		tracePrintf("%s event=leader_propose_skip node=%d reason=batcher_closed curr_view=%d last_committed_seq=%d proposal_seq=%d leader=%d\n",
+			traceLogTag("trace"), c.ID, c.getCurrentViewNumber(), c.latestSeq(), c.diagnosticProposalSeq(), leaderID)
 		return
 	}
 	nextBatch := c.Batcher.NextBatch()
 	if len(nextBatch) == 0 { // no requests in this batch
+		tracePrintf("%s event=leader_propose_skip node=%d reason=empty_batch curr_view=%d last_committed_seq=%d proposal_seq=%d leader=%d\n",
+			traceLogTag("trace"), c.ID, c.getCurrentViewNumber(), c.latestSeq(), c.diagnosticProposalSeq(), leaderID)
 		c.acquireLeaderToken() // try again later
 		return
 	}
+	tracePrintf("%s event=leader_propose_submit node=%d curr_view=%d last_committed_seq=%d proposal_seq=%d leader=%d batch_size=%d\n",
+		traceLogTag("trace"), c.ID, c.getCurrentViewNumber(), c.latestSeq(), c.diagnosticProposalSeq(), leaderID, len(nextBatch))
 	metadata := c.currView.GetMetadata()
 	proposal := c.Assembler.AssembleProposal(metadata, nextBatch)
 	c.currView.Propose(proposal)
@@ -500,7 +601,7 @@ func (c *Controller) run() {
 	// and wait for it to finish.
 	defer func() {
 		c.Logger.Infof("Exiting controller run; ID: %d", c.ID)
-		c.currView.Abort()
+		c.abortCurrentViewWithReason("controller_run_exit")
 	}()
 
 	for {
@@ -542,9 +643,10 @@ func (c *Controller) decide(d decision) {
 	}
 	c.Logger.Debugf("Node %d delivered proposal", c.ID)
 	c.removeDeliveredFromPool(d)
-	select {
-	case c.deliverChan <- struct{}{}:
-	case <-c.stopChan:
+	if d.delivered != nil {
+		close(d.delivered)
+	}
+	if c.stopped() {
 		return
 	}
 	c.incrementCurrentDecisionsInView()
@@ -557,8 +659,6 @@ func (c *Controller) decide(d decision) {
 	if c.checkIfRotate(md.BlackList) {
 		c.Logger.Debugf("Restarting view to rotate the leader")
 		c.changeView(c.getCurrentViewNumber(), md.LatestSequence+1, c.getCurrentDecisionsInView())
-		c.Logger.Debugf("Restarting timers in request pool due to leader rotation")
-		c.RequestPool.RestartTimers()
 	}
 	c.MaybePruneRevokedRequests()
 	if iAm, _ := c.iAmTheLeader(); iAm {
@@ -592,6 +692,15 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 
 	c.syncLock.Lock()
 	defer c.syncLock.Unlock()
+	controllerViewNum := c.currViewNumber
+	controllerSequence := c.latestSeq()
+	c.emitViewEvent(
+		"sync_start",
+		controllerViewNum,
+		controllerViewNum,
+		controllerSequence,
+		fmt.Sprintf("decisions_in_view=%d", c.getCurrentDecisionsInView()),
+	)
 
 	syncResponse := c.Synchronizer.Sync()
 	if syncResponse.Reconfig.InReplicatedDecisions {
@@ -615,6 +724,13 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 	if len(latestDecision.Proposal.Metadata) == 0 {
 		c.Logger.Infof("Synchronizer returned with an empty proposal metadata")
 		latestDecisionMetadata = nil
+		c.emitViewEvent(
+			"sync_latest_decision",
+			controllerViewNum,
+			controllerViewNum,
+			controllerSequence,
+			"empty_metadata=true",
+		)
 	} else {
 		md := &protos.ViewMetadata{}
 		if err := proto.Unmarshal(latestDecision.Proposal.Metadata, md); err != nil {
@@ -624,12 +740,17 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 		latestDecisionViewNum = md.ViewId
 		latestDecisionDecisions = md.DecisionsInView
 		latestDecisionMetadata = md
+		c.emitViewEvent(
+			"sync_latest_decision",
+			controllerViewNum,
+			latestDecisionViewNum,
+			latestDecisionSeq,
+			fmt.Sprintf("decisions_in_view=%d local_seq=%d", latestDecisionDecisions, controllerSequence),
+		)
 	}
 
-	controllerSequence := c.latestSeq()
 	newProposalSequence = controllerSequence + 1
 
-	controllerViewNum := c.currViewNumber
 	newViewNum = controllerViewNum
 
 	newDecisionsInView = c.getCurrentDecisionsInView()
@@ -651,12 +772,40 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 	response := c.fetchState()
 	if response == nil {
 		c.Logger.Infof("Fetching state failed")
+		c.emitViewEvent(
+			"sync_fetch_state_failed",
+			controllerViewNum,
+			newViewNum,
+			newProposalSequence,
+			fmt.Sprintf("latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
+		)
 		if latestDecisionMetadata == nil || latestDecisionViewNum < controllerViewNum {
 			// And the synchronizer did not return a new view
+			c.emitViewEvent(
+				"sync_no_progress",
+				controllerViewNum,
+				newViewNum,
+				newProposalSequence,
+				fmt.Sprintf("reason=fetch_failed_no_new_view latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
+			)
 			return 0, 0, 0
 		}
 	} else {
+		c.emitViewEvent(
+			"sync_fetch_state_result",
+			controllerViewNum,
+			response.View,
+			response.Seq,
+			fmt.Sprintf("latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
+		)
 		if response.View <= controllerViewNum && latestDecisionViewNum < controllerViewNum {
+			c.emitViewEvent(
+				"sync_no_progress",
+				controllerViewNum,
+				response.View,
+				response.Seq,
+				fmt.Sprintf("reason=response_not_newer latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
+			)
 			return 0, 0, 0 // no new view to report
 		}
 		if response.View > newViewNum && response.Seq == latestDecisionSeq+1 {
@@ -684,7 +833,22 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 
 	if newViewNum > controllerViewNum {
 		c.Logger.Debugf("Node %d is informing the view changer of view %d after sync of view %d and seq %d", c.ID, newViewNum, latestDecisionViewNum, latestDecisionSeq)
+		c.emitViewEvent(
+			"sync_inform_new_view",
+			controllerViewNum,
+			newViewNum,
+			newProposalSequence,
+			fmt.Sprintf("latest_decision_view=%d latest_decision_seq=%d decisions_in_view=%d", latestDecisionViewNum, latestDecisionSeq, newDecisionsInView),
+		)
 		c.ViewChanger.InformNewView(newViewNum)
+	} else {
+		c.emitViewEvent(
+			"sync_no_progress",
+			controllerViewNum,
+			newViewNum,
+			newProposalSequence,
+			fmt.Sprintf("reason=no_newer_view latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
+		)
 	}
 
 	return newViewNum, newProposalSequence, newDecisionsInView
@@ -797,7 +961,6 @@ func (c *Controller) Start(startViewNumber uint64, startProposalSequence uint64,
 	c.stopChan = make(chan struct{})
 	c.leaderToken = make(chan struct{}, 1)
 	c.decisionChan = make(chan decision, 1)
-	c.deliverChan = make(chan struct{})
 	c.viewChange = make(chan viewInfo, 1)
 	c.abortViewChan = make(chan uint64, 1)
 
@@ -882,11 +1045,13 @@ func (c *Controller) stopped() bool {
 
 // Decide delivers the decision to the application
 func (c *Controller) Decide(proposal types.Proposal, signatures []types.Signature, requests []types.RequestInfo) {
+	delivered := make(chan struct{})
 	select {
 	case c.decisionChan <- decision{
 		proposal:   proposal,
 		requests:   requests,
 		signatures: signatures,
+		delivered:  delivered,
 	}:
 	case <-c.stopChan:
 		// In case we are in the middle of shutting down,
@@ -895,7 +1060,7 @@ func (c *Controller) Decide(proposal types.Proposal, signatures []types.Signatur
 	}
 
 	select {
-	case <-c.deliverChan: // wait for the delivery of the decision to the application
+	case <-delivered: // wait for the delivery of the decision to the application
 	case <-c.stopChan: // If we stopped the controller, abort delivery
 	case <-c.currentViewAbortChan(): // If we stopped the view, abort delivery
 	}
@@ -918,10 +1083,13 @@ type decision struct {
 	proposal   types.Proposal
 	signatures []types.Signature
 	requests   []types.RequestInfo
+	delivered  chan struct{}
 }
 
 // BroadcastConsensus broadcasts the message and informs the heartbeat monitor if necessary
 func (c *Controller) BroadcastConsensus(m *protos.Message) {
+	tracePrintf("%s event=broadcast_consensus_start node=%d targets=%d %s\n",
+		traceLogTag("trace"), c.ID, len(c.NodesList)-1, traceMessageSummary(m))
 	for _, node := range c.NodesList {
 		// Do not send to yourself
 		if c.ID == node {
@@ -929,6 +1097,8 @@ func (c *Controller) BroadcastConsensus(m *protos.Message) {
 		}
 		c.Comm.SendConsensus(node, m)
 	}
+	tracePrintf("%s event=broadcast_consensus_done node=%d targets=%d %s\n",
+		traceLogTag("trace"), c.ID, len(c.NodesList)-1, traceMessageSummary(m))
 
 	if m.GetPrePrepare() != nil || m.GetPrepare() != nil || m.GetCommit() != nil {
 		if leader, _ := c.iAmTheLeader(); leader {

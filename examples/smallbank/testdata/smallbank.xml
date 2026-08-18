@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<parameters>
+    <numAccounts>20</numAccounts>
+    <randomSeed>42</randomSeed>
+    <monitorInterval>1</monitorInterval>
+    <works>
+        <work>
+            <time>2</time>
+            <terminals>4</terminals>
+            <rate>5</rate>
+            <weights>15,15,25,15,15,15</weights>
+        </work>
+    </works>
+</parameters>
