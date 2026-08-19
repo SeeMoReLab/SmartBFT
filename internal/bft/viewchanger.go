@@ -106,6 +106,7 @@ type ViewChanger struct {
 	inFlightViewLock   sync.RWMutex
 
 	Ticker              <-chan time.Time
+	Now                 func() time.Time
 	lastTick            time.Time
 	ResendTimeout       time.Duration
 	lastResend          time.Time
@@ -171,7 +172,7 @@ func (v *ViewChanger) Start(startViewNumber uint64) {
 	v.MetricsViewChange.RealView.Set(float64(v.realView))
 	v.MetricsViewChange.NextView.Set(float64(v.nextView))
 
-	v.lastTick = time.Now()
+	v.lastTick = v.now()
 	v.lastResend = v.lastTick
 
 	v.backOffFactor = 1
@@ -181,6 +182,21 @@ func (v *ViewChanger) Start(startViewNumber uint64) {
 		v.ControllerStartedWG.Wait()
 		v.run()
 	}()
+}
+
+func (v *ViewChanger) now() time.Time {
+	if v.Now != nil {
+		return v.Now()
+	}
+	return time.Now()
+}
+
+func (v *ViewChanger) timeoutStart() time.Time {
+	now := v.now()
+	if v.lastTick.After(now) {
+		return v.lastTick
+	}
+	return now
 }
 
 func (v *ViewChanger) setupVotes() {
@@ -655,7 +671,11 @@ func (v *ViewChanger) startViewChange(change *change) {
 	if change.stopView {
 		v.Controller.AbortView(v.currView) // abort the current view when joining view change
 	}
-	v.startViewChangeTime = v.lastTick
+	// AbortView may block while the current view finishes application work. The
+	// view-changer loop cannot consume ticker updates during that call, so
+	// lastTick may predate the completed abort by an arbitrary amount. Give the
+	// new view-change attempt its full timeout budget after the abort completes.
+	v.startViewChangeTime = v.timeoutStart()
 	v.checkTimeout = true
 	v.emitViewEvent(
 		"view_change_timeout_started",

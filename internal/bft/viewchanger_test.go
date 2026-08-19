@@ -1232,6 +1232,84 @@ func TestViewChangeTimeoutStartsBeforeQuorum(t *testing.T) {
 	comm.AssertNumberOfCalls(t, "BroadcastConsensus", 1)
 }
 
+func TestViewChangeTimeoutStartsAfterAbortCompletes(t *testing.T) {
+	comm := &mocks.CommMock{}
+	comm.On("BroadcastConsensus", mock.Anything)
+	reqTimer := &mocks.RequestsTimer{}
+	reqTimer.On("StopTimers")
+	ticker := make(chan time.Time)
+	basicLog, err := zap.NewDevelopment()
+	assert.NoError(t, err)
+
+	baseTime := time.Unix(1_000_000, 0)
+	var clock atomic.Value
+	clock.Store(baseTime)
+
+	controller := &mocks.ViewController{}
+	controller.On("AbortView", mock.Anything).Run(func(mock.Arguments) {
+		clock.Store(baseTime.Add(9 * time.Second))
+	}).Once()
+
+	timedOut := make(chan struct{}, 1)
+	timeoutStarted := make(chan struct{}, 1)
+	synchronizer := &mocks.Synchronizer{}
+	synchronizer.On("Sync").Run(func(mock.Arguments) {
+		timedOut <- struct{}{}
+	}).Once()
+
+	timeout := 10 * time.Second
+	vc := &bft.ViewChanger{
+		SelfID:            0,
+		N:                 4,
+		NodesList:         []uint64{0, 1, 2, 3},
+		Comm:              comm,
+		RequestsTimer:     reqTimer,
+		Ticker:            ticker,
+		Now:               func() time.Time { return clock.Load().(time.Time) },
+		Logger:            basicLog.Sugar(),
+		ViewChangeTimeout: timeout,
+		ResendTimeout:     time.Hour,
+		Synchronizer:      synchronizer,
+		Controller:        controller,
+		InMsqQSize:        100,
+		ViewEvent: func(event string, _ uint64, _ uint64, _ uint64, _ uint64, _ uint64, _ string) {
+			if event == "view_change_timeout_started" {
+				timeoutStarted <- struct{}{}
+			}
+		},
+	}
+
+	vc.Start(0)
+	defer vc.Stop()
+	vc.StartViewChange(0, true)
+
+	select {
+	case <-timeoutStarted:
+	case <-time.After(time.Second):
+		t.Fatal("view-change timeout did not start after abort completed")
+	}
+
+	// AbortView consumed nine seconds, but the post-abort attempt must still
+	// receive its complete ten-second timeout budget.
+	ticker <- baseTime.Add(10 * time.Second)
+	ticker <- baseTime.Add(10*time.Second + time.Millisecond)
+	select {
+	case <-timedOut:
+		t.Fatal("time spent in AbortView consumed the view-change timeout budget")
+	default:
+	}
+
+	ticker <- baseTime.Add(19 * time.Second)
+	select {
+	case <-timedOut:
+	case <-time.After(time.Second):
+		t.Fatal("view-change timeout did not expire after the post-abort budget")
+	}
+
+	synchronizer.AssertNumberOfCalls(t, "Sync", 1)
+	controller.AssertNumberOfCalls(t, "AbortView", 1)
+}
+
 func TestExternalBackoffViewChangeTimeoutAdvancesAfterQuorum(t *testing.T) {
 	comm := &mocks.CommMock{}
 	msgChan := make(chan *protos.Message, 2)
