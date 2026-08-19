@@ -32,7 +32,7 @@ import (
 const (
 	defaultNetworkSendTimeout = 2 * time.Second
 	syncMaxReceiveMessageSize = 64 << 20
-	consensusQueueSize        = 4096
+	consensusQueueSize        = 100
 	clientQueueSize           = 65536
 	operationConsensus        = "smallbank-consensus"
 	operationTransaction      = "smallbank-transaction"

@@ -256,7 +256,7 @@ func TestViewChangeProcess(t *testing.T) {
 				vc.HandleMessage(3, viewChangeMsg)
 			}
 
-			// A single future viewChange message is not enough to catch up.
+			// A future view-change message is ignored, as in Fabric.
 			msg3 := proto.Clone(viewChangeMsg).(*protos.Message)
 			msg3.GetViewChange().NextView = 3
 			vc.HandleMessage(2, msg3)
@@ -282,70 +282,6 @@ func TestViewChangeProcess(t *testing.T) {
 			vc.Stop()
 		})
 	}
-}
-
-func TestFutureViewChangeCatchUp(t *testing.T) {
-	comm := &mocks.CommMock{}
-	broadcastChan := make(chan *protos.Message, 4)
-	comm.On("BroadcastConsensus", mock.Anything).Run(func(args mock.Arguments) {
-		broadcastChan <- args.Get(0).(*protos.Message)
-	}).Once()
-	sendChan := make(chan *protos.Message, 4)
-	comm.On("SendConsensus", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
-		sendChan <- args.Get(1).(*protos.Message)
-	}).Once()
-	signer := &mocks.SignerMock{}
-	signer.On("Sign", mock.Anything).Return([]byte{1, 2, 3})
-	basicLog, err := zap.NewDevelopment()
-	assert.NoError(t, err)
-	log := basicLog.Sugar()
-	reqTimer := &mocks.RequestsTimer{}
-	reqTimer.On("StopTimers").Once()
-	controller := &mocks.ViewController{}
-	controller.On("AbortView", mock.Anything)
-	state := &mocks.State{}
-	state.On("Save", mock.Anything).Return(nil).Once()
-
-	vc := &bft.ViewChanger{
-		SelfID:            0,
-		N:                 4,
-		NodesList:         []uint64{0, 1, 2, 3},
-		Comm:              comm,
-		Signer:            signer,
-		Logger:            log,
-		RequestsTimer:     reqTimer,
-		Ticker:            make(chan time.Time),
-		InFlight:          &bft.InFlightData{},
-		Checkpoint:        &types.Checkpoint{},
-		Controller:        controller,
-		InMsqQSize:        100,
-		State:             state,
-		SpeedUpViewChange: true,
-	}
-
-	vc.Start(0)
-
-	future := proto.Clone(viewChangeMsg).(*protos.Message)
-	future.GetViewChange().NextView = 3
-	vc.HandleMessage(1, future)
-	vc.HandleMessage(2, future)
-
-	msg := <-broadcastChan
-	assert.NotNil(t, msg.GetViewChange())
-	assert.Equal(t, uint64(3), msg.GetViewChange().NextView)
-
-	msg = <-sendChan
-	assert.NotNil(t, msg.GetViewData())
-	viewData := &protos.ViewData{}
-	assert.NoError(t, proto.Unmarshal(msg.GetViewData().RawViewData, viewData))
-	assert.Equal(t, uint64(3), viewData.NextView)
-	comm.AssertCalled(t, "SendConsensus", uint64(3), mock.Anything)
-
-	vc.Stop()
-
-	reqTimer.AssertNumberOfCalls(t, "StopTimers", 1)
-	controller.AssertNumberOfCalls(t, "AbortView", 2)
-	state.AssertNumberOfCalls(t, "Save", 1)
 }
 
 func TestViewDataProcess(t *testing.T) {
@@ -1242,6 +1178,60 @@ func TestViewChangerTimeout(t *testing.T) {
 	comm.AssertNumberOfCalls(t, "BroadcastConsensus", 2)
 }
 
+func TestViewChangeTimeoutStartsBeforeQuorum(t *testing.T) {
+	comm := &mocks.CommMock{}
+	msgChan := make(chan *protos.Message, 2)
+	comm.On("BroadcastConsensus", mock.Anything).Run(func(args mock.Arguments) {
+		msgChan <- args.Get(0).(*protos.Message)
+	})
+	reqTimer := &mocks.RequestsTimer{}
+	reqTimer.On("StopTimers").Once()
+	ticker := make(chan time.Time)
+	basicLog, err := zap.NewDevelopment()
+	assert.NoError(t, err)
+	synchronizer := &mocks.Synchronizer{}
+	synced := make(chan struct{}, 1)
+	synchronizer.On("Sync").Run(func(mock.Arguments) {
+		synced <- struct{}{}
+	}).Once()
+	controller := &mocks.ViewController{}
+	controller.On("AbortView", mock.Anything).Once()
+
+	timeout := 10 * time.Second
+	vc := &bft.ViewChanger{
+		SelfID:            0,
+		N:                 4,
+		NodesList:         []uint64{0, 1, 2, 3},
+		Comm:              comm,
+		RequestsTimer:     reqTimer,
+		Ticker:            ticker,
+		Logger:            basicLog.Sugar(),
+		ViewChangeTimeout: timeout,
+		ResendTimeout:     100 * time.Second,
+		Synchronizer:      synchronizer,
+		Controller:        controller,
+		InMsqQSize:        100,
+	}
+
+	vc.Start(0)
+	startTime := time.Now()
+	vc.StartViewChange(0, true)
+	msg := <-msgChan
+	assert.Equal(t, uint64(1), msg.GetViewChange().GetNextView())
+
+	// No remote view-change votes are delivered before the timeout.
+	ticker <- startTime.Add(timeout + time.Second)
+	select {
+	case <-synced:
+	case <-time.After(time.Second):
+		t.Fatal("view-change timeout did not trigger sync before quorum")
+	}
+
+	vc.Stop()
+	synchronizer.AssertNumberOfCalls(t, "Sync", 1)
+	comm.AssertNumberOfCalls(t, "BroadcastConsensus", 1)
+}
+
 func TestExternalBackoffViewChangeTimeoutAdvancesAfterQuorum(t *testing.T) {
 	comm := &mocks.CommMock{}
 	msgChan := make(chan *protos.Message, 2)
@@ -1313,61 +1303,6 @@ func TestExternalBackoffViewChangeTimeoutAdvancesAfterQuorum(t *testing.T) {
 	reqTimer.AssertNumberOfCalls(t, "StopTimers", 2)
 	controller.AssertNumberOfCalls(t, "AbortView", 2)
 	comm.AssertNumberOfCalls(t, "BroadcastConsensus", 2)
-}
-
-func TestExternalBackoffFutureCatchUpDoesNotTimeoutBeforeQuorum(t *testing.T) {
-	comm := &mocks.CommMock{}
-	msgChan := make(chan *protos.Message, 4)
-	comm.On("BroadcastConsensus", mock.Anything).Run(func(args mock.Arguments) {
-		msgChan <- args.Get(0).(*protos.Message)
-	})
-	reqTimer := &mocks.RequestsTimer{}
-	reqTimer.On("StopTimers")
-	ticker := make(chan time.Time)
-	basicLog, err := zap.NewDevelopment()
-	assert.NoError(t, err)
-	log := basicLog.Sugar()
-	synchronizer := &mocks.Synchronizer{}
-	synchronizer.On("Sync")
-	controller := &mocks.ViewController{}
-	controller.On("AbortView", mock.Anything)
-
-	timeout := 10 * time.Second
-	vc := &bft.ViewChanger{
-		SelfID:            0,
-		N:                 7,
-		NodesList:         []uint64{0, 1, 2, 3, 4, 5, 6},
-		Comm:              comm,
-		RequestsTimer:     reqTimer,
-		Ticker:            ticker,
-		Logger:            log,
-		ViewChangeTimeout: timeout,
-		ResendTimeout:     100 * time.Second,
-		ExternalBackoff:   true,
-		Synchronizer:      synchronizer,
-		Controller:        controller,
-		InMsqQSize:        100,
-	}
-
-	vc.Start(0)
-	startTime := time.Now()
-
-	futureViewChange := proto.Clone(viewChangeMsg).(*protos.Message)
-	futureViewChange.GetViewChange().NextView = 3
-	vc.HandleMessage(1, futureViewChange)
-	vc.HandleMessage(2, proto.Clone(futureViewChange).(*protos.Message))
-	vc.HandleMessage(3, proto.Clone(futureViewChange).(*protos.Message)) // f+1 future evidence, but not quorum
-
-	msg := <-msgChan
-	assert.Equal(t, uint64(3), msg.GetViewChange().GetNextView())
-
-	ticker <- startTime.Add(timeout + time.Second)
-
-	synchronizer.AssertNumberOfCalls(t, "Sync", 0)
-	comm.AssertNumberOfCalls(t, "BroadcastConsensus", 1)
-	reqTimer.AssertNumberOfCalls(t, "StopTimers", 1)
-	controller.AssertNumberOfCalls(t, "AbortView", 1)
-	vc.Stop()
 }
 
 func TestBackOff(t *testing.T) {

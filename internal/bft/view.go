@@ -31,20 +31,6 @@ const (
 	ABORT
 )
 
-const futureMessageWindow = 100
-
-type bufferedFutureMessage struct {
-	sender  uint64
-	message *protos.Message
-}
-
-type futureMessageKey struct {
-	sender uint64
-	kind   int
-	view   uint64
-	seq    uint64
-}
-
 func (p Phase) String() string {
 	switch p {
 	case COMMITTED:
@@ -123,12 +109,9 @@ type View struct {
 	prepares   *voteSet
 	commits    *voteSet
 	// Next proposal
-	nextPrePrepare chan *protos.Message
-	nextPrepares   *voteSet
-	nextCommits    *voteSet
-	// Future proposals within a small window.
-	futureMessages map[uint64]map[futureMessageKey]bufferedFutureMessage
-
+	nextPrePrepare     chan *protos.Message
+	nextPrepares       *voteSet
+	nextCommits        *voteSet
 	beginPrePrepare    time.Time
 	MetricsBlacklist   *api.MetricsBlacklist
 	MetricsView        *api.MetricsView
@@ -148,7 +131,6 @@ func (v *View) Start() {
 	v.abortChan = make(chan struct{})
 	v.stopReason.Store("running")
 	v.lastVotedProposalByID = make(map[uint64]*protos.Commit)
-	v.futureMessages = make(map[uint64]map[futureMessageKey]bufferedFutureMessage)
 	v.viewEnded.Add(1)
 
 	v.prePrepare = make(chan *protos.Message, 1)
@@ -260,9 +242,6 @@ func (v *View) processMsg(sender uint64, m *protos.Message) {
 	// This message is either for this proposal or the next one (we might be behind the rest)
 	if msgProposalSeq != v.ProposalSequence && msgProposalSeq != v.ProposalSequence+1 {
 		v.Logger.Infof("%d got message from %d with sequence %d but our sequence is %d", v.SelfID, sender, msgProposalSeq, v.ProposalSequence)
-		if v.bufferFutureMessage(sender, m, msgViewNum, msgProposalSeq) {
-			return
-		}
 		v.discoverIfSyncNeeded(sender, m)
 		return
 	}
@@ -296,105 +275,6 @@ func (v *View) processMsg(sender uint64, m *protos.Message) {
 			v.commits.registerVote(sender, m)
 		}
 		return
-	}
-}
-
-func futureMessageKind(m *protos.Message) int {
-	switch {
-	case m.GetPrePrepare() != nil:
-		return 0
-	case m.GetPrepare() != nil:
-		return 1
-	case m.GetCommit() != nil:
-		return 2
-	default:
-		return -1
-	}
-}
-
-func (v *View) bufferFutureMessage(sender uint64, m *protos.Message, msgViewNum uint64, msgProposalSeq uint64) bool {
-	if msgViewNum != v.Number || msgProposalSeq <= v.ProposalSequence+1 || msgProposalSeq > v.ProposalSequence+futureMessageWindow {
-		return false
-	}
-
-	kind := futureMessageKind(m)
-	if kind < 0 {
-		return false
-	}
-
-	if v.futureMessages == nil {
-		v.futureMessages = make(map[uint64]map[futureMessageKey]bufferedFutureMessage)
-	}
-
-	byKey := v.futureMessages[msgProposalSeq]
-	if byKey == nil {
-		byKey = make(map[futureMessageKey]bufferedFutureMessage)
-		v.futureMessages[msgProposalSeq] = byKey
-	}
-
-	key := futureMessageKey{
-		sender: sender,
-		kind:   kind,
-		view:   msgViewNum,
-		seq:    msgProposalSeq,
-	}
-	if _, exists := byKey[key]; exists {
-		return true
-	}
-
-	byKey[key] = bufferedFutureMessage{
-		sender:  sender,
-		message: proto.Clone(m).(*protos.Message),
-	}
-	return true
-}
-
-func (v *View) promoteBufferedFutureMessages() {
-	if len(v.futureMessages) == 0 {
-		return
-	}
-
-	v.promoteBufferedSequence(v.ProposalSequence)
-	v.promoteBufferedSequence(v.ProposalSequence + 1)
-	v.pruneFutureMessages()
-}
-
-func (v *View) promoteBufferedSequence(seq uint64) {
-	byKey := v.futureMessages[seq]
-	if len(byKey) == 0 {
-		delete(v.futureMessages, seq)
-		return
-	}
-
-	keys := make([]futureMessageKey, 0, len(byKey))
-	for key := range byKey {
-		keys = append(keys, key)
-	}
-	slices.SortFunc(keys, func(a futureMessageKey, b futureMessageKey) int {
-		if a.kind != b.kind {
-			return a.kind - b.kind
-		}
-		if a.sender < b.sender {
-			return -1
-		}
-		if a.sender > b.sender {
-			return 1
-		}
-		return 0
-	})
-
-	delete(v.futureMessages, seq)
-	for _, key := range keys {
-		msg := byKey[key]
-		v.processMsg(msg.sender, msg.message)
-	}
-}
-
-func (v *View) pruneFutureMessages() {
-	for seq := range v.futureMessages {
-		if seq <= v.ProposalSequence || seq > v.ProposalSequence+futureMessageWindow {
-			delete(v.futureMessages, seq)
-		}
 	}
 }
 
@@ -1047,7 +927,6 @@ func (v *View) startNextSeq() {
 	tmpVotes.clear(v.N)
 	v.nextCommits = tmpVotes
 
-	v.promoteBufferedFutureMessages()
 }
 
 // GetMetadata returns the current sequence and view number (in a marshaled ViewMetadata protobuf message)

@@ -128,13 +128,14 @@ func newNode(
 	config.RequestBatchMaxCount = opts.BatchSize
 	config.RequestBatchMaxInterval = opts.BatchTimeout
 	config.RequestPoolSize = max(2*opts.BatchSize, 1024)
-	config.RequestPoolSubmitTimeout = 500 * time.Millisecond
+	config.RequestPoolSubmitTimeout = 50 * time.Millisecond
 	config.RequestForwardTimeout = 400 * time.Millisecond
 	config.RequestComplainTimeout = 400 * time.Millisecond
 	config.ViewChangeTimeout = config.RequestForwardTimeout + config.RequestComplainTimeout
 	config.ViewChangeResendInterval = config.ViewChangeTimeout
 	config.LeaderHeartbeatTimeout = 30 * time.Second
 	config.LeaderRotation = false
+	config.SpeedUpViewChange = false
 	config.DecisionsPerLeader = 0
 	n.configuration = config
 	timeoutBackoff, err := newRequestTimeoutBackoff(config.RequestForwardTimeout+config.RequestComplainTimeout, opts.Backoff)

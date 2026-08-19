@@ -220,12 +220,14 @@ func (rp *Pool) Submit(request []byte) error {
 		return ErrReqAlreadyProcessed
 	}
 
-	// do not wait for a semaphore with a lock, as it will prevent draining the pool.
-	if !rp.semaphore.TryAcquire(1) {
+	ctx, cancel := context.WithTimeout(context.Background(), rp.options.SubmitTimeout)
+	defer cancel()
+	// Do not wait for a semaphore with a lock, as it will prevent draining the pool.
+	if err := rp.semaphore.Acquire(ctx, 1); err != nil {
 		rp.metrics.CountOfFailAddRequestToPool.With(
 			rp.metrics.LabelsForWith("reason", api.ReasonSemaphoreAcquireFail)...,
 		).Add(1)
-		return fmt.Errorf("acquiring semaphore for request: %s: %w", reqInfo, ErrSubmitTimeout)
+		return fmt.Errorf("acquiring semaphore for request: %s: %w", reqInfo, err)
 	}
 
 	reqCopy := append(make([]byte, 0), request...)

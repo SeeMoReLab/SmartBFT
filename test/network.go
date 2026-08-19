@@ -21,7 +21,7 @@ const (
 
 type handler interface {
 	HandleMessage(sender uint64, m *smartbftprotos.Message)
-	HandleRequest(sender uint64, req []byte)
+	HandleRequest(sender uint64, req []byte) error
 	Stop()
 }
 
@@ -234,7 +234,7 @@ func (node *Node) serve() {
 				}
 				handler.HandleMessage(uint64(m.from), msg)
 			default:
-				handler.HandleRequest(uint64(m.from), msg.(*FwdMessage).Payload)
+				_ = handler.HandleRequest(uint64(m.from), msg.(*FwdMessage).Payload)
 			}
 		}
 	}

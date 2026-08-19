@@ -46,9 +46,7 @@ type RequestsTimer interface {
 
 type change struct {
 	view     uint64
-	nextView uint64
 	stopView bool
-	catchUp  bool
 }
 
 type inFlightAttempt struct {
@@ -115,7 +113,6 @@ type ViewChanger struct {
 	ExternalBackoff     bool
 	startViewChangeTime time.Time
 	checkTimeout        bool
-	resendViewChange    bool
 	backOffFactor       uint64
 
 	// Runtime
@@ -130,8 +127,6 @@ type ViewChanger struct {
 	pendingViewMsgsLock       sync.Mutex
 	viewChangeMsgs            *voteSet
 	viewDataMsgs              *voteSet
-	futureViewChangeMsgs      map[uint64]*voteSet
-	viewChangeQuorumView      uint64
 	nvs                       *nextViews
 	realView                  uint64
 	currView                  uint64
@@ -191,7 +186,6 @@ func (v *ViewChanger) Start(startViewNumber uint64) {
 func (v *ViewChanger) setupVotes() {
 	// view change
 	v.viewChangeMsgs = v.newViewChangeVoteSet()
-	v.futureViewChangeMsgs = make(map[uint64]*voteSet)
 
 	// view data
 	acceptViewData := func(_ uint64, message *protos.Message) bool {
@@ -396,89 +390,6 @@ func signedViewDataDetail(svd *protos.SignedViewData) string {
 	)
 }
 
-func sortedFutureViews(future map[uint64]*voteSet) []uint64 {
-	views := make([]uint64, 0, len(future))
-	for view := range future {
-		views = append(views, view)
-	}
-	sort.Slice(views, func(i, j int) bool {
-		return views[i] > views[j]
-	})
-	return views
-}
-
-func (v *ViewChanger) expectedViewChangeTarget() uint64 {
-	if v.nextView > v.currView {
-		return v.nextView
-	}
-	return v.currView + 1
-}
-
-func (v *ViewChanger) pruneFutureViewChanges(upTo uint64) {
-	for view := range v.futureViewChangeMsgs {
-		if view <= upTo {
-			delete(v.futureViewChangeMsgs, view)
-		}
-	}
-}
-
-func (v *ViewChanger) registerFutureViewChange(sender uint64, m *protos.Message) bool {
-	vc := m.GetViewChange()
-	if vc == nil || vc.NextView <= v.expectedViewChangeTarget() {
-		return false
-	}
-
-	vs := v.futureViewChangeMsgs[vc.NextView]
-	if vs == nil {
-		vs = v.newViewChangeVoteSet()
-		v.futureViewChangeMsgs[vc.NextView] = vs
-	}
-
-	vs.registerVote(sender, m)
-	v.emitViewEvent(
-		"future_view_change_stored",
-		v.currView,
-		vc.NextView,
-		0,
-		fmt.Sprintf("sender=%d expected=%d votes=%d threshold=%d senders=%v", sender, v.expectedViewChangeTarget(), len(vs.voted), v.f+1, sortedVoteSenders(vs)),
-	)
-
-	return v.maybeCatchUpToFutureView()
-}
-
-func (v *ViewChanger) maybeCatchUpToFutureView() bool {
-	for _, target := range sortedFutureViews(v.futureViewChangeMsgs) {
-		if target <= v.expectedViewChangeTarget() {
-			continue
-		}
-		vs := v.futureViewChangeMsgs[target]
-		if len(vs.voted) < v.f+1 {
-			continue
-		}
-
-		v.Logger.Warnf("Node %d observed %d future view change messages for view %d while in view %d, catching up", v.SelfID, len(vs.voted), target, v.currView)
-		v.emitViewEvent(
-			"future_catchup_triggered",
-			v.currView,
-			target,
-			0,
-			fmt.Sprintf("old_next_view=%d votes=%d threshold=%d senders=%v", v.nextView, len(vs.voted), v.f+1, sortedVoteSenders(vs)),
-		)
-
-		v.viewChangeMsgs = vs
-		v.pruneFutureViewChanges(target)
-		v.startViewChange(&change{
-			view:     v.currView,
-			nextView: target,
-			stopView: true,
-			catchUp:  true,
-		})
-		v.processViewChangeMsg(false)
-		return true
-	}
-	return false
-}
-
 func (v *ViewChanger) SetBackOffFactor(factor uint64) {
 	if factor == 0 {
 		factor = 1
@@ -491,7 +402,7 @@ func (v *ViewChanger) checkIfResendViewChange(now time.Time) {
 	if nextTimeout.After(now) { // check if it is time to resend
 		return
 	}
-	if v.resendViewChange { // during view change process
+	if v.checkTimeout { // during view change process
 		msg := &protos.Message{
 			Content: &protos.Message_ViewChange{
 				ViewChange: &protos.ViewChange{
@@ -528,79 +439,8 @@ func (v *ViewChanger) checkIfTimeout(now time.Time) bool {
 	// the timeout has passed, something went wrong, try sync and complain
 	v.Logger.Debugf("Node %d is calling sync because it got a view change timeout", v.SelfID)
 	v.Synchronizer.Sync()
-	if v.promoteFutureViewChangeTarget(v.currView + 1) {
-		return true
-	}
-	if v.viewChangeQuorumView == v.currView && v.currView > v.realView {
-		v.startViewChange(&change{view: v.currView, nextView: v.currView + 1, stopView: false})
-		return true
-	}
-	v.retryTimedOutViewChange()
+	v.StartViewChange(v.currView, false)
 	return true
-}
-
-func (v *ViewChanger) startViewChangeTimeout() {
-	if v.checkTimeout {
-		return
-	}
-	v.startViewChangeTime = v.lastTick
-	v.checkTimeout = true
-	v.emitViewEvent(
-		"view_change_timeout_started",
-		v.currView,
-		v.nextView,
-		0,
-		fmt.Sprintf("votes=%d required=%d senders=%v", len(v.viewChangeMsgs.voted), v.quorum-1, sortedVoteSenders(v.viewChangeMsgs)),
-	)
-}
-
-func (v *ViewChanger) promoteFutureViewChangeTarget(targetView uint64) bool {
-	if futureVotes := v.futureViewChangeMsgs[targetView]; futureVotes != nil {
-		if len(futureVotes.voted) < v.quorum-1 {
-			return false
-		}
-		v.viewChangeMsgs = futureVotes
-		delete(v.futureViewChangeMsgs, targetView)
-	} else {
-		return false
-	}
-	v.viewDataMsgs.clear(v.N)
-	v.pruneFutureViewChanges(targetView)
-	v.emitViewEvent(
-		"timeout_promote_future_target",
-		v.currView,
-		targetView,
-		0,
-		fmt.Sprintf("active_votes=%d required=%d senders=%v", len(v.viewChangeMsgs.voted), v.quorum-1, sortedVoteSenders(v.viewChangeMsgs)),
-	)
-
-	v.startViewChange(&change{view: v.currView, nextView: targetView, stopView: false})
-	v.processViewChangeMsg(false)
-	return true
-}
-
-func (v *ViewChanger) retryTimedOutViewChange() {
-	if v.nextView <= v.realView {
-		return
-	}
-	msg := &protos.Message{
-		Content: &protos.Message_ViewChange{
-			ViewChange: &protos.ViewChange{
-				NextView: v.nextView,
-			},
-		},
-	}
-	v.Comm.BroadcastConsensus(msg)
-	v.lastResend = v.lastTick
-	v.resendViewChange = true
-	v.emitViewEvent(
-		"timeout_retry_view_change",
-		v.currView,
-		v.nextView,
-		0,
-		fmt.Sprintf("active_votes=%d senders=%v", len(v.viewChangeMsgs.voted), sortedVoteSenders(v.viewChangeMsgs)),
-	)
-	v.startViewChangeTimeout()
 }
 
 func (v *ViewChanger) processMsg(sender uint64, m *protos.Message) {
@@ -617,7 +457,7 @@ func (v *ViewChanger) processMsg(sender uint64, m *protos.Message) {
 		v.emitViewEvent("received_view_change", v.currView, vc.NextView, 0, fmt.Sprintf("sender=%d local_next_view=%d real_view=%d", sender, v.nextView, v.realView))
 		v.nvs.registerNext(vc.NextView, sender)
 		// check view number
-		expectedNextView := v.expectedViewChangeTarget()
+		expectedNextView := v.currView + 1
 		if vc.NextView == expectedNextView { // accept view changes for the active view-change target
 			v.viewChangeMsgs.registerVote(sender, m)
 			v.emitViewEvent(
@@ -628,13 +468,6 @@ func (v *ViewChanger) processMsg(sender uint64, m *protos.Message) {
 				fmt.Sprintf("sender=%d votes=%d required=%d senders=%v", sender, len(v.viewChangeMsgs.voted), v.quorum-1, sortedVoteSenders(v.viewChangeMsgs)),
 			)
 			v.processViewChangeMsg(false)
-			return
-		}
-		if vc.NextView > expectedNextView {
-			if v.registerFutureViewChange(sender, m) {
-				return
-			}
-			v.Logger.Warnf("Node %d got future viewChange message %v from %d with view %d, expected view %d, waiting for catch-up threshold", v.SelfID, m, sender, vc.NextView, expectedNextView)
 			return
 		}
 		if v.nextView == v.currView+1 && // node has already started view change with last view
@@ -740,7 +573,6 @@ func (v *ViewChanger) informNewView(view uint64) {
 	oldCurrView := v.currView
 	oldNextView := v.nextView
 	activeVotes := len(v.viewChangeMsgs.voted)
-	futureViews := sortedFutureViews(v.futureViewChangeMsgs)
 	v.currView = view
 	v.realView = v.currView
 	v.nextView = v.currView
@@ -750,10 +582,7 @@ func (v *ViewChanger) informNewView(view uint64) {
 	v.nvs.clear()
 	v.viewChangeMsgs.clear(v.N)
 	v.viewDataMsgs.clear(v.N)
-	v.futureViewChangeMsgs = make(map[uint64]*voteSet)
-	v.viewChangeQuorumView = 0
 	v.checkTimeout = false
-	v.resendViewChange = false
 	if !v.ExternalBackoff {
 		v.backOffFactor = 1 // reset
 	}
@@ -762,7 +591,7 @@ func (v *ViewChanger) informNewView(view uint64) {
 		oldCurrView,
 		v.currView,
 		0,
-		fmt.Sprintf("old_next_view=%d active_votes=%d future_views=%v", oldNextView, activeVotes, futureViews),
+		fmt.Sprintf("old_next_view=%d active_votes=%d", oldNextView, activeVotes),
 	)
 }
 
@@ -777,8 +606,7 @@ func (v *ViewChanger) StartViewChange(view uint64, stopView bool) {
 
 // StartViewChange stops current view and timeouts, and broadcasts a view change message to all
 func (v *ViewChanger) startViewChange(change *change) {
-	explicitNextView := change.nextView != 0
-	if change.view < v.currView && !explicitNextView { // this is about an old view
+	if change.view < v.currView { // this is about an old view
 		v.Logger.Debugf("Node %d has a view change request with an old view %d, while the current view is %d", v.SelfID, change.view, v.currView)
 		v.emitViewEvent(
 			"start_view_change_refused",
@@ -789,58 +617,29 @@ func (v *ViewChanger) startViewChange(change *change) {
 		)
 		return
 	}
-	if !explicitNextView {
-		change.nextView = v.currView + 1
-	}
-	if change.view < v.currView && change.nextView <= v.currView { // this is about an old view
-		v.Logger.Debugf("Node %d has a view change request with an old view %d, while the current view is %d", v.SelfID, change.view, v.currView)
-		v.emitViewEvent(
-			"start_view_change_refused",
-			v.currView,
-			change.nextView,
-			0,
-			fmt.Sprintf("reason=old_view request_view=%d stop_view=%t", change.view, change.stopView),
-		)
-		return
-	}
-	if change.nextView <= v.currView {
-		v.Logger.Debugf("Node %d has a view change request with target view %d, while the current view is %d", v.SelfID, change.nextView, v.currView)
-		v.emitViewEvent(
-			"start_view_change_refused",
-			v.currView,
-			change.nextView,
-			0,
-			fmt.Sprintf("reason=target_not_ahead request_view=%d stop_view=%t", change.view, change.stopView),
-		)
-		return
-	}
-	if v.nextView > v.currView && change.nextView <= v.nextView {
+	if v.nextView == v.currView+1 {
 		v.Logger.Debugf("Node %d has already started view change with target view %d", v.SelfID, v.nextView)
 		v.emitViewEvent("view_change_already_started", v.currView, v.nextView, 0, fmt.Sprintf("stop_view=%t", change.stopView))
 		v.emitViewEvent(
 			"start_view_change_refused",
 			v.currView,
-			change.nextView,
+			v.nextView,
 			0,
 			fmt.Sprintf("reason=already_started active_target=%d request_view=%d stop_view=%t", v.nextView, change.view, change.stopView),
 		)
-		v.resendViewChange = true
+		v.checkTimeout = true
 		return
 	}
-	oldNextView := v.nextView
-	v.nextView = change.nextView
+	v.nextView = v.currView + 1
 	v.MetricsViewChange.NextView.Set(float64(v.nextView))
 	detail := fmt.Sprintf("stop_view=%t", change.stopView)
-	if change.catchUp {
-		detail = fmt.Sprintf("%s catch_up=true old_next_view=%d", detail, oldNextView)
-	}
 	v.emitViewEvent("start_view_change", v.currView, v.nextView, 0, detail)
 	v.emitViewEvent(
 		"election_trigger",
 		v.currView,
 		v.nextView,
 		0,
-		fmt.Sprintf("reason=start_view_change stop_view=%t catch_up=%t votes=%d required=%d senders=%v", change.stopView, change.catchUp, len(v.viewChangeMsgs.voted), v.quorum-1, sortedVoteSenders(v.viewChangeMsgs)),
+		fmt.Sprintf("reason=start_view_change stop_view=%t votes=%d required=%d senders=%v", change.stopView, len(v.viewChangeMsgs.voted), v.quorum-1, sortedVoteSenders(v.viewChangeMsgs)),
 	)
 	v.RequestsTimer.StopTimers()
 	msg := &protos.Message{
@@ -852,15 +651,23 @@ func (v *ViewChanger) startViewChange(change *change) {
 	}
 	v.Comm.BroadcastConsensus(msg)
 	v.lastResend = v.lastTick
-	v.resendViewChange = true
 	v.Logger.Debugf("Node %d started view change, last view is %d", v.SelfID, v.currView)
 	if change.stopView {
 		v.Controller.AbortView(v.currView) // abort the current view when joining view change
 	}
+	v.startViewChangeTime = v.lastTick
+	v.checkTimeout = true
+	v.emitViewEvent(
+		"view_change_timeout_started",
+		v.currView,
+		v.nextView,
+		0,
+		fmt.Sprintf("votes=%d required=%d senders=%v", len(v.viewChangeMsgs.voted), v.quorum-1, sortedVoteSenders(v.viewChangeMsgs)),
+	)
 }
 
 func (v *ViewChanger) processViewChangeMsg(restore bool) {
-	target := v.expectedViewChangeTarget()
+	target := v.currView + 1
 	v.emitViewEvent(
 		"view_change_quorum_check",
 		v.currView,
@@ -877,12 +684,11 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 			0,
 			fmt.Sprintf("reason=view_change_votes_speedup restore=%t votes=%d required=%d senders=%v", restore, len(v.viewChangeMsgs.voted), v.f+1, sortedVoteSenders(v.viewChangeMsgs)),
 		)
-		v.startViewChange(&change{view: v.currView, nextView: target, stopView: true})
+		v.startViewChange(&change{view: v.currView, stopView: true})
 	}
 	if (len(v.viewChangeMsgs.voted) < v.quorum-1) && !restore {
 		return
 	}
-	v.startViewChangeTimeout()
 	// send view data
 	if !v.SpeedUpViewChange {
 		v.Logger.Debugf("Node %d is joining view change, last view is %d", v.SelfID, v.currView)
@@ -893,7 +699,7 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 			0,
 			fmt.Sprintf("reason=view_change_votes_no_speedup restore=%t votes=%d required=%d senders=%v", restore, len(v.viewChangeMsgs.voted), v.quorum-1, sortedVoteSenders(v.viewChangeMsgs)),
 		)
-		v.startViewChange(&change{view: v.currView, nextView: target, stopView: true})
+		v.startViewChange(&change{view: v.currView, stopView: true})
 	}
 	if !restore {
 		msgToSave := &protos.SavedMessage{
@@ -910,7 +716,6 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 	v.Controller.AbortView(v.currView) // before preparing the view data message abort the current view
 	oldCurrView := v.currView
 	v.currView = v.nextView
-	v.viewChangeQuorumView = v.currView
 	v.MetricsViewChange.CurrentView.Set(float64(v.currView))
 	v.emitViewEvent(
 		"curr_view_advance",
@@ -921,7 +726,6 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 	)
 	v.viewChangeMsgs.clear(v.N)
 	v.viewDataMsgs.clear(v.N) // clear because currView changed
-	v.pruneFutureViewChanges(v.currView)
 	msg := v.prepareViewDataMsg()
 	leader := v.getLeader()
 	if leader == v.SelfID {
@@ -1721,8 +1525,6 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 	v.realView = v.currView
 	v.MetricsViewChange.RealView.Set(float64(v.realView))
 	v.nvs.clear()
-	v.futureViewChangeMsgs = make(map[uint64]*voteSet)
-	v.viewChangeQuorumView = 0
 	v.emitViewEvent(
 		"new_view_installed",
 		v.currView,
@@ -1733,7 +1535,6 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 	v.Controller.ViewChanged(v.currView, mySequence+1)
 
 	v.checkTimeout = false
-	v.resendViewChange = false
 	if !v.ExternalBackoff {
 		v.backOffFactor = 1 // reset
 	}
