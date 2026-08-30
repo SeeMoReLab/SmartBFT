@@ -59,7 +59,6 @@ type node struct {
 	learning       *learningManager
 	network        *networkTransport
 	replies        *clientReplyDispatcher
-	timeoutBackoff *requestTimeoutBackoff
 
 	// State transfer history is authoritative for sync discovery. It keeps a
 	// small number of immutable checkpoint generations and the certified
@@ -81,7 +80,6 @@ type nodeOptions struct {
 	Failures        *proposalDelayController
 	LearningOptions learningOptions
 	Learning        *learningManager
-	Backoff         requestTimeoutBackoffOptions
 	Network         *networkTransport
 	Replies         *clientReplyDispatcher
 }
@@ -138,31 +136,23 @@ func newNode(
 	config.SpeedUpViewChange = false
 	config.DecisionsPerLeader = 0
 	n.configuration = config
-	timeoutBackoff, err := newRequestTimeoutBackoff(config.RequestForwardTimeout+config.RequestComplainTimeout, opts.Backoff)
-	if err != nil {
-		writeAheadLog.Close()
-		return nil, fmt.Errorf("create request timeout backoff for node %d: %w", id, err)
-	}
-	n.timeoutBackoff = timeoutBackoff
 
 	n.consensus = &smartbft.Consensus{
-		Config:                    config,
-		ViewChangerTicker:         n.viewClock.C,
-		Scheduler:                 n.clock.C,
-		Logger:                    logger,
-		Metrics:                   bftmet,
-		Comm:                      n,
-		Signer:                    n,
-		MembershipNotifier:        n,
-		Verifier:                  n,
-		Application:               n,
-		Assembler:                 n,
-		RequestInspector:          n,
-		Synchronizer:              n,
-		WAL:                       writeAheadLog,
-		RequestTimeout:            n.onRequestTimeoutBackoff,
-		ViewEvent:                 n.onViewEvent,
-		ExternalViewChangeBackoff: opts.Backoff.Enabled,
+		Config:             config,
+		ViewChangerTicker:  n.viewClock.C,
+		Scheduler:          n.clock.C,
+		Logger:             logger,
+		Metrics:            bftmet,
+		Comm:               n,
+		Signer:             n,
+		MembershipNotifier: n,
+		Verifier:           n,
+		Application:        n,
+		Assembler:          n,
+		RequestInspector:   n,
+		Synchronizer:       n,
+		WAL:                writeAheadLog,
+		ViewEvent:          n.onViewEvent,
 		Metadata: &smartbftprotos.ViewMetadata{
 			LatestSequence: 0,
 			ViewId:         0,
@@ -685,7 +675,6 @@ func (n *node) Deliver(proposal bft.Proposal, signatures []bft.Signature) bft.Re
 		Latencies:    applied.latencies,
 		Timeout:      n.learning.currentTimeoutValue(),
 	})
-	n.onCommitBackoff(md.GetViewId(), md.GetLatestSequence())
 	if md.GetLatestSequence() == 1 || md.GetLatestSequence()%500 == 0 || applied.elapsed > 100*time.Millisecond {
 		fmt.Printf("%s delivered: node=%d view=%d seq=%d batch=%d post_decision_ms=%d state_accounts=%d\n",
 			timestampedLogTag("sync"), n.id, md.GetViewId(), md.GetLatestSequence(), applied.batchSize,
@@ -696,18 +685,10 @@ func (n *node) Deliver(proposal bft.Proposal, signatures []bft.Signature) bft.Re
 }
 
 func (n *node) applyBaseRequestTimeout(timeout time.Duration, source string) (bft.Configuration, error) {
-	if n.timeoutBackoff != nil && n.timeoutBackoff.state().Enabled {
-		update, err := n.timeoutBackoff.setBaseTimeout(timeout)
-		if err != nil {
-			return n.configuration, err
-		}
-		return n.applyEffectiveTimeouts(update.State, source)
-	}
-
-	// Keep the view-change timers tied to the learned request timeout, mirroring
-	// applyEffectiveTimeouts. ApplyViewChangeTimeout must run first: it clamps the
-	// resend interval down to the new timeout, and the explicit resend call after it
-	// raises the interval again when the timeout grows.
+	// Keep the view-change timers tied to the learned request timeout.
+	// ApplyViewChangeTimeout must run first: it clamps the resend interval down
+	// to the new timeout, and the explicit resend call after it raises the
+	// interval again when the timeout grows.
 	config, err := n.consensus.ApplyViewChangeTimeout(timeout)
 	if err != nil {
 		return config, err
@@ -726,90 +707,10 @@ func (n *node) applyBaseRequestTimeout(timeout time.Duration, source string) (bf
 	return config, nil
 }
 
-func (n *node) onRequestTimeoutBackoff(view uint64) {
-	update := n.timeoutBackoff.onRequestTimeout(view)
-	if !update.Log {
-		return
-	}
-	fmt.Printf("%s request timeout: node=%d view=%d base_timeout_ms=%d multiplier=%d effective_timeout_ms=%d max_timeout_ms=%d applied=%t\n",
-		timestampedLogTag("backoff"), n.id, view, update.State.BaseTimeout.Milliseconds(), update.State.Multiplier,
-		update.State.EffectiveTimeout.Milliseconds(), update.State.MaxTimeout.Milliseconds(), update.Apply)
-}
-
-func (n *node) onNoProgressViewChangeBackoff(targetView uint64) {
-	update := n.timeoutBackoff.onNoProgressViewChange(targetView)
-	if !update.Log {
-		return
-	}
-	n.learning.recordNoProgressViewChange()
-	if update.Apply {
-		if _, err := n.applyEffectiveTimeouts(update.State, "backoff-view-change"); err != nil {
-			n.logger.Errorf("node %d failed to apply timeout backoff after view change to %d: %v", n.id, targetView, err)
-			return
-		}
-	}
-	fmt.Printf("%s no-progress view change: node=%d target_view=%d base_timeout_ms=%d multiplier=%d effective_timeout_ms=%d effective_view_change_timeout_ms=%d effective_view_change_resend_ms=%d max_timeout_ms=%d applied=%t\n",
-		timestampedLogTag("backoff"), n.id, targetView, update.State.BaseTimeout.Milliseconds(), update.State.Multiplier,
-		update.State.EffectiveTimeout.Milliseconds(), update.State.EffectiveViewChangeTimeout.Milliseconds(),
-		update.State.EffectiveViewChangeResendInterval.Milliseconds(), update.State.MaxTimeout.Milliseconds(), update.Apply)
-}
-
-func (n *node) onCommitBackoff(view uint64, sequence uint64) {
-	update := n.timeoutBackoff.onCommit(view, sequence)
-	if !update.Log {
-		return
-	}
-	if update.Apply {
-		if _, err := n.applyEffectiveTimeouts(update.State, "backoff-commit"); err != nil {
-			n.logger.Errorf("node %d failed to apply request timeout backoff after commit view=%d seq=%d: %v", n.id, view, sequence, err)
-			return
-		}
-	}
-	if update.Decayed {
-		fmt.Printf("%s decay: node=%d view=%d seq=%d base_timeout_ms=%d previous_multiplier=%d multiplier=%d previous_effective_timeout_ms=%d effective_timeout_ms=%d previous_effective_view_change_timeout_ms=%d effective_view_change_timeout_ms=%d previous_effective_view_change_resend_ms=%d effective_view_change_resend_ms=%d max_timeout_ms=%d applied=%t\n",
-			timestampedLogTag("backoff"), n.id, view, sequence, update.State.BaseTimeout.Milliseconds(),
-			update.Previous.Multiplier, update.State.Multiplier,
-			update.Previous.EffectiveTimeout.Milliseconds(), update.State.EffectiveTimeout.Milliseconds(),
-			update.Previous.EffectiveViewChangeTimeout.Milliseconds(), update.State.EffectiveViewChangeTimeout.Milliseconds(),
-			update.Previous.EffectiveViewChangeResendInterval.Milliseconds(), update.State.EffectiveViewChangeResendInterval.Milliseconds(),
-			update.State.MaxTimeout.Milliseconds(), update.Apply)
-	}
-	fmt.Printf("%s committed: node=%d view=%d seq=%d base_timeout_ms=%d multiplier=%d effective_timeout_ms=%d effective_view_change_timeout_ms=%d effective_view_change_resend_ms=%d max_timeout_ms=%d applied=%t\n",
-		timestampedLogTag("backoff"), n.id, view, sequence, update.State.BaseTimeout.Milliseconds(), update.State.Multiplier,
-		update.State.EffectiveTimeout.Milliseconds(), update.State.EffectiveViewChangeTimeout.Milliseconds(),
-		update.State.EffectiveViewChangeResendInterval.Milliseconds(), update.State.MaxTimeout.Milliseconds(), update.Apply)
-}
-
-func (n *node) applyEffectiveTimeouts(state requestTimeoutBackoffState, source string) (bft.Configuration, error) {
-	config, err := n.consensus.ApplyViewChangeTimeout(state.BaseTimeout)
-	if err != nil {
-		return config, err
-	}
-	if err := n.consensus.ApplyViewChangeBackoffFactor(uint64(state.Multiplier)); err != nil {
-		return config, err
-	}
-	if err := n.consensus.ApplyViewChangeResendInterval(state.EffectiveViewChangeResendInterval); err != nil {
-		return config, err
-	}
-	config, err = n.consensus.ApplyRequestTimeout(state.EffectiveTimeout)
-	if err != nil {
-		return config, err
-	}
-	n.configuration = config
-	fmt.Printf("%s applied SmartBFT timeouts: node=%d source=%s base_timeout_ms=%d multiplier=%d effective_timeout_ms=%d effective_view_change_timeout_ms=%d effective_view_change_resend_ms=%d max_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d view_change_timeout_ms=%d view_change_backoff_factor=%d\n",
-		timestampedLogTag("backoff"), n.id, source, state.BaseTimeout.Milliseconds(), state.Multiplier,
-		state.EffectiveTimeout.Milliseconds(), state.EffectiveViewChangeTimeout.Milliseconds(),
-		state.EffectiveViewChangeResendInterval.Milliseconds(), state.MaxTimeout.Milliseconds(),
-		config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds(),
-		config.ViewChangeTimeout.Milliseconds(), state.Multiplier)
-	return config, nil
-}
-
 func (n *node) onViewEvent(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string) {
 	n.recordObservedView(currentView, nextView, proposalSeq)
 	if event == "start_view_change" {
 		n.learning.recordViewChange()
-		n.onNoProgressViewChangeBackoff(nextView)
 	}
 }
 

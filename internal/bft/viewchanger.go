@@ -108,7 +108,6 @@ type ViewChanger struct {
 	ResendTimeout       time.Duration
 	lastResend          time.Time
 	ViewChangeTimeout   time.Duration
-	ExternalBackoff     bool
 	startViewChangeTime time.Time
 	checkTimeout        bool
 	backOffFactor       uint64
@@ -403,13 +402,6 @@ func signedViewDataDetail(svd *protos.SignedViewData) string {
 	)
 }
 
-func (v *ViewChanger) SetBackOffFactor(factor uint64) {
-	if factor == 0 {
-		factor = 1
-	}
-	v.backOffFactor = factor
-}
-
 func (v *ViewChanger) checkIfResendViewChange(now time.Time) {
 	nextTimeout := v.lastResend.Add(v.ResendTimeout)
 	if nextTimeout.After(now) { // check if it is time to resend
@@ -438,17 +430,9 @@ func (v *ViewChanger) checkIfTimeout(now time.Time) bool {
 		return false
 	}
 	v.Logger.Debugf("Node %d got a view change timeout, the current view is %d", v.SelfID, v.currView)
-	if v.ExternalBackoff {
-		v.emitViewEvent("view_change_timeout", v.currView, v.nextView, 0, fmt.Sprintf("adaptive_view_backoff_factor=%d", v.backOffFactor))
-	} else {
-		v.emitViewEvent("view_change_timeout", v.currView, v.nextView, 0, fmt.Sprintf("next_view_change_backoff_factor=%d", v.backOffFactor+1))
-	}
+	v.emitViewEvent("view_change_timeout", v.currView, v.nextView, 0, fmt.Sprintf("next_view_change_backoff_factor=%d", v.backOffFactor+1))
 	v.checkTimeout = false // stop timeout for now, a new one will start when a new view change begins
-	if !v.ExternalBackoff {
-		v.backOffFactor++ // next timeout will be longer
-	} else {
-		v.startViewChangeTime = now
-	}
+	v.backOffFactor++      // next timeout will be longer
 	// the timeout has passed, something went wrong, try sync and complain
 	v.Logger.Debugf("Node %d is calling sync because it got a view change timeout", v.SelfID)
 	v.Synchronizer.Sync()
@@ -596,9 +580,7 @@ func (v *ViewChanger) informNewView(view uint64) {
 	v.viewChangeMsgs.clear(v.N)
 	v.viewDataMsgs.clear(v.N)
 	v.checkTimeout = false
-	if !v.ExternalBackoff {
-		v.backOffFactor = 1 // reset
-	}
+	v.backOffFactor = 1 // reset
 	v.emitViewEvent(
 		"inform_new_view_clear",
 		oldCurrView,
@@ -1552,9 +1534,7 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 	v.Controller.ViewChanged(v.currView, mySequence+1)
 
 	v.checkTimeout = false
-	if !v.ExternalBackoff {
-		v.backOffFactor = 1 // reset
-	}
+	v.backOffFactor = 1 // reset
 }
 
 func (v *ViewChanger) deliverDecision(proposal types.Proposal, signatures []types.Signature) {

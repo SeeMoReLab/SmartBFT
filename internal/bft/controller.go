@@ -115,7 +115,6 @@ type Controller struct {
 	State              State
 	InFlight           *InFlightData
 	MetricsView        *api.MetricsView
-	RequestTimeout     func(view uint64)
 	ViewEvent          func(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string)
 	quorum             int
 
@@ -298,10 +297,6 @@ func (c *Controller) addRequest(info types.RequestInfo, request []byte) error {
 // OnRequestTimeout is called when request-timeout expires and forwards the request to leader.
 // Called by the request-pool timeout goroutine. Upon return, the leader-forward timeout is started.
 func (c *Controller) OnRequestTimeout(request []byte, info types.RequestInfo) {
-	if c.RequestTimeout != nil {
-		c.RequestTimeout(c.getCurrentViewNumber())
-	}
-
 	iAm, leaderID := c.iAmTheLeader()
 	tracePrintf("%s event=election_trigger node=%d reason=request_timeout curr_view=%d next_view=%d last_committed_seq=%d proposal_seq=%d leader=%d i_am_leader=%t stop_view=false request=%s\n",
 		traceLogTag("trace"), c.ID, c.getCurrentViewNumber(), c.getCurrentViewNumber()+1, c.latestSeq(), c.diagnosticProposalSeq(), leaderID, iAm, info)

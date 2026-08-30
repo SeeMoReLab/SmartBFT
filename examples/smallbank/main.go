@@ -36,10 +36,10 @@ func main() {
 		startUnixMS     = flag.Int64("start-unix-ms", 0, "absolute Unix epoch time in ms for benchmark start")
 		failureSpec     = flag.String("failure-spec", "", "failure_spec.xml path; only pbft/proposalDelay is applied")
 		failureStartMS  = flag.Int64("failure-start-unix-ms", -1, "absolute Unix epoch time in ms for failure schedule start")
-		learning        = flag.Bool("learning", false, "enable PBFT learning-agent reports and recommendation polling")
+		learning        = flag.Bool("learning", false, "enable SmartBFT learning-agent reports and recommendation polling")
 		learningNodeID  = flag.Uint64("learning-node-id", 1, "SmartBFT node ID that sends learning reports")
 		agentTarget     = flag.String("agent-target", "", "learning agent gRPC target, for example 127.0.0.1:50051")
-		initialTimeout  = flag.Duration("learning-initial-election-timeout", 5*time.Second, "initial PBFT timeout value reported to the learning agent")
+		initialTimeout  = flag.Duration("learning-initial-election-timeout", 5*time.Second, "initial SmartBFT timeout value reported to the learning agent")
 		windowModeFlag  = flag.String("learning-window-mode", string(learningWindowModeConsensus), "learning episode boundaries: consensus or wall-clock")
 		reportTicks     = flag.Uint64("learning-report-tick-interval", defaultLearningReportTickInterval, "consensus ticks between learning report checks")
 		reportTrigger   = flag.Duration("learning-report-trigger", defaultLearningReportTrigger, "minimum elapsed time before the first learning report")
@@ -50,8 +50,6 @@ func main() {
 		replyWait       = flag.Duration("learning-reply-wait", defaultLearningReplyWait, "time to wait before applying a recommendation in wall-clock mode")
 		warmupDuration  = flag.Duration("learning-warmup-duration", defaultLearningWarmupDuration, "post-apply warm-up duration in wall-clock mode")
 		rewardDuration  = flag.Duration("learning-reward-duration", defaultLearningRewardDuration, "reward collection duration in wall-clock mode")
-		backoff         = flag.Bool("request-timeout-backoff", false, "enable request timeout backoff for SmartBFT forward/complain timers")
-		backoffMax      = flag.Duration("request-timeout-backoff-max", 10*time.Second, "maximum effective SmartBFT request timeout when backoff is enabled")
 		dataDir         = flag.String("data-dir", "", "directory for SmartBFT WAL data; defaults to a temporary directory")
 		keepData        = flag.Bool("keep-data", false, "keep generated WAL data when using a temporary data directory")
 		verbose         = flag.Bool("verbose", false, "enable SmartBFT debug logs")
@@ -88,10 +86,6 @@ func main() {
 		WarmupDuration:     *warmupDuration,
 		RewardDuration:     *rewardDuration,
 	}
-	backoffOptions := requestTimeoutBackoffOptions{
-		Enabled:    *backoff,
-		MaxTimeout: *backoffMax,
-	}
 	logMode := smallBankLogModeQuiet
 	if *verbose {
 		logMode = smallBankLogModeDebug
@@ -99,9 +93,9 @@ func main() {
 
 	switch *role {
 	case "inprocess":
-		runInProcess(*configPath, *nodes, *batchSize, *batchTimeout, *requestTimeout, *create, *execute, *createWorkers, *startUnixMS, *failureSpec, *failureStartMS, learningOptions, backoffOptions, *dataDir, *keepData, logMode)
+		runInProcess(*configPath, *nodes, *batchSize, *batchTimeout, *requestTimeout, *create, *execute, *createWorkers, *startUnixMS, *failureSpec, *failureStartMS, learningOptions, *dataDir, *keepData, logMode)
 	case "server":
-		runNetworkServer(*nodeID, *hostsConfig, *batchSize, *batchTimeout, *requestTimeout, *failureSpec, *failureStartMS, *startUnixMS, learningOptions, backoffOptions, *dataDir, *keepData, logMode)
+		runNetworkServer(*nodeID, *hostsConfig, *batchSize, *batchTimeout, *requestTimeout, *failureSpec, *failureStartMS, *startUnixMS, learningOptions, *dataDir, *keepData, logMode)
 	case "client":
 		if !*create && !*execute {
 			*create = true
@@ -113,7 +107,7 @@ func main() {
 	}
 }
 
-func runInProcess(configPath string, nodes int, batchSize uint64, batchTimeout time.Duration, requestTimeout time.Duration, create bool, execute bool, createWorkers int, startUnixMS int64, failureSpec string, failureStartMS int64, learning learningOptions, backoff requestTimeoutBackoffOptions, dataDir string, keepData bool, logMode smallBankLogMode) {
+func runInProcess(configPath string, nodes int, batchSize uint64, batchTimeout time.Duration, requestTimeout time.Duration, create bool, execute bool, createWorkers int, startUnixMS int64, failureSpec string, failureStartMS int64, learning learningOptions, dataDir string, keepData bool, logMode smallBankLogMode) {
 	cfg, err := loadWorkloadConfig(configPath)
 	if err != nil {
 		fatalf("load config: %v", err)
@@ -143,7 +137,6 @@ func runInProcess(configPath string, nodes int, batchSize uint64, batchTimeout t
 		BatchTimeout:    batchTimeout,
 		Failures:        failures,
 		LearningOptions: learning,
-		Backoff:         backoff,
 	}, dir, logMode)
 	if err != nil {
 		fatalf("start cluster: %v", err)
@@ -168,7 +161,7 @@ func runInProcess(configPath string, nodes int, batchSize uint64, batchTimeout t
 	printChecksums(cluster.stateChecksums())
 }
 
-func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batchTimeout time.Duration, requestTimeout time.Duration, failureSpec string, failureStartMS int64, startUnixMS int64, learning learningOptions, backoff requestTimeoutBackoffOptions, dataDir string, keepData bool, logMode smallBankLogMode) {
+func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batchTimeout time.Duration, requestTimeout time.Duration, failureSpec string, failureStartMS int64, startUnixMS int64, learning learningOptions, dataDir string, keepData bool, logMode smallBankLogMode) {
 	if nodeID == 0 {
 		fatalf("--role server requires --node-id")
 	}
@@ -202,7 +195,6 @@ func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batch
 		BatchTimeout:    batchTimeout,
 		Failures:        failures,
 		LearningOptions: learning,
-		Backoff:         backoff,
 	}, dir, logMode, requestTimeout)
 	if err != nil {
 		fatalf("start server: %v", err)
