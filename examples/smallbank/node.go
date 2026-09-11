@@ -60,6 +60,18 @@ type node struct {
 	network        *networkTransport
 	replies        *clientReplyDispatcher
 
+	// sendLines hold outgoing consensus messages per peer while an injected
+	// proposal delay is active. They are created on first use so that both
+	// the gRPC and the in-memory transports go through the same path.
+	sendLinesLock sync.Mutex
+	sendLines     map[uint64]*proposalSendLine
+	// lastDelayedProposal de-duplicates the proposal delay log line across
+	// the per-peer sends of one broadcast.
+	lastDelayedProposal struct {
+		view, seq uint64
+		valid     bool
+	}
+
 	// State transfer history is authoritative for sync discovery. It keeps a
 	// small number of immutable checkpoint generations and the certified
 	// decisions following the oldest retained checkpoint. The latest fields are
@@ -242,6 +254,7 @@ func (n *node) stop() {
 	n.clock.Stop()
 	n.viewClock.Stop()
 	n.consensus.Stop()
+	n.stopSendLines()
 	n.learning.close()
 	n.replies.close()
 	n.doneWG.Wait()
@@ -304,13 +317,69 @@ func (n *node) Nodes() []uint64 {
 }
 
 func (n *node) SendConsensus(targetID uint64, message *smartbftprotos.Message) {
-	if n.network != nil {
-		n.network.sendConsensus(targetID, proto.Clone(message).(*smartbftprotos.Message))
+	clone := proto.Clone(message).(*smartbftprotos.Message)
+	deliver := func() {
+		if n.network != nil {
+			n.network.sendConsensus(targetID, clone)
+			return
+		}
+		n.out[targetID] <- wireMessage{from: n.id, msg: clone}
+	}
+	view, ordered := consensusMessageView(message)
+	if !ordered {
+		deliver()
 		return
 	}
-	out := n.out[targetID]
-	clone := proto.Clone(message)
-	out <- wireMessage{from: n.id, msg: clone}
+	var delay time.Duration
+	if pp := message.GetPrePrepare(); pp != nil {
+		delay = n.proposalSendDelay(pp)
+	}
+	n.sendLine(targetID).submit(view, delay, deliver)
+}
+
+// proposalSendDelay returns the injected delay for one of this replica's own
+// proposals and logs it once per proposal.
+func (n *node) proposalSendDelay(pp *smartbftprotos.PrePrepare) time.Duration {
+	delay := n.failures.delayForProposal(n.id, n.consensus.GetLeaderID(), n.Nodes())
+	if delay <= 0 {
+		return 0
+	}
+	n.sendLinesLock.Lock()
+	logged := n.lastDelayedProposal.valid && n.lastDelayedProposal.view == pp.View && n.lastDelayedProposal.seq == pp.Seq
+	n.lastDelayedProposal.view, n.lastDelayedProposal.seq, n.lastDelayedProposal.valid = pp.View, pp.Seq, true
+	n.sendLinesLock.Unlock()
+	if !logged {
+		fmt.Printf("Applying proposal delay: node=%d replica=%d delay_ms=%d view=%d seq=%d\n",
+			n.id, smartNodeIDToFailureReplicaID(n.id), delay.Milliseconds(), pp.View, pp.Seq)
+	}
+	return delay
+}
+
+func (n *node) sendLine(targetID uint64) *proposalSendLine {
+	n.sendLinesLock.Lock()
+	defer n.sendLinesLock.Unlock()
+	if line, exists := n.sendLines[targetID]; exists {
+		return line
+	}
+	if n.sendLines == nil {
+		n.sendLines = make(map[uint64]*proposalSendLine)
+	}
+	line := newProposalSendLine(func(view uint64) {
+		smallbankTracePrintf("%s event=proposal_delay_dropped_stale node=%d to=%d view=%d\n",
+			timestampedLogTag("trace"), n.id, targetID, view)
+	})
+	n.sendLines[targetID] = line
+	return line
+}
+
+func (n *node) stopSendLines() {
+	n.sendLinesLock.Lock()
+	lines := n.sendLines
+	n.sendLines = nil
+	n.sendLinesLock.Unlock()
+	for _, line := range lines {
+		line.stop()
+	}
 }
 
 func (n *node) SendTransaction(targetID uint64, request []byte) {
@@ -530,13 +599,11 @@ func (n *node) RequestsFromProposal(proposal bft.Proposal) []bft.RequestInfo {
 	return requests
 }
 
+// AssembleProposal builds the proposal immediately. An injected proposal delay
+// is applied when the pre-prepare leaves the replica (see SendConsensus), so the
+// controller's run loop never blocks and the replica keeps voting and taking
+// part in view changes while its proposal is held back.
 func (n *node) AssembleProposal(metadata []byte, requests [][]byte) bft.Proposal {
-	if delay := n.failures.delayForProposal(n.id, n.consensus.GetLeaderID(), n.Nodes()); delay > 0 {
-		fmt.Printf("Applying proposal delay: node=%d replica=%d delay_ms=%d\n",
-			n.id, smartNodeIDToFailureReplicaID(n.id), delay.Milliseconds())
-		time.Sleep(delay)
-	}
-
 	payload := encodeBlockData(blockData{Requests: requests})
 	md := &smartbftprotos.ViewMetadata{}
 	if err := proto.Unmarshal(metadata, md); err != nil {
