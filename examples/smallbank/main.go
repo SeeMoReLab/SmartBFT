@@ -27,7 +27,6 @@ func main() {
 		batchSize       = flag.Uint64("batch-size", 100, "maximum SmartBFT request batch size")
 		batchTimeout    = flag.Duration("batch-timeout", 50*time.Millisecond, "maximum SmartBFT request batch interval")
 		requestTimeout  = flag.Duration("request-timeout", 30*time.Second, "timeout waiting for a request to be delivered")
-		submitModeFlag  = flag.String("submit-mode", string(submitModeBroadcast), "network client submit mode: broadcast or leader")
 		replyListen     = flag.String("client-reply-listen", "127.0.0.1:0", "client reply listener address for broadcast mode")
 		replyAdvertise  = flag.String("client-reply-advertise-host", "", "host/IP advertised to servers for client replies; empty uses listener address")
 		create          = flag.Bool("create", false, "create initial SmallBank accounts before executing")
@@ -56,10 +55,6 @@ func main() {
 	)
 	flag.Parse()
 
-	mode, err := parseSubmitMode(*submitModeFlag)
-	if err != nil {
-		fatalf("%v", err)
-	}
 	windowMode, err := parseLearningWindowMode(*windowModeFlag)
 	if err != nil {
 		fatalf("%v", err)
@@ -95,13 +90,13 @@ func main() {
 	case "inprocess":
 		runInProcess(*configPath, *nodes, *batchSize, *batchTimeout, *requestTimeout, *create, *execute, *createWorkers, *startUnixMS, *failureSpec, *failureStartMS, learningOptions, *dataDir, *keepData, logMode)
 	case "server":
-		runNetworkServer(*nodeID, *hostsConfig, *batchSize, *batchTimeout, *requestTimeout, *failureSpec, *failureStartMS, *startUnixMS, learningOptions, *dataDir, *keepData, logMode)
+		runNetworkServer(*nodeID, *hostsConfig, *batchSize, *batchTimeout, *failureSpec, *failureStartMS, *startUnixMS, learningOptions, *dataDir, *keepData, logMode)
 	case "client":
 		if !*create && !*execute {
 			*create = true
 			*execute = true
 		}
-		runNetworkClient(*configPath, *hostsConfig, *requestTimeout, mode, *replyListen, *replyAdvertise, *create, *execute, *createWorkers, *startUnixMS)
+		runNetworkClient(*configPath, *hostsConfig, *requestTimeout, *replyListen, *replyAdvertise, *create, *execute, *createWorkers, *startUnixMS)
 	default:
 		fatalf("unknown --role %q; expected inprocess, server, or client", *role)
 	}
@@ -161,7 +156,7 @@ func runInProcess(configPath string, nodes int, batchSize uint64, batchTimeout t
 	printChecksums(cluster.stateChecksums())
 }
 
-func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batchTimeout time.Duration, requestTimeout time.Duration, failureSpec string, failureStartMS int64, startUnixMS int64, learning learningOptions, dataDir string, keepData bool, logMode smallBankLogMode) {
+func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batchTimeout time.Duration, failureSpec string, failureStartMS int64, startUnixMS int64, learning learningOptions, dataDir string, keepData bool, logMode smallBankLogMode) {
 	if nodeID == 0 {
 		fatalf("--role server requires --node-id")
 	}
@@ -195,7 +190,7 @@ func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batch
 		BatchTimeout:    batchTimeout,
 		Failures:        failures,
 		LearningOptions: learning,
-	}, dir, logMode, requestTimeout)
+	}, dir, logMode)
 	if err != nil {
 		fatalf("start server: %v", err)
 	}
@@ -218,7 +213,7 @@ func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batch
 	}
 }
 
-func runNetworkClient(configPath string, hostsConfig string, requestTimeout time.Duration, submitMode submitMode, replyListen string, replyAdvertise string, create bool, execute bool, createWorkers int, startUnixMS int64) {
+func runNetworkClient(configPath string, hostsConfig string, requestTimeout time.Duration, replyListen string, replyAdvertise string, create bool, execute bool, createWorkers int, startUnixMS int64) {
 	if hostsConfig == "" {
 		fatalf("--role client requires --hosts-config")
 	}
@@ -231,12 +226,11 @@ func runNetworkClient(configPath string, hostsConfig string, requestTimeout time
 	if err != nil {
 		fatalf("load hosts config: %v", err)
 	}
-	client, err := newNetworkSmallBankClient(hosts, requestTimeout, submitMode, replyListen, replyAdvertise)
+	client, err := newNetworkSmallBankClient(hosts, requestTimeout, replyListen, replyAdvertise)
 	if err != nil {
 		fatalf("create network client: %v", err)
 	}
 	defer client.close()
-	fmt.Printf("Submit mode: %s\n", submitMode)
 	if err := client.waitForServers(30 * time.Second); err != nil {
 		fatalf("%v", err)
 	}

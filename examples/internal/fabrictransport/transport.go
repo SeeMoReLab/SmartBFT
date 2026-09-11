@@ -257,14 +257,53 @@ func (s *registeredServer) report(operation string, err error) {
 }
 
 // ClientConfig configures all operation streams to one remote endpoint.
+//
+// InitialWindowSize and InitialConnWindowSize pin the HTTP/2 flow-control
+// windows this client advertises for each stream and for the whole connection.
+// Zero keeps gRPC's defaults (64KB with dynamic BDP probing). A positive value
+// disables BDP probing and uses that static window, so a message larger than
+// the default window can be delivered in a single round trip even after the
+// stream has been idle. Both sides of a connection advertise their own receive
+// window, so a server that must accept large messages quickly needs the
+// matching FlowControlServerOptions.
 type ClientConfig struct {
-	SelfID            uint64
-	Address           string
-	QueueSize         int
-	SendTimeout       time.Duration
-	MaxReceiveMsgSize int
-	OnError           func(operation string, err error)
-	Dialer            func(context.Context, string) (net.Conn, error)
+	SelfID                uint64
+	Address               string
+	QueueSize             int
+	SendTimeout           time.Duration
+	MaxReceiveMsgSize     int
+	InitialWindowSize     int32
+	InitialConnWindowSize int32
+	OnError               func(operation string, err error)
+	Dialer                func(context.Context, string) (net.Conn, error)
+}
+
+// FlowControlServerOptions returns the gRPC server options that advertise
+// static HTTP/2 flow-control windows of the given sizes, mirroring the client
+// side fields of ClientConfig. Zero for either size keeps gRPC's default for
+// that window.
+func FlowControlServerOptions(initialWindowSize, initialConnWindowSize int32) ([]grpc.ServerOption, error) {
+	if err := validateFlowControlWindows(initialWindowSize, initialConnWindowSize); err != nil {
+		return nil, err
+	}
+	var options []grpc.ServerOption
+	if initialWindowSize > 0 {
+		options = append(options, grpc.InitialWindowSize(initialWindowSize))
+	}
+	if initialConnWindowSize > 0 {
+		options = append(options, grpc.InitialConnWindowSize(initialConnWindowSize))
+	}
+	return options, nil
+}
+
+func validateFlowControlWindows(initialWindowSize, initialConnWindowSize int32) error {
+	if initialWindowSize < 0 {
+		return fmt.Errorf("fabric transport initial window size must not be negative: %d", initialWindowSize)
+	}
+	if initialConnWindowSize < 0 {
+		return fmt.Errorf("fabric transport initial connection window size must not be negative: %d", initialConnWindowSize)
+	}
+	return nil
 }
 
 // Client owns one lazily-created stream per operation to one destination.
@@ -293,6 +332,9 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if config.SendTimeout <= 0 {
 		return nil, fmt.Errorf("fabric transport send timeout must be positive: %s", config.SendTimeout)
 	}
+	if err := validateFlowControlWindows(config.InitialWindowSize, config.InitialConnWindowSize); err != nil {
+		return nil, err
+	}
 
 	callOptions := []grpc.CallOption{
 		grpc.ForceCodec(wireCodec),
@@ -303,6 +345,12 @@ func NewClient(config ClientConfig) (*Client, error) {
 	dialOptions := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(callOptions...),
+	}
+	if config.InitialWindowSize > 0 {
+		dialOptions = append(dialOptions, grpc.WithInitialWindowSize(config.InitialWindowSize))
+	}
+	if config.InitialConnWindowSize > 0 {
+		dialOptions = append(dialOptions, grpc.WithInitialConnWindowSize(config.InitialConnWindowSize))
 	}
 	if config.Dialer != nil {
 		dialOptions = append(dialOptions, grpc.WithContextDialer(config.Dialer))

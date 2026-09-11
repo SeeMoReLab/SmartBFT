@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hyperledger-labs/SmartBFT/examples/internal/fabrictransport"
@@ -42,6 +41,18 @@ const (
 	operationStateTransfer    = "smallbank-state-transfer"
 	operationApplyTimeout     = "smallbank-apply-timeout"
 	operationClientReply      = "smallbank-client-reply"
+)
+
+// Static HTTP/2 flow-control windows for node-to-node connections. A SmartBFT
+// new-view message carries 2f+1 signed view-data entries, each holding the last
+// decision and the in-flight proposal, so it reaches a few hundred KB with
+// 256-transaction batches. With gRPC's default 64KB window such a message needs
+// several round trips, which under a 50ms one-way delay is longer than the
+// view-change timeout. The windows below let one new-view plus the following
+// pre-prepare travel in a single round trip.
+const (
+	consensusStreamWindowSize     = 4 << 20
+	consensusConnectionWindowSize = 8 << 20
 )
 
 type hostEntry struct {
@@ -115,7 +126,6 @@ type grpcTransactionRequest struct {
 
 type grpcSubmitRequest struct {
 	Payload      []byte
-	Mode         string
 	ReplyAddress string
 }
 
@@ -269,7 +279,7 @@ func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, e
 			continue
 		}
 		peerID := host.ID
-		client, err := newSmallBankFabricClient(selfID, host.address(), consensusQueueSize, func(operation string, err error) {
+		client, err := newSmallBankFabricClient(selfID, host.address(), consensusQueueSize, consensusFlowControl, func(operation string, err error) {
 			smallbankTracePrintf("%s event=stream_failed node=%d to=%d operation=%s err=%q\n",
 				timestampedLogTag("trace"), selfID, peerID, operation, err.Error())
 		})
@@ -282,19 +292,38 @@ func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, e
 	return t, nil
 }
 
+// flowControlWindows selects the HTTP/2 flow-control windows a client
+// advertises. Zero values keep gRPC's defaults.
+type flowControlWindows struct {
+	stream     int32
+	connection int32
+}
+
+var (
+	// consensusFlowControl is used for node-to-node connections, which carry
+	// large view-change and proposal messages.
+	consensusFlowControl = flowControlWindows{stream: consensusStreamWindowSize, connection: consensusConnectionWindowSize}
+	// defaultFlowControl is used for client submit and reply connections,
+	// whose messages are individual transactions and fit the default window.
+	defaultFlowControl = flowControlWindows{}
+)
+
 func newSmallBankFabricClient(
 	selfID uint64,
 	target string,
 	queueSize int,
+	windows flowControlWindows,
 	onError func(operation string, err error),
 ) (*fabrictransport.Client, error) {
 	return fabrictransport.NewClient(fabrictransport.ClientConfig{
-		SelfID:            selfID,
-		Address:           target,
-		QueueSize:         queueSize,
-		SendTimeout:       defaultNetworkSendTimeout,
-		MaxReceiveMsgSize: syncMaxReceiveMessageSize,
-		OnError:           onError,
+		SelfID:                selfID,
+		Address:               target,
+		QueueSize:             queueSize,
+		SendTimeout:           defaultNetworkSendTimeout,
+		MaxReceiveMsgSize:     syncMaxReceiveMessageSize,
+		InitialWindowSize:     windows.stream,
+		InitialConnWindowSize: windows.connection,
+		OnError:               onError,
 	})
 }
 
@@ -607,7 +636,7 @@ func (d *clientReplyDispatcher) close() {
 }
 
 func newReplySender(address string, selfID uint64) (*replySender, error) {
-	client, err := newSmallBankFabricClient(selfID, address, clientQueueSize, func(operation string, err error) {
+	client, err := newSmallBankFabricClient(selfID, address, clientQueueSize, defaultFlowControl, func(operation string, err error) {
 		fmt.Printf("SmallBank reply stream to %s failed: operation=%s err=%v\n", address, operation, err)
 	})
 	if err != nil {
@@ -642,7 +671,6 @@ func newSubmitSender(host hostEntry, client *fabrictransport.Client, replyAddres
 func (s *submitSender) enqueue(_ request, raw []byte) {
 	payload, err := fabrictransport.Marshal(&grpcSubmitRequest{
 		Payload:      append([]byte(nil), raw...),
-		Mode:         string(submitModeBroadcast),
 		ReplyAddress: s.replyAddress,
 	})
 	if err != nil {
@@ -657,12 +685,11 @@ func (s *submitSender) enqueue(_ request, raw []byte) {
 func (s *submitSender) close() {}
 
 type networkNodeServer struct {
-	node           *node
-	host           hostEntry
-	grpcServer     *grpc.Server
-	listener       net.Listener
-	requestTimeout time.Duration
-	closeOnce      sync.Once
+	node       *node
+	host       hostEntry
+	grpcServer *grpc.Server
+	listener   net.Listener
+	closeOnce  sync.Once
 }
 
 func newNetworkNodeServer(
@@ -671,7 +698,6 @@ func newNetworkNodeServer(
 	opts nodeOptions,
 	dataDir string,
 	logMode smallBankLogMode,
-	requestTimeout time.Duration,
 ) (*networkNodeServer, error) {
 	host, exists := hostByID(hosts, id)
 	if !exists {
@@ -725,6 +751,14 @@ func newNetworkNodeServer(
 	}
 	localNode = n
 
+	// The node server accepts consensus and state-transfer streams from peers,
+	// so its receive windows must match the peers' consensusFlowControl.
+	serverOptions, err := fabrictransport.FlowControlServerOptions(consensusFlowControl.stream, consensusFlowControl.connection)
+	if err != nil {
+		n.stop()
+		transport.close()
+		return nil, err
+	}
 	listener, err := net.Listen("tcp", host.address())
 	if err != nil {
 		n.stop()
@@ -732,11 +766,10 @@ func newNetworkNodeServer(
 		return nil, err
 	}
 	s := &networkNodeServer{
-		node:           n,
-		host:           host,
-		listener:       listener,
-		grpcServer:     grpc.NewServer(),
-		requestTimeout: requestTimeout,
+		node:       n,
+		host:       host,
+		listener:   listener,
+		grpcServer: grpc.NewServer(serverOptions...),
 	}
 	if err := fabrictransport.RegisterServer(s.grpcServer, s, fabrictransport.ServerConfig{
 		SendTimeout: defaultNetworkSendTimeout,
@@ -808,25 +841,14 @@ func (s *networkNodeServer) Handle(ctx context.Context, from uint64, operation s
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
 			return nil, fmt.Errorf("decode client submission: %w", err)
 		}
-		mode, err := parseSubmitMode(request.Mode)
+		decoded, err := decodeRequest(request.Payload)
 		if err != nil {
+			return nil, fmt.Errorf("decode broadcast submission: %w", err)
+		}
+		if err := s.acceptBroadcastSubmit(decoded, request); err != nil {
 			return nil, err
 		}
-		if mode == submitModeBroadcast {
-			decoded, err := decodeRequest(request.Payload)
-			if err != nil {
-				return nil, fmt.Errorf("decode broadcast submission: %w", err)
-			}
-			if err := s.acceptBroadcastSubmit(decoded, request); err != nil {
-				return nil, err
-			}
-			return fabrictransport.Marshal(&response{ClientID: decoded.ClientID, ID: decoded.ID, Status: statusSuccess})
-		}
-		result, err := s.Submit(ctx, request)
-		if err != nil {
-			return nil, err
-		}
-		return fabrictransport.Marshal(result)
+		return fabrictransport.Marshal(&response{ClientID: decoded.ClientID, ID: decoded.ID, Status: statusSuccess})
 	case operationStatus:
 		request := new(grpcStatusRequest)
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
@@ -904,49 +926,6 @@ func (s *networkNodeServer) Transaction(_ context.Context, req *grpcTransactionR
 	return &grpcAck{}, nil
 }
 
-func (s *networkNodeServer) Submit(ctx context.Context, req *grpcSubmitRequest) (*response, error) {
-	decoded, err := decodeRequest(req.Payload)
-	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "decode request: %v", err)
-	}
-
-	mode, err := parseSubmitMode(req.Mode)
-	if err != nil {
-		return nil, grpcstatus.Error(codes.InvalidArgument, err.Error())
-	}
-	leaderID := s.node.consensus.GetLeaderID()
-	if leaderID == 0 {
-		return nil, grpcstatus.Error(codes.Unavailable, "leader unavailable")
-	}
-	if mode == submitModeLeader && leaderID != s.node.id {
-		return nil, grpcstatus.Errorf(codes.FailedPrecondition, "not leader: leader=%d", leaderID)
-	}
-
-	if mode == submitModeBroadcast {
-		if err := s.acceptBroadcastSubmit(decoded, req); err != nil {
-			return nil, grpcstatus.Errorf(codes.Unavailable, "submit request: %v", err)
-		}
-		return &response{ClientID: decoded.ClientID, ID: decoded.ID, Status: statusSuccess}, nil
-	}
-
-	respCh, cancel := s.node.pending.register(decoded)
-	defer cancel()
-
-	if err := s.node.submitRequest(decoded.ClientID, decoded.ID, req.Payload); err != nil {
-		s.node.pending.fail(decoded, err)
-		return nil, grpcstatus.Errorf(codes.Unavailable, "submit request: %v", err)
-	}
-
-	waitCtx, cancelTimeout := context.WithTimeout(ctx, s.requestTimeout)
-	defer cancelTimeout()
-	select {
-	case resp := <-respCh:
-		return &resp, nil
-	case <-waitCtx.Done():
-		return nil, grpcstatus.Error(codes.DeadlineExceeded, waitCtx.Err().Error())
-	}
-}
-
 func (s *networkNodeServer) acceptBroadcastSubmit(decoded request, req *grpcSubmitRequest) error {
 	if req.ReplyAddress == "" {
 		return fmt.Errorf("broadcast submit missing reply address")
@@ -999,10 +978,7 @@ func (s *networkNodeServer) ApplyTimeout(_ context.Context, req *grpcApplyTimeou
 type networkSmallBankClient struct {
 	hosts          []hostEntry
 	clients        map[uint64]*fabrictransport.Client
-	next           atomic.Uint64
-	leader         atomic.Uint64
 	requestTimeout time.Duration
-	submitMode     submitMode
 	replyListen    string
 	replyAdvertise string
 	replyTracker   *replyTracker
@@ -1012,31 +988,11 @@ type networkSmallBankClient struct {
 	submitSenders  map[uint64]*submitSender
 }
 
-type submitMode string
-
-const (
-	submitModeBroadcast submitMode = "broadcast"
-	submitModeLeader    submitMode = "leader"
-)
-
-func parseSubmitMode(value string) (submitMode, error) {
-	switch submitMode(value) {
-	case "":
-		return submitModeLeader, nil
-	case submitModeBroadcast:
-		return submitModeBroadcast, nil
-	case submitModeLeader:
-		return submitModeLeader, nil
-	default:
-		return "", fmt.Errorf("unknown submit mode %q; expected %q or %q", value, submitModeBroadcast, submitModeLeader)
-	}
-}
-
-func newNetworkSmallBankClient(hosts []hostEntry, requestTimeout time.Duration, mode submitMode, replyListen string, replyAdvertise string) (*networkSmallBankClient, error) {
+func newNetworkSmallBankClient(hosts []hostEntry, requestTimeout time.Duration, replyListen string, replyAdvertise string) (*networkSmallBankClient, error) {
 	clients := make(map[uint64]*fabrictransport.Client, len(hosts))
 	for _, host := range hosts {
 		hostID := host.ID
-		client, err := newSmallBankFabricClient(0, host.address(), clientQueueSize, func(operation string, err error) {
+		client, err := newSmallBankFabricClient(0, host.address(), clientQueueSize, defaultFlowControl, func(operation string, err error) {
 			fmt.Printf("SmallBank client stream to node %d failed: operation=%s err=%v\n", hostID, operation, err)
 		})
 		if err != nil {
@@ -1051,17 +1007,14 @@ func newNetworkSmallBankClient(hosts []hostEntry, requestTimeout time.Duration, 
 		hosts:          hosts,
 		clients:        clients,
 		requestTimeout: requestTimeout,
-		submitMode:     mode,
 		replyListen:    replyListen,
 		replyAdvertise: replyAdvertise,
 	}
-	if mode == submitModeBroadcast {
-		if err := client.startReplyServer(); err != nil {
-			client.close()
-			return nil, err
-		}
-		client.startSubmitSenders()
+	if err := client.startReplyServer(); err != nil {
+		client.close()
+		return nil, err
 	}
+	client.startSubmitSenders()
 	return client, nil
 }
 
@@ -1132,38 +1085,6 @@ func (c *networkSmallBankClient) invoke(ctx context.Context, req request) (respo
 		return response{}, err
 	}
 
-	if c.submitMode == submitModeBroadcast {
-		return c.invokeBroadcast(ctx, req, raw)
-	}
-	return c.invokeLeader(ctx, raw)
-}
-
-func (c *networkSmallBankClient) invokeLeader(ctx context.Context, raw []byte) (response, error) {
-	var lastErr error
-	for attempt := 0; attempt < len(c.hosts)+1; attempt++ {
-		host, ok := c.currentLeaderHost(ctx)
-		if !ok {
-			start := int(c.next.Add(1)-1) % len(c.hosts)
-			host = c.hosts[start]
-		}
-		var out response
-		err := callSmallBank(ctx, c.clients[host.ID], operationSubmit, &grpcSubmitRequest{
-			Payload: raw,
-			Mode:    string(submitModeLeader),
-		}, &out)
-		if err == nil {
-			return out, nil
-		}
-		lastErr = fmt.Errorf("node %d submit failed: %w", host.ID, err)
-		c.leader.Store(0)
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no SmartBFT servers configured")
-	}
-	return response{}, lastErr
-}
-
-func (c *networkSmallBankClient) invokeBroadcast(ctx context.Context, req request, raw []byte) (response, error) {
 	respCh, cancelWait := c.replyTracker.register(req)
 	defer cancelWait()
 
@@ -1182,37 +1103,6 @@ func (c *networkSmallBankClient) invokeBroadcast(ctx context.Context, req reques
 func (c *networkSmallBankClient) replyQuorum() int {
 	f := (len(c.hosts) - 1) / 3
 	return f + 1
-}
-
-func (c *networkSmallBankClient) currentLeaderHost(ctx context.Context) (hostEntry, bool) {
-	if leaderID := c.leader.Load(); leaderID != 0 {
-		if host, ok := hostByID(c.hosts, leaderID); ok {
-			return host, true
-		}
-	}
-	if leaderID := c.refreshLeader(ctx); leaderID != 0 {
-		if host, ok := hostByID(c.hosts, leaderID); ok {
-			return host, true
-		}
-	}
-	return hostEntry{}, false
-}
-
-func (c *networkSmallBankClient) refreshLeader(ctx context.Context) uint64 {
-	for _, host := range c.hosts {
-		statusCtx, cancel := context.WithTimeout(ctx, time.Second)
-		var status grpcStatusResponse
-		err := callSmallBank(statusCtx, c.clients[host.ID], operationStatus, &grpcStatusRequest{}, &status)
-		cancel()
-		if err != nil || !status.Running || status.Leader == 0 {
-			continue
-		}
-		if _, ok := c.clients[status.Leader]; ok {
-			c.leader.Store(status.Leader)
-			return status.Leader
-		}
-	}
-	return 0
 }
 
 func (c *networkSmallBankClient) waitForServers(timeout time.Duration) error {
@@ -1236,7 +1126,6 @@ func (c *networkSmallBankClient) waitForServers(timeout time.Duration) error {
 			ready++
 		}
 		if ready == len(c.hosts) && leaderID != 0 {
-			c.leader.Store(leaderID)
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)

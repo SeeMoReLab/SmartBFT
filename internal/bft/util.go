@@ -74,7 +74,7 @@ func tracePrintf(format string, args ...any) {
 	if !traceEnabled {
 		return
 	}
-	// fmt.Printf(format, args...)
+	fmt.Printf(format, args...)
 }
 
 func traceMessageSummary(m *protos.Message) string {

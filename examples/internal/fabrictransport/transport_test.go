@@ -6,6 +6,7 @@
 package fabrictransport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -246,3 +247,102 @@ type pipeAddress string
 
 func (a pipeAddress) Network() string { return "pipe" }
 func (a pipeAddress) String() string  { return string(a) }
+
+func TestFlowControlWindowsRejectNegativeSizes(t *testing.T) {
+	_, err := NewClient(ClientConfig{
+		SelfID:            1,
+		Address:           "passthrough:///fabrictransport-test",
+		QueueSize:         1,
+		SendTimeout:       time.Second,
+		InitialWindowSize: -1,
+	})
+	if err == nil {
+		t.Fatal("expected negative stream window to be rejected")
+	}
+	_, err = NewClient(ClientConfig{
+		SelfID:                1,
+		Address:               "passthrough:///fabrictransport-test",
+		QueueSize:             1,
+		SendTimeout:           time.Second,
+		InitialConnWindowSize: -1,
+	})
+	if err == nil {
+		t.Fatal("expected negative connection window to be rejected")
+	}
+	if _, err := FlowControlServerOptions(-1, 0); err == nil {
+		t.Fatal("expected negative server stream window to be rejected")
+	}
+	if _, err := FlowControlServerOptions(0, -1); err == nil {
+		t.Fatal("expected negative server connection window to be rejected")
+	}
+	options, err := FlowControlServerOptions(0, 0)
+	if err != nil {
+		t.Fatalf("zero windows must keep defaults: %v", err)
+	}
+	if len(options) != 0 {
+		t.Fatalf("zero windows must produce no server options, got %d", len(options))
+	}
+	options, err = FlowControlServerOptions(1<<20, 2<<20)
+	if err != nil {
+		t.Fatalf("positive windows: %v", err)
+	}
+	if len(options) != 2 {
+		t.Fatalf("expected one option per window, got %d", len(options))
+	}
+}
+
+func TestFlowControlWindowsCarryLargeMessages(t *testing.T) {
+	const streamWindow = 4 << 20
+	const connectionWindow = 8 << 20
+	// Larger than gRPC's default 64KB window and larger than the default
+	// connection window, so delivery depends on the advertised windows being
+	// honoured on both sides.
+	payload := bytes.Repeat([]byte("v"), 1<<20)
+
+	listener := newPipeListener()
+	serverOptions, err := FlowControlServerOptions(streamWindow, connectionWindow)
+	if err != nil {
+		t.Fatalf("server options: %v", err)
+	}
+	server := grpc.NewServer(serverOptions...)
+	err = RegisterServer(server, HandlerFunc(func(_ context.Context, _ uint64, _ string, payload []byte) ([]byte, error) {
+		return payload, nil
+	}), ServerConfig{SendTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("register server: %v", err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+		<-serveDone
+	})
+
+	client, err := NewClient(ClientConfig{
+		SelfID:                3,
+		Address:               "passthrough:///fabrictransport-test",
+		QueueSize:             1,
+		SendTimeout:           time.Second,
+		MaxReceiveMsgSize:     2 << 20,
+		InitialWindowSize:     streamWindow,
+		InitialConnWindowSize: connectionWindow,
+		Dialer: func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		},
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	echoed, err := client.Call(ctx, "echo", payload)
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !bytes.Equal(echoed, payload) {
+		t.Fatalf("echoed payload differs: got %d bytes, want %d", len(echoed), len(payload))
+	}
+}
