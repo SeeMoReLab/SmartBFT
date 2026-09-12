@@ -67,44 +67,13 @@ type Pool struct {
 	sizeBytes      uint64
 	delMap         map[types.RequestInfo]struct{}
 	delSlice       []types.RequestInfo
-
-	// Only the oldest pending request is timed. Timing every request makes the
-	// complaint threshold depend on queue depth instead of on progress: a deep
-	// backlog would complain about a leader that is committing at full speed.
-	// progress runs the forward -> complain chain for the head, and gc removes
-	// the head once it is older than AutoRemoveTimeout. Both move on to the
-	// next request when the head leaves the pool.
-	progress headTimer
-	gc       headTimer
 }
 
 // requestItem captures request related information
 type requestItem struct {
-	info              types.RequestInfo
 	request           []byte
+	timeout           *time.Timer
 	additionTimestamp time.Time
-}
-
-// headTimer is a timer that follows the request at the front of the FIFO.
-// gen invalidates callbacks that belong to an earlier arming.
-type headTimer struct {
-	timer  *time.Timer
-	owner  types.RequestInfo
-	active bool
-	gen    uint64
-}
-
-func (t *headTimer) stop() {
-	if t.timer != nil {
-		t.timer.Stop()
-		t.timer = nil
-	}
-	t.active = false
-	t.gen++
-}
-
-func (t *headTimer) tracks(info types.RequestInfo) bool {
-	return t.active && t.owner == info
 }
 
 // PoolOptions is the pool configuration
@@ -278,9 +247,17 @@ func (rp *Pool) Submit(request []byte) error {
 		return ErrReqAlreadyProcessed
 	}
 
+	to := time.AfterFunc(
+		rp.options.ForwardTimeout,
+		func() { rp.onRequestTO(reqCopy, reqInfo) },
+	)
+	if rp.stopped {
+		rp.logger.Debugf("pool stopped, submitting with a stopped timer, request: %s", reqInfo)
+		to.Stop()
+	}
 	reqItem := &requestItem{
-		info:              reqInfo,
 		request:           reqCopy,
+		timeout:           to,
 		additionTimestamp: time.Now(),
 	}
 
@@ -293,11 +270,7 @@ func (rp *Pool) Submit(request []byte) error {
 		rp.logger.Panicf("RequestPool map and list are of different length: map=%d, list=%d", len(rp.existMap), rp.fifo.Len())
 	}
 
-	if rp.stopped {
-		rp.logger.Debugf("pool stopped, submitting without a timer, request: %s", reqInfo)
-	}
-	rp.armTimers()
-	rp.logger.Debugf("Request %s submitted", reqInfo)
+	rp.logger.Debugf("Request %s submitted; started a timeout: %s", reqInfo, rp.options.ForwardTimeout)
 
 	// notify that a request was submitted
 	select {
@@ -402,30 +375,22 @@ func (rp *Pool) RemoveRequest(requestInfo types.RequestInfo) error {
 	rp.lock.Lock()
 	defer rp.lock.Unlock()
 
-	if !rp.removeLocked(requestInfo) {
+	element, exist := rp.existMap[requestInfo]
+	if !exist {
+		rp.moveToDelSlice(requestInfo)
 		errStr := fmt.Sprintf("request %s is not in the pool at remove time", requestInfo)
 		rp.logger.Debugf(errStr)
 		return errors.New(errStr)
 	}
-	return nil
-}
-
-// removeLocked removes the request if it is in the pool. Called with the lock held.
-func (rp *Pool) removeLocked(requestInfo types.RequestInfo) bool {
-	element, exist := rp.existMap[requestInfo]
-	if !exist {
-		rp.moveToDelSlice(requestInfo)
-		return false
-	}
 
 	rp.deleteRequest(element, requestInfo)
 	rp.sizeBytes -= uint64(len(element.Value.(*requestItem).request))
-	return true
+	return nil
 }
 
 func (rp *Pool) deleteRequest(element *list.Element, requestInfo types.RequestInfo) {
 	item := element.Value.(*requestItem)
-	wasHead := rp.fifo.Front() == element
+	item.timeout.Stop()
 
 	rp.fifo.Remove(element)
 	rp.metrics.CountOfRequestPool.Set(float64(rp.fifo.Len()))
@@ -437,10 +402,6 @@ func (rp *Pool) deleteRequest(element *list.Element, requestInfo types.RequestIn
 
 	if len(rp.existMap) != rp.fifo.Len() {
 		rp.logger.Panicf("RequestPool map and list are of different length: map=%d, list=%d", len(rp.existMap), rp.fifo.Len())
-	}
-
-	if wasHead {
-		rp.armTimers()
 	}
 }
 
@@ -475,71 +436,12 @@ func (rp *Pool) eraseFromDelSlice() {
 	rp.delSlice = rp.delSlice[n:]
 }
 
-// armTimers points the head timers at the request at the front of the FIFO.
-// A timer already tracking that request is left alone, so the head keeps its
-// budget when other requests are added or removed. Called with the lock held.
-func (rp *Pool) armTimers() {
-	if rp.closed || rp.stopped {
-		return
-	}
-
-	front := rp.fifo.Front()
-	if front == nil {
-		rp.progress.stop()
-		rp.gc.stop()
-		return
-	}
-
-	item := front.Value.(*requestItem)
-	if !rp.progress.tracks(item.info) {
-		rp.startProgress(item)
-	}
-	if !rp.gc.tracks(item.info) {
-		rp.startGC(item)
-	}
-}
-
-// startProgress gives the head a fresh RequestForwardTimeout. Called with the lock held.
-func (rp *Pool) startProgress(item *requestItem) {
-	rp.progress.stop()
-	rp.progress.owner = item.info
-	rp.progress.active = true
-
-	gen := rp.progress.gen
-	request, reqInfo := item.request, item.info
-	rp.progress.timer = time.AfterFunc(
-		rp.options.ForwardTimeout,
-		func() { rp.onRequestTO(gen, request, reqInfo) },
-	)
-	rp.logger.Debugf("Request %s is at the head of the pool; started a timeout: %s", reqInfo, rp.options.ForwardTimeout)
-}
-
-// startGC arms removal of the head at its age limit. The limit is measured
-// from submission, so stopping and restarting the timers never extends a
-// request's lifetime, and a head that is already overdue is removed at once.
-// Called with the lock held.
-func (rp *Pool) startGC(item *requestItem) {
-	rp.gc.stop()
-	rp.gc.owner = item.info
-	rp.gc.active = true
-
-	gen := rp.gc.gen
-	reqInfo := item.info
-	delay := time.Until(item.additionTimestamp.Add(rp.options.AutoRemoveTimeout))
-	if delay < 0 {
-		delay = 0
-	}
-	rp.gc.timer = time.AfterFunc(delay, func() { rp.onAutoRemoveTO(gen, reqInfo) })
-}
-
 // Close removes all the requests, stops all the timeout timers.
 func (rp *Pool) Close() {
 	rp.lock.Lock()
 	defer rp.lock.Unlock()
 
 	rp.closed = true
-	rp.progress.stop()
-	rp.gc.stop()
 
 	for requestInfo, element := range rp.existMap {
 		rp.deleteRequest(element, requestInfo)
@@ -548,51 +450,67 @@ func (rp *Pool) Close() {
 	rp.cancel()
 }
 
-// StopTimers stops the head-of-line timers and marks the pool as "stopped", which keeps the head
-// untimed until RestartTimers, including by timer go-routines that were running at the time of
-// the call to StopTimers().
+// StopTimers stops all the timeout timers attached to the pending requests, and marks the pool as "stopped".
+// This which prevents submission of new requests, and renewal of timeouts by timer go-routines that where running
+// at the time of the call to StopTimers().
 func (rp *Pool) StopTimers() {
 	rp.lock.Lock()
 	defer rp.lock.Unlock()
 
 	rp.stopped = true
-	rp.progress.stop()
-	rp.gc.stop()
 
-	rp.logger.Debugf("Stopped timers: size=%d", len(rp.existMap))
+	for _, element := range rp.existMap {
+		item := element.Value.(*requestItem)
+		item.timeout.Stop()
+	}
+
+	rp.logger.Debugf("Stopped all timers: size=%d", len(rp.existMap))
 }
 
-// RestartTimers re-allows timing and gives the request at the head of the pool a fresh
-// RequestForwardTimeout budget. The auto-remove age limit is not extended.
+// RestartTimers restarts all the timeout timers attached to the pending requests, as RequestForwardTimeout, and re-allows
+// submission of new requests.
 func (rp *Pool) RestartTimers() {
 	rp.lock.Lock()
 	defer rp.lock.Unlock()
 
 	rp.stopped = false
-	rp.progress.stop()
-	rp.gc.stop()
-	rp.armTimers()
 
-	rp.logger.Debugf("Restarted timers: size=%d", len(rp.existMap))
+	for reqInfo, element := range rp.existMap {
+		item := element.Value.(*requestItem)
+		item.timeout.Stop()
+		ri := reqInfo
+		to := time.AfterFunc(
+			rp.options.ForwardTimeout,
+			func() { rp.onRequestTO(item.request, ri) },
+		)
+		item.timeout = to
+	}
+
+	rp.logger.Debugf("Restarted all timers: size=%d", len(rp.existMap))
 }
 
 // called by the goroutine spawned by time.AfterFunc
-func (rp *Pool) onRequestTO(gen uint64, request []byte, reqInfo types.RequestInfo) {
+func (rp *Pool) onRequestTO(request []byte, reqInfo types.RequestInfo) {
 	rp.lock.Lock()
 
-	// Any change of head, stop, or close re-arms or stops the timer and bumps
-	// its generation, so a matching generation means the request is still the
-	// untouched head of a running pool.
-	if gen != rp.progress.gen {
+	element, contains := rp.existMap[reqInfo]
+	if !contains {
 		rp.lock.Unlock()
-		rp.logger.Debugf("Request %s is no longer the timed head of the pool", reqInfo)
+		rp.logger.Debugf("Request %s no longer in pool", reqInfo)
+		return
+	}
+
+	if rp.closed || rp.stopped {
+		rp.lock.Unlock()
+		rp.logger.Debugf("Pool stopped, will NOT start a leader-forwarding timeout")
 		return
 	}
 
 	// start a second timeout
-	rp.progress.timer = time.AfterFunc(
+	item := element.Value.(*requestItem)
+	item.timeout = time.AfterFunc(
 		rp.options.ComplainTimeout,
-		func() { rp.onLeaderFwdRequestTO(gen, request, reqInfo) },
+		func() { rp.onLeaderFwdRequestTO(request, reqInfo) },
 	)
 	rp.logger.Debugf("Request %s; started a leader-forwarding timeout: %s", reqInfo, rp.options.ComplainTimeout)
 
@@ -605,18 +523,29 @@ func (rp *Pool) onRequestTO(gen uint64, request []byte, reqInfo types.RequestInf
 }
 
 // called by the goroutine spawned by time.AfterFunc
-func (rp *Pool) onLeaderFwdRequestTO(gen uint64, request []byte, reqInfo types.RequestInfo) {
+func (rp *Pool) onLeaderFwdRequestTO(request []byte, reqInfo types.RequestInfo) {
 	rp.lock.Lock()
 
-	if gen != rp.progress.gen {
+	element, contains := rp.existMap[reqInfo]
+	if !contains {
 		rp.lock.Unlock()
-		rp.logger.Debugf("Request %s is no longer the timed head of the pool", reqInfo)
+		rp.logger.Debugf("Request %s no longer in pool", reqInfo)
 		return
 	}
 
-	// The chain ends here. The head stays until it is delivered, the timers
-	// are restarted, or it reaches its auto-remove age.
-	rp.progress.timer = nil
+	if rp.closed || rp.stopped {
+		rp.lock.Unlock()
+		rp.logger.Debugf("Pool stopped, will NOT start auto-remove timeout")
+		return
+	}
+
+	// start a third timeout
+	item := element.Value.(*requestItem)
+	item.timeout = time.AfterFunc(
+		rp.options.AutoRemoveTimeout,
+		func() { rp.onAutoRemoveTO(reqInfo) },
+	)
+	rp.logger.Debugf("Request %s; started auto-remove timeout: %s", reqInfo, rp.options.AutoRemoveTimeout)
 
 	rp.lock.Unlock()
 
@@ -627,22 +556,10 @@ func (rp *Pool) onLeaderFwdRequestTO(gen uint64, request []byte, reqInfo types.R
 }
 
 // called by the goroutine spawned by time.AfterFunc
-func (rp *Pool) onAutoRemoveTO(gen uint64, reqInfo types.RequestInfo) {
-	rp.lock.Lock()
-
-	if gen != rp.gc.gen {
-		rp.lock.Unlock()
-		rp.logger.Debugf("Request %s is no longer the head of the pool", reqInfo)
-		return
-	}
-
+func (rp *Pool) onAutoRemoveTO(reqInfo types.RequestInfo) {
 	rp.logger.Debugf("Request %s auto-remove timeout expired, going to remove from pool", reqInfo)
-	removed := rp.removeLocked(reqInfo)
-
-	rp.lock.Unlock()
-
-	if !removed {
-		rp.logger.Errorf("Removal of request %s failed; it is not in the pool", reqInfo)
+	if err := rp.RemoveRequest(reqInfo); err != nil {
+		rp.logger.Errorf("Removal of request %s failed; error: %s", reqInfo, err)
 		return
 	}
 	rp.metrics.CountOfDeleteRequestPool.Add(1)
