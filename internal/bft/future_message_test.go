@@ -34,7 +34,6 @@ func TestOutOfRangeCommitsTriggerSync(t *testing.T) {
 		lastVotedProposalByID: make(map[uint64]*protos.Commit),
 		abortChan:             make(chan struct{}),
 	}
-	view.stopReason.Store("running")
 
 	commit := func(sender uint64) {
 		view.processMsg(sender, &protos.Message{

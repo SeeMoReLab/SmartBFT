@@ -109,15 +109,15 @@ type View struct {
 	prepares   *voteSet
 	commits    *voteSet
 	// Next proposal
-	nextPrePrepare     chan *protos.Message
-	nextPrepares       *voteSet
-	nextCommits        *voteSet
+	nextPrePrepare chan *protos.Message
+	nextPrepares   *voteSet
+	nextCommits    *voteSet
+
 	beginPrePrepare    time.Time
 	MetricsBlacklist   *api.MetricsBlacklist
 	MetricsView        *api.MetricsView
 	blacklistSupported bool
 	abortChan          chan struct{}
-	stopReason         atomic.Value
 	stopOnce           sync.Once
 	viewEnded          sync.WaitGroup
 
@@ -129,7 +129,6 @@ func (v *View) Start() {
 	v.stopOnce = sync.Once{}
 	v.incMsgs = make(chan *incMsg, v.InMsgQSize)
 	v.abortChan = make(chan struct{})
-	v.stopReason.Store("running")
 	v.lastVotedProposalByID = make(map[uint64]*protos.Commit)
 	v.viewEnded.Add(1)
 
@@ -186,30 +185,15 @@ func (v *View) setupVotes() {
 // HandleMessage handles incoming messages
 func (v *View) HandleMessage(sender uint64, m *protos.Message) {
 	msg := &incMsg{sender: sender, Message: m}
-	tracePrintf("%s event=view_enqueue_start node=%d view=%d proposal_seq=%d from=%d queue_len=%d queue_cap=%d %s\n",
-		traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, sender, len(v.incMsgs), cap(v.incMsgs), traceMessageSummary(m))
 	select {
 	case <-v.abortChan:
-		tracePrintf("%s event=view_enqueue_aborted node=%d view=%d proposal_seq=%d from=%d abort_reason=%q %s\n",
-			traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, sender, v.abortReason(), traceMessageSummary(m))
 		return
 	case v.incMsgs <- msg:
-		tracePrintf("%s event=view_enqueue_done node=%d view=%d proposal_seq=%d from=%d queue_len=%d queue_cap=%d %s\n",
-			traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, sender, len(v.incMsgs), cap(v.incMsgs), traceMessageSummary(m))
 	}
 }
 
 func (v *View) processMsg(sender uint64, m *protos.Message) {
-	start := time.Now()
-	tracePrintf("%s event=view_process_start node=%d view=%d proposal_seq=%d from=%d %s\n",
-		traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, sender, traceMessageSummary(m))
-	defer func() {
-		tracePrintf("%s event=view_process_done node=%d view=%d proposal_seq=%d from=%d elapsed_ms=%d %s\n",
-			traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, sender, time.Since(start).Milliseconds(), traceMessageSummary(m))
-	}()
 	if v.Stopped() {
-		tracePrintf("%s event=view_process_stopped node=%d view=%d proposal_seq=%d from=%d %s\n",
-			traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, sender, traceMessageSummary(m))
 		return
 	}
 	// Ensure view number is equal to our view
@@ -225,11 +209,9 @@ func (v *View) processMsg(sender uint64, m *protos.Message) {
 		v.FailureDetector.Complain(v.Number, false)
 		// Else, we got a message with a wrong view from the leader.
 		if msgViewNum > v.Number {
-			tracePrintf("%s event=sync_trigger node=%d reason=wrong_view_from_leader local_view=%d local_seq=%d from=%d message_view=%d message_seq=%d %s\n",
-				traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, sender, msgViewNum, msgProposalSeq, traceMessageSummary(m))
 			v.Sync.Sync()
 		}
-		v.stopWithReason(fmt.Sprintf("wrong_view_from_leader from=%d message_view=%d message_seq=%d", sender, msgViewNum, msgProposalSeq))
+		v.stop()
 		return
 	}
 
@@ -406,10 +388,8 @@ func (v *View) processProposal() Phase {
 	if err != nil {
 		v.Logger.Warnf("%d received bad proposal from %d: %v", v.SelfID, v.LeaderID, err)
 		v.FailureDetector.Complain(v.Number, false)
-		tracePrintf("%s event=sync_trigger node=%d reason=bad_proposal local_view=%d local_seq=%d from=%d message_view=%d message_seq=%d err=%q %s\n",
-			traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, v.LeaderID, v.Number, v.ProposalSequence, err.Error(), traceMessageSummary(receivedProposal))
 		v.Sync.Sync()
-		v.stopWithReason(fmt.Sprintf("bad_proposal err=%q", err.Error()))
+		v.stop()
 		return ABORT
 	}
 
@@ -467,8 +447,6 @@ func (v *View) processPrepares() Phase {
 	for len(voterIDs) < v.Quorum-1 {
 		select {
 		case <-v.abortChan:
-			tracePrintf("%s event=proposal_progress node=%d view=%d seq=%d phase=prepare result=aborted votes=%d required=%d voters=%v abort_reason=%q\n",
-				traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, len(voterIDs), v.Quorum-1, voterIDs, v.abortReason())
 			return ABORT
 		case msg := <-v.incMsgs:
 			v.processMsg(msg.sender, msg.Message)
@@ -480,14 +458,10 @@ func (v *View) processPrepares() Phase {
 				continue
 			}
 			voterIDs = append(voterIDs, vote.sender)
-			tracePrintf("%s event=proposal_progress node=%d view=%d seq=%d phase=prepare result=vote votes=%d required=%d voter=%d voters=%v\n",
-				traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, len(voterIDs), v.Quorum-1, vote.sender, voterIDs)
 		}
 	}
 
 	v.Logger.Infof("%d collected %d prepares from %v", v.SelfID, len(voterIDs), voterIDs)
-	tracePrintf("%s event=proposal_progress node=%d view=%d seq=%d phase=prepare result=quorum votes=%d required=%d voters=%v\n",
-		traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, len(voterIDs), v.Quorum-1, voterIDs)
 
 	// SignProposal returns a types.Signature with the following 3 fields:
 	// ID: The integer that represents this node.
@@ -558,8 +532,6 @@ func (v *View) processCommits(proposal *types.Proposal) ([]types.Signature, Phas
 	for len(signatures) < v.Quorum-1 {
 		select {
 		case <-v.abortChan:
-			tracePrintf("%s event=proposal_progress node=%d view=%d seq=%d phase=commit result=aborted votes=%d required=%d voters=%v abort_reason=%q\n",
-				traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, len(signatures), v.Quorum-1, voterIDs, v.abortReason())
 			return nil, ABORT
 		case msg := <-v.incMsgs:
 			v.processMsg(msg.sender, msg.Message)
@@ -571,14 +543,10 @@ func (v *View) processCommits(proposal *types.Proposal) ([]types.Signature, Phas
 		case signature := <-signatureCollector.validVotes:
 			signatures = append(signatures, signature)
 			voterIDs = append(voterIDs, signature.ID)
-			tracePrintf("%s event=proposal_progress node=%d view=%d seq=%d phase=commit result=vote votes=%d required=%d voter=%d voters=%v\n",
-				traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, len(signatures), v.Quorum-1, signature.ID, voterIDs)
 		}
 	}
 
 	v.Logger.Infof("%d collected %d commits from %v", v.SelfID, len(signatures), voterIDs)
-	tracePrintf("%s event=proposal_progress node=%d view=%d seq=%d phase=commit result=quorum votes=%d required=%d voters=%v\n",
-		traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, len(signatures), v.Quorum-1, voterIDs)
 
 	return signatures, COMMITTED
 }
@@ -844,9 +812,7 @@ func (v *View) discoverIfSyncNeeded(sender uint64, m *protos.Message) {
 
 		v.Logger.Warnf("Seen %d votes for digest %s in view %d, sequence %d but I am in view %d and seq %d",
 			count, vote.digest, vote.view, vote.seq, v.Number, v.ProposalSequence)
-		tracePrintf("%s event=sync_trigger node=%d reason=commit_threshold_ahead local_view=%d local_seq=%d from=%d message_view=%d message_seq=%d vote_view=%d vote_seq=%d votes=%d threshold=%d\n",
-			traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, sender, viewNumber(m), proposalSequence(m), vote.view, vote.seq, count, threshold)
-		v.stopWithReason(fmt.Sprintf("commit_threshold_ahead vote_view=%d vote_seq=%d votes=%d threshold=%d", vote.view, vote.seq, count, threshold))
+		v.stop()
 		v.Sync.Sync()
 		return
 	}
@@ -926,7 +892,6 @@ func (v *View) startNextSeq() {
 	v.commits = v.nextCommits
 	tmpVotes.clear(v.N)
 	v.nextCommits = tmpVotes
-
 }
 
 // GetMetadata returns the current sequence and view number (in a marshaled ViewMetadata protobuf message)
@@ -1027,42 +992,18 @@ func (v *View) bindCommitSignaturesToProposalMetadata(metadata *protos.ViewMetad
 	return metadata
 }
 
-func (v *View) abortReason() string {
-	if reason := v.stopReason.Load(); reason != nil {
-		if reasonString, ok := reason.(string); ok {
-			return reasonString
-		}
-	}
-	return "unknown"
-}
-
-func (v *View) stopWithReason(reason string) {
-	if reason == "" {
-		reason = "unspecified"
-	}
+func (v *View) stop() {
 	v.stopOnce.Do(func() {
 		if v.abortChan == nil {
 			return
 		}
-		v.stopReason.Store(reason)
-		tracePrintf("%s event=view_stop node=%d view=%d proposal_seq=%d phase=%s reason=%q\n",
-			traceLogTag("trace"), v.SelfID, v.Number, v.ProposalSequence, v.Phase, reason)
 		close(v.abortChan)
 	})
 }
 
-func (v *View) stop() {
-	v.stopWithReason("unspecified")
-}
-
 // Abort forces the view to end
 func (v *View) Abort() {
-	v.AbortWithReason("abort")
-}
-
-// AbortWithReason forces the view to end and records a diagnostic reason.
-func (v *View) AbortWithReason(reason string) {
-	v.stopWithReason(reason)
+	v.stop()
 	v.viewEnded.Wait()
 }
 

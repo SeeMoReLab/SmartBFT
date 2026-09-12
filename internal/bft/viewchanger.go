@@ -242,28 +242,18 @@ func (v *ViewChanger) Stop() {
 // HandleMessage passes a message to the view changer
 func (v *ViewChanger) HandleMessage(sender uint64, m *protos.Message) {
 	if v.dropStaleViewMessage(sender, m) {
-		tracePrintf("%s event=viewchanger_drop_stale node=%d from=%d curr_view=%d next_view=%d real_view=%d %s\n",
-			traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, traceMessageSummary(m))
 		return
 	}
 	key, coalesce := v.reservePendingViewMessage(sender, m)
 	if !coalesce {
-		tracePrintf("%s event=viewchanger_drop_coalesced node=%d from=%d curr_view=%d next_view=%d real_view=%d %s\n",
-			traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, traceMessageSummary(m))
 		return
 	}
 	msg := &incMsg{sender: sender, Message: m, coalesce: key}
-	tracePrintf("%s event=viewchanger_enqueue_start node=%d from=%d curr_view=%d next_view=%d real_view=%d queue_len=%d queue_cap=%d %s\n",
-		traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, len(v.incMsgs), cap(v.incMsgs), traceMessageSummary(m))
 	select {
 	case <-v.stopChan:
 		v.releasePendingViewMessage(key)
-		tracePrintf("%s event=viewchanger_enqueue_stopped node=%d from=%d curr_view=%d next_view=%d real_view=%d %s\n",
-			traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, traceMessageSummary(m))
 		return
 	case v.incMsgs <- msg:
-		tracePrintf("%s event=viewchanger_enqueue_done node=%d from=%d curr_view=%d next_view=%d real_view=%d queue_len=%d queue_cap=%d %s\n",
-			traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, len(v.incMsgs), cap(v.incMsgs), traceMessageSummary(m))
 	}
 }
 
@@ -441,13 +431,6 @@ func (v *ViewChanger) checkIfTimeout(now time.Time) bool {
 }
 
 func (v *ViewChanger) processMsg(sender uint64, m *protos.Message) {
-	start := time.Now()
-	tracePrintf("%s event=viewchanger_process_start node=%d from=%d curr_view=%d next_view=%d real_view=%d %s\n",
-		traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, traceMessageSummary(m))
-	defer func() {
-		tracePrintf("%s event=viewchanger_process_done node=%d from=%d curr_view=%d next_view=%d real_view=%d elapsed_ms=%d %s\n",
-			traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, time.Since(start).Milliseconds(), traceMessageSummary(m))
-	}()
 	// viewChange message
 	if vc := m.GetViewChange(); vc != nil {
 		v.Logger.Debugf("Node %d is processing a view change message %v from %d with next view %d", v.SelfID, m, sender, vc.NextView)
@@ -1750,17 +1733,11 @@ func (v *ViewChanger) syncInFlight(attempt *inFlightAttempt) {
 
 // HandleViewMessage passes a message to the in flight proposal view if applicable
 func (v *ViewChanger) HandleViewMessage(sender uint64, m *protos.Message) {
-	tracePrintf("%s event=inflight_view_check node=%d from=%d curr_view=%d next_view=%d real_view=%d %s\n",
-		traceLogTag("trace"), v.SelfID, sender, v.currView, v.nextView, v.realView, traceMessageSummary(m))
 	v.inFlightViewLock.RLock()
 	defer v.inFlightViewLock.RUnlock()
 	if view := v.inFlightView; view != nil {
 		v.Logger.Debugf("Node %d is passing a message to the in flight view", v.SelfID)
-		tracePrintf("%s event=inflight_view_forward node=%d from=%d inflight_view=%d inflight_seq=%d %s\n",
-			traceLogTag("trace"), v.SelfID, sender, view.Number, view.ProposalSequence, traceMessageSummary(m))
 		view.HandleMessage(sender, m)
-		tracePrintf("%s event=inflight_view_forward_done node=%d from=%d inflight_view=%d inflight_seq=%d %s\n",
-			traceLogTag("trace"), v.SelfID, sender, view.Number, view.ProposalSequence, traceMessageSummary(m))
 	}
 }
 
