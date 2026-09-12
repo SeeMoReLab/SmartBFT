@@ -157,48 +157,7 @@ func (nv *nextViews) sendRecv(next uint64, sender uint64) bool {
 
 type incMsg struct {
 	*protos.Message
-	sender   uint64
-	coalesce *viewMessageCoalesceKey
-}
-
-type viewMessageCoalesceKey struct {
 	sender uint64
-	kind   string
-	view   uint64
-}
-
-func viewMessageTargetView(m *protos.Message) (string, uint64, bool) {
-	if m == nil {
-		return "", 0, false
-	}
-	if vc := m.GetViewChange(); vc != nil {
-		return "view_change", vc.GetNextView(), true
-	}
-	if vd := m.GetViewData(); vd != nil {
-		target, ok := signedViewDataTargetView(vd)
-		return "view_data", target, ok
-	}
-	if nv := m.GetNewView(); nv != nil {
-		for _, svd := range nv.GetSignedViewData() {
-			target, ok := signedViewDataTargetView(svd)
-			if ok {
-				return "new_view", target, true
-			}
-		}
-		return "new_view", 0, false
-	}
-	return "", 0, false
-}
-
-func signedViewDataTargetView(svd *protos.SignedViewData) (uint64, bool) {
-	if svd == nil {
-		return 0, false
-	}
-	vd := &protos.ViewData{}
-	if err := proto.Unmarshal(svd.GetRawViewData(), vd); err != nil {
-		return 0, false
-	}
-	return vd.GetNextView(), true
 }
 
 // computeQuorum calculates the quorums size Q, given a cluster size N.

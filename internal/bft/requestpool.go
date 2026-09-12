@@ -222,7 +222,7 @@ func (rp *Pool) Submit(request []byte) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), rp.options.SubmitTimeout)
 	defer cancel()
-	// Do not wait for a semaphore with a lock, as it will prevent draining the pool.
+	// do not wait for a semaphore with a lock, as it will prevent draining the pool.
 	if err := rp.semaphore.Acquire(ctx, 1); err != nil {
 		rp.metrics.CountOfFailAddRequestToPool.With(
 			rp.metrics.LabelsForWith("reason", api.ReasonSemaphoreAcquireFail)...,

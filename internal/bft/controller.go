@@ -333,9 +333,6 @@ func (c *Controller) ProcessMessages(sender uint64, m *protos.Message) {
 	c.Logger.Debugf("%d got message from %d: %s", c.ID, sender, MsgToString(m))
 	switch m.GetContent().(type) {
 	case *protos.Message_PrePrepare, *protos.Message_Prepare, *protos.Message_Commit:
-		if c.dropStaleConsensusMessage(sender, m) {
-			return
-		}
 		c.currViewLock.RLock()
 		view := c.currView
 		c.currViewLock.RUnlock()
@@ -355,17 +352,6 @@ func (c *Controller) ProcessMessages(sender uint64, m *protos.Message) {
 	default:
 		c.Logger.Warnf("Unexpected message type, ignoring")
 	}
-}
-
-func (c *Controller) dropStaleConsensusMessage(sender uint64, m *protos.Message) bool {
-	msgView := viewNumber(m)
-	c.currViewLock.RLock()
-	currentView := c.currViewNumber
-	c.currViewLock.RUnlock()
-	if msgView < currentView {
-		return true
-	}
-	return false
 }
 
 func (c *Controller) respondToStateTransferRequest(sender uint64) {

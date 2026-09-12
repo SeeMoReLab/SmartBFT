@@ -120,8 +120,6 @@ type ViewChanger struct {
 	Restore                   chan struct{}
 	InMsqQSize                int
 	incMsgs                   chan *incMsg
-	pendingViewMsgs           map[viewMessageCoalesceKey]struct{}
-	pendingViewMsgsLock       sync.Mutex
 	viewChangeMsgs            *voteSet
 	viewDataMsgs              *voteSet
 	nvs                       *nextViews
@@ -142,7 +140,6 @@ type ViewChanger struct {
 // Start the view changer
 func (v *ViewChanger) Start(startViewNumber uint64) {
 	v.incMsgs = make(chan *incMsg, v.InMsqQSize)
-	v.pendingViewMsgs = make(map[viewMessageCoalesceKey]struct{})
 	v.startChangeChan = make(chan *change, 2)
 	v.informChan = make(chan uint64, 1)
 
@@ -241,58 +238,12 @@ func (v *ViewChanger) Stop() {
 
 // HandleMessage passes a message to the view changer
 func (v *ViewChanger) HandleMessage(sender uint64, m *protos.Message) {
-	if v.dropStaleViewMessage(sender, m) {
-		return
-	}
-	key, coalesce := v.reservePendingViewMessage(sender, m)
-	if !coalesce {
-		return
-	}
-	msg := &incMsg{sender: sender, Message: m, coalesce: key}
+	msg := &incMsg{sender: sender, Message: m}
 	select {
 	case <-v.stopChan:
-		v.releasePendingViewMessage(key)
 		return
 	case v.incMsgs <- msg:
 	}
-}
-
-func (v *ViewChanger) dropStaleViewMessage(sender uint64, m *protos.Message) bool {
-	kind, target, ok := viewMessageTargetView(m)
-	if !ok {
-		return false
-	}
-	if kind == "view_change" && target <= v.realView {
-		return true
-	}
-	if kind != "view_change" && target < v.currView {
-		return true
-	}
-	return false
-}
-
-func (v *ViewChanger) reservePendingViewMessage(sender uint64, m *protos.Message) (*viewMessageCoalesceKey, bool) {
-	kind, target, ok := viewMessageTargetView(m)
-	if !ok {
-		return nil, true
-	}
-	key := viewMessageCoalesceKey{sender: sender, kind: kind, view: target}
-	v.pendingViewMsgsLock.Lock()
-	defer v.pendingViewMsgsLock.Unlock()
-	if _, exists := v.pendingViewMsgs[key]; exists {
-		return nil, false
-	}
-	v.pendingViewMsgs[key] = struct{}{}
-	return &key, true
-}
-
-func (v *ViewChanger) releasePendingViewMessage(key *viewMessageCoalesceKey) {
-	if key == nil {
-		return
-	}
-	v.pendingViewMsgsLock.Lock()
-	delete(v.pendingViewMsgs, *key)
-	v.pendingViewMsgsLock.Unlock()
 }
 
 func (v *ViewChanger) run() {
@@ -303,7 +254,6 @@ func (v *ViewChanger) run() {
 		case changeMsg := <-v.startChangeChan:
 			v.startViewChange(changeMsg)
 		case msg := <-v.incMsgs:
-			v.releasePendingViewMessage(msg.coalesce)
 			v.processMsg(msg.sender, msg.Message)
 		case now := <-v.Ticker:
 			v.lastTick = now
@@ -1656,12 +1606,6 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 	v.inFlightViewLock.Unlock()
 
 	v.Logger.Debugf("Node %d started a view %d for the in flight proposal", v.SelfID, v.inFlightView.Number)
-	inFlightTimeoutFactor := v.backOffFactor
-	if inFlightTimeoutFactor == 0 {
-		inFlightTimeoutFactor = 1
-	}
-	inFlightTimeout := v.ViewChangeTimeout * time.Duration(inFlightTimeoutFactor)
-	inFlightWaitStart := time.Now()
 
 	// wait for view to finish or time out
 	for {
@@ -1676,10 +1620,6 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 			v.lastTick = now
 			if v.checkIfTimeout(now) {
 				v.Logger.Infof("Timeout expired waiting on In-flight %d with latest sequence view to commit %d", inFlightViewNum, inFlightViewLatestSeq)
-				return false
-			}
-			if inFlightTimeout > 0 && time.Since(inFlightWaitStart) >= inFlightTimeout {
-				v.Logger.Warnf("Node %d timed out waiting on in-flight view %d with latest sequence %d to commit", v.SelfID, inFlightViewNum, inFlightViewLatestSeq)
 				return false
 			}
 		case <-v.stopChan:
