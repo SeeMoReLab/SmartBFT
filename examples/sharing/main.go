@@ -35,7 +35,7 @@ func main() {
 		role        = flag.String("role", "server", "run role: server or inprocess")
 		nodeID      = flag.Uint64("node-id", 0, "sharing node id for --role server")
 		hostsConfig = flag.String("hosts-config", "", "sharing hosts config: node_id host report_port agent_port consensus_port")
-		protocolRaw = flag.String("protocol", "pbft", "consensus protocol being learned: pbft, sbft, or tendermint")
+		protocolRaw = flag.String("protocol", "pbft", "consensus protocol being learned: pbft, smartbft, sbft, or tendermint")
 		dataDir     = flag.String("data-dir", "", "directory for report chain WAL data; defaults to a temporary directory")
 		keepData    = flag.Bool("keep-data", false, "keep generated WAL data when using a temporary data directory")
 		verbose     = flag.Bool("verbose", false, "enable SmartBFT debug logs for the report chain")
@@ -149,13 +149,15 @@ func parseProtocol(raw string) (adaptivetimers.Protocol, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "pbft":
 		return adaptivetimers.Protocol_PROTOCOL_PBFT, nil
+	case "smartbft":
+		return adaptivetimers.Protocol_PROTOCOL_SMARTBFT, nil
 	case "sbft":
 		return adaptivetimers.Protocol_PROTOCOL_SBFT, nil
 	case "tendermint":
 		return adaptivetimers.Protocol_PROTOCOL_TENDERMINT, nil
 	default:
 		return adaptivetimers.Protocol_PROTOCOL_UNSPECIFIED,
-			fmt.Errorf("unknown --protocol %q; expected pbft, sbft, or tendermint", raw)
+			fmt.Errorf("unknown --protocol %q; expected pbft, smartbft, sbft, or tendermint", raw)
 	}
 }
 

@@ -85,7 +85,7 @@ type learningReportWindow struct {
 }
 
 type pendingLearningReward struct {
-	report                 *adaptivetimers.PbftReport
+	report                 *adaptivetimers.SmartbftReport
 	episode                uint32
 	timeoutMS              uint32
 	throughputTransactions uint64
@@ -738,19 +738,19 @@ func (m *learningManager) sendStateReportLocked(episode uint32, startTick uint64
 	local := &adaptivetimers.ReportLocal{
 		NodeId:               uint32(m.nodeID),
 		Episode:              episode,
-		Protocol:             adaptivetimers.Protocol_PROTOCOL_PBFT,
+		Protocol:             adaptivetimers.Protocol_PROTOCOL_SMARTBFT,
 		StartTick:            saturatingUint32(startTick),
 		ReportSeq:            saturatingUint32(reportSeq),
 		WindowConsensusCount: saturatingUint32(reportLength),
-		State:                &adaptivetimers.ReportLocal_PbftState{PbftState: report},
+		State:                &adaptivetimers.ReportLocal_SmartbftState{SmartbftState: report},
 	}
 	if m.pendingReward != nil {
 		local.Reward = &adaptivetimers.Reward{
-			Value: &adaptivetimers.Reward_Pbft{
-				Pbft: &adaptivetimers.PbftReward{
+			Value: &adaptivetimers.Reward_Smartbft{
+				Smartbft: &adaptivetimers.SmartbftReward{
 					Episode: m.pendingReward.episode,
 					Report:  m.pendingReward.report,
-					TimeoutUsed: &adaptivetimers.PbftTimeout{
+					TimeoutUsed: &adaptivetimers.SmartbftTimeout{
 						ElectionTimeoutMilliseconds: m.pendingReward.timeoutMS,
 					},
 				},
@@ -781,19 +781,19 @@ func (m *learningManager) sendWallClockStateReportLocked(episode uint32, startTi
 	local := &adaptivetimers.ReportLocal{
 		NodeId:               uint32(m.nodeID),
 		Episode:              episode,
-		Protocol:             adaptivetimers.Protocol_PROTOCOL_PBFT,
+		Protocol:             adaptivetimers.Protocol_PROTOCOL_SMARTBFT,
 		StartTick:            saturatingUint32(startTick),
 		ReportSeq:            saturatingUint32(reportSeq),
 		WindowConsensusCount: 0,
-		State:                &adaptivetimers.ReportLocal_PbftState{PbftState: report},
+		State:                &adaptivetimers.ReportLocal_SmartbftState{SmartbftState: report},
 	}
 	if pendingReward != nil {
 		local.Reward = &adaptivetimers.Reward{
-			Value: &adaptivetimers.Reward_Pbft{
-				Pbft: &adaptivetimers.PbftReward{
+			Value: &adaptivetimers.Reward_Smartbft{
+				Smartbft: &adaptivetimers.SmartbftReward{
 					Episode: pendingReward.episode,
 					Report:  pendingReward.report,
-					TimeoutUsed: &adaptivetimers.PbftTimeout{
+					TimeoutUsed: &adaptivetimers.SmartbftTimeout{
 						ElectionTimeoutMilliseconds: pendingReward.timeoutMS,
 					},
 				},
@@ -813,7 +813,7 @@ func (m *learningManager) sendWallClockStateReport(local *adaptivetimers.ReportL
 		return
 	}
 
-	report := local.GetPbftState()
+	report := local.GetSmartbftState()
 	learningPrintf("sent report: node=%d episode=%d start_tick=%d report_seq=%d window_mode=wall-clock total_consensus=%d total_transactions=%d throughput_duration_s=%.6f throughput_tps=%.6f\n",
 		m.nodeID, local.Episode, local.StartTick, local.ReportSeq, report.TotalConsensusInstances,
 		throughput.totalTransactions, throughput.duration.Seconds(), report.ThroughputTps)
@@ -867,7 +867,7 @@ func (m *learningManager) pollForTimeout(ctx context.Context, episode uint32) {
 			if err != nil || status == nil {
 				continue
 			}
-			if status.Status != adaptivetimers.TimeoutStatus_READY || status.Timeout == nil || status.Timeout.GetPbft() == nil {
+			if status.Status != adaptivetimers.TimeoutStatus_READY || status.Timeout == nil || status.Timeout.GetSmartbft() == nil {
 				continue
 			}
 			startTick := uint64(status.StartTick)
@@ -882,7 +882,7 @@ func (m *learningManager) pollForTimeout(ctx context.Context, episode uint32) {
 					continue
 				}
 			}
-			timeout := time.Duration(status.Timeout.GetPbft().ElectionTimeoutMilliseconds) * time.Millisecond
+			timeout := time.Duration(status.Timeout.GetSmartbft().ElectionTimeoutMilliseconds) * time.Millisecond
 			if timeout <= 0 {
 				continue
 			}

@@ -314,7 +314,7 @@ func TestLearningMetricsBuildPBFTReport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal report: %v", err)
 	}
-	roundTrip := &adaptivetimers.PbftReport{}
+	roundTrip := &adaptivetimers.SmartbftReport{}
 	if err := proto.Unmarshal(encoded, roundTrip); err != nil {
 		t.Fatalf("unmarshal report: %v", err)
 	}

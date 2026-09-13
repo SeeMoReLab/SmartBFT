@@ -55,6 +55,6 @@ func (c *learningAgentClient) getTimeout(ctx context.Context, episode uint32) (*
 	}
 	return c.client.GetTimeout(ctx, &adaptivetimers.TimeoutRequest{
 		Episode:  episode,
-		Protocol: adaptivetimers.Protocol_PROTOCOL_PBFT,
+		Protocol: adaptivetimers.Protocol_PROTOCOL_SMARTBFT,
 	})
 }

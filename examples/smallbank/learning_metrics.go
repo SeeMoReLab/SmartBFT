@@ -109,11 +109,11 @@ func (m *learningWindowMetrics) recordNoProgressViewChange() {
 	m.noProgressViewChange++
 }
 
-func (m *learningWindowMetrics) buildReport() *adaptivetimers.PbftReport {
+func (m *learningWindowMetrics) buildReport() *adaptivetimers.SmartbftReport {
 	return m.buildReportUntil(time.Time{}, false)
 }
 
-func (m *learningWindowMetrics) buildReportUntil(end time.Time, allowEmpty bool) *adaptivetimers.PbftReport {
+func (m *learningWindowMetrics) buildReportUntil(end time.Time, allowEmpty bool) *adaptivetimers.SmartbftReport {
 	if !allowEmpty && len(m.latencies) == 0 {
 		return nil
 	}
@@ -125,7 +125,7 @@ func (m *learningWindowMetrics) buildReportUntil(end time.Time, allowEmpty bool)
 		avgBatchSize = float32(float64(m.totalTransactions) / float64(m.totalConsensus))
 	}
 
-	return &adaptivetimers.PbftReport{
+	return &adaptivetimers.SmartbftReport{
 		TotalTransactions:         saturatingUint32(m.totalTransactions),
 		TotalConsensusInstances:   saturatingUint32(m.totalConsensus),
 		AvgConsensusLatencyMs:     avgDurationMS(m.latencies),
