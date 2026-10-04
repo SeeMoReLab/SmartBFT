@@ -181,6 +181,9 @@ func newNode(
 			n.id, (config.RequestForwardTimeout + config.RequestComplainTimeout).Milliseconds(),
 			config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds(),
 			config.ViewChangeTimeout.Milliseconds(), config.ViewChangeResendInterval.Milliseconds())
+		// The harness plot reads "applied timeouts:": once here, then on every apply.
+		learningPrintf("applied timeouts: request_timeout_ms=%d\n",
+			(config.RequestForwardTimeout + config.RequestComplainTimeout).Milliseconds())
 	}
 	n.start()
 
@@ -771,6 +774,7 @@ func (n *node) applyBaseRequestTimeout(timeout time.Duration, source string) (bf
 	learningPrintf("applied SmartBFT request timeout: node=%d source=%s total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d view_change_timeout_ms=%d view_change_resend_ms=%d\n",
 		n.id, source, timeout.Milliseconds(), config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds(),
 		config.ViewChangeTimeout.Milliseconds(), timeout.Milliseconds())
+	learningPrintf("applied timeouts: request_timeout_ms=%d\n", timeout.Milliseconds())
 	return config, nil
 }
 
