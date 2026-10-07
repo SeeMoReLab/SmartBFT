@@ -155,10 +155,6 @@ func newNode(
 		return nil, fmt.Errorf("start consensus for node %d: %w", id, err)
 	}
 	if n.learning != nil && n.learning.enabled {
-		learningPrintf("SmartBFT request timeout active: node=%d source=initial-configuration total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d view_change_timeout_ms=%d view_change_resend_ms=%d\n",
-			n.id, (config.RequestForwardTimeout + config.RequestComplainTimeout).Milliseconds(),
-			config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds(),
-			config.ViewChangeTimeout.Milliseconds(), config.ViewChangeResendInterval.Milliseconds())
 		// The harness plot reads "applied timeouts:": once here, then on every apply.
 		learningPrintf("applied timeouts: request_timeout_ms=%d\n",
 			(config.RequestForwardTimeout + config.RequestComplainTimeout).Milliseconds())
@@ -684,7 +680,7 @@ func (n *node) Deliver(proposal bft.Proposal, signatures []bft.Signature) bft.Re
 	return bft.Reconfig{InLatestDecision: false}
 }
 
-func (n *node) applyBaseRequestTimeout(timeout time.Duration, source string) error {
+func (n *node) applyBaseRequestTimeout(timeout time.Duration) error {
 	// Keep the view-change timers tied to the learned request timeout.
 	// ApplyViewChangeTimeout must run first: it clamps the resend interval down
 	// to the new timeout, and the explicit resend call after it raises the
@@ -695,13 +691,9 @@ func (n *node) applyBaseRequestTimeout(timeout time.Duration, source string) err
 	if err := n.consensus.ApplyViewChangeResendInterval(timeout); err != nil {
 		return err
 	}
-	config, err := n.consensus.ApplyRequestTimeout(timeout)
-	if err != nil {
+	if _, err := n.consensus.ApplyRequestTimeout(timeout); err != nil {
 		return err
 	}
-	learningPrintf("applied SmartBFT request timeout: node=%d source=%s total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d view_change_timeout_ms=%d view_change_resend_ms=%d\n",
-		n.id, source, timeout.Milliseconds(), config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds(),
-		config.ViewChangeTimeout.Milliseconds(), timeout.Milliseconds())
 	learningPrintf("applied timeouts: request_timeout_ms=%d\n", timeout.Milliseconds())
 	return nil
 }

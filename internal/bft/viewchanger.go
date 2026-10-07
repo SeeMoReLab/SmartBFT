@@ -425,7 +425,6 @@ func (v *ViewChanger) startViewChange(change *change) {
 	}
 	if v.nextView == v.currView+1 {
 		v.Logger.Debugf("Node %d has already started view change with target view %d", v.SelfID, v.nextView)
-		v.emitViewEvent("view_change_already_started", v.currView, v.nextView, 0)
 		v.emitViewEvent("start_view_change_refused", v.currView, v.nextView, 0)
 		v.checkTimeout = true
 		return
@@ -433,7 +432,6 @@ func (v *ViewChanger) startViewChange(change *change) {
 	v.nextView = v.currView + 1
 	v.MetricsViewChange.NextView.Set(float64(v.nextView))
 	v.emitViewEvent("start_view_change", v.currView, v.nextView, 0)
-	v.emitViewEvent("election_trigger", v.currView, v.nextView, 0)
 	v.RequestsTimer.StopTimers()
 	msg := &protos.Message{
 		Content: &protos.Message_ViewChange{
@@ -462,7 +460,6 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 	v.emitViewEvent("view_change_quorum_check", v.currView, target, 0)
 	if ((uint64(len(v.viewChangeMsgs.voted)) == uint64(v.f+1)) && v.SpeedUpViewChange) || restore { // join view change
 		v.Logger.Debugf("Node %d is joining view change, last view is %d", v.SelfID, v.currView)
-		v.emitViewEvent("election_trigger", v.currView, target, 0)
 		v.startViewChange(&change{view: v.currView, stopView: true})
 	}
 	if (len(v.viewChangeMsgs.voted) < v.quorum-1) && !restore {
@@ -471,7 +468,6 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 	// send view data
 	if !v.SpeedUpViewChange {
 		v.Logger.Debugf("Node %d is joining view change, last view is %d", v.SelfID, v.currView)
-		v.emitViewEvent("election_trigger", v.currView, target, 0)
 		v.startViewChange(&change{view: v.currView, stopView: true})
 	}
 	if !restore {

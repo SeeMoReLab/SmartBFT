@@ -87,13 +87,6 @@ type Handler interface {
 	Handle(context.Context, uint64, string, []byte) ([]byte, error)
 }
 
-// HandlerFunc adapts a function to Handler.
-type HandlerFunc func(context.Context, uint64, string, []byte) ([]byte, error)
-
-func (f HandlerFunc) Handle(ctx context.Context, from uint64, operation string, payload []byte) ([]byte, error) {
-	return f(ctx, from, operation, payload)
-}
-
 // ServerConfig controls response writes made by a registered Step service.
 type ServerConfig struct {
 	SendTimeout time.Duration

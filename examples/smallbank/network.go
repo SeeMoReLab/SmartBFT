@@ -112,12 +112,10 @@ func hostByID(hosts []hostEntry, id uint64) (hostEntry, bool) {
 }
 
 type grpcConsensusRequest struct {
-	From    uint64
 	Message []byte
 }
 
 type grpcTransactionRequest struct {
-	From    uint64
 	Payload []byte
 }
 
@@ -152,7 +150,6 @@ type grpcStateSnapshotRequest struct {
 }
 
 type grpcReplyRequest struct {
-	From     uint64
 	Response response
 }
 
@@ -381,8 +378,7 @@ func (s *clientReplyServer) Handle(_ context.Context, from uint64, operation str
 	if err := fabrictransport.Unmarshal(payload, request); err != nil {
 		return nil, fmt.Errorf("decode client reply: %w", err)
 	}
-	request.From = from
-	s.tracker.observe(request.From, request.Response)
+	s.tracker.observe(from, request.Response)
 	return nil, nil
 }
 
@@ -556,7 +552,7 @@ func newNetworkNodeServer(
 			if localNode == nil {
 				return fmt.Errorf("node %d not initialized", id)
 			}
-			return localNode.applyBaseRequestTimeout(timeout, "learning-recommendation")
+			return localNode.applyBaseRequestTimeout(timeout)
 		}
 	}
 	learning, err := newLearningManager(learningOpts)
@@ -637,22 +633,20 @@ func (s *networkNodeServer) closeOnceClose(ctx context.Context) {
 
 // Handle dispatches all node, client, control, and state-transfer traffic from
 // the shared Fabric-style Step service.
-func (s *networkNodeServer) Handle(ctx context.Context, from uint64, operation string, payload []byte) ([]byte, error) {
+func (s *networkNodeServer) Handle(_ context.Context, from uint64, operation string, payload []byte) ([]byte, error) {
 	switch operation {
 	case operationConsensus:
 		request := new(grpcConsensusRequest)
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
 			return nil, fmt.Errorf("decode consensus request: %w", err)
 		}
-		request.From = from
-		return nil, s.handleConsensusRequest(request)
+		return nil, s.handleConsensusRequest(from, request)
 	case operationTransaction:
 		request := new(grpcTransactionRequest)
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
 			return nil, fmt.Errorf("decode forwarded transaction: %w", err)
 		}
-		request.From = from
-		s.Transaction(request)
+		s.Transaction(from, request)
 		return nil, nil
 	case operationSubmit:
 		request := new(grpcSubmitRequest)
@@ -672,27 +666,19 @@ func (s *networkNodeServer) Handle(ctx context.Context, from uint64, operation s
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
 			return nil, fmt.Errorf("decode status request: %w", err)
 		}
-		result, err := s.Status(ctx, request)
-		if err != nil {
-			return nil, err
-		}
-		return fabrictransport.Marshal(result)
+		return fabrictransport.Marshal(s.Status())
 	case operationChecksum:
 		request := new(grpcChecksumRequest)
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
 			return nil, fmt.Errorf("decode checksum request: %w", err)
 		}
-		result, err := s.Checksum(ctx, request)
-		if err != nil {
-			return nil, err
-		}
-		return fabrictransport.Marshal(result)
+		return fabrictransport.Marshal(s.Checksum())
 	case operationStateTransfer:
 		request := new(grpcStateSnapshotRequest)
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
 			return nil, fmt.Errorf("decode state-transfer request: %w", err)
 		}
-		result, err := s.StateSnapshot(ctx, request)
+		result, err := s.StateSnapshot(request)
 		if err != nil {
 			return nil, err
 		}
@@ -702,19 +688,19 @@ func (s *networkNodeServer) Handle(ctx context.Context, from uint64, operation s
 	}
 }
 
-func (s *networkNodeServer) handleConsensusRequest(req *grpcConsensusRequest) error {
+func (s *networkNodeServer) handleConsensusRequest(from uint64, req *grpcConsensusRequest) error {
 	msg := &smartbftprotos.Message{}
 	if err := proto.Unmarshal(req.Message, msg); err != nil {
 		return grpcstatus.Errorf(codes.InvalidArgument, "decode consensus message: %v", err)
 	}
-	s.node.consensus.HandleMessage(req.From, msg)
+	s.node.consensus.HandleMessage(from, msg)
 	return nil
 }
 
 // Transaction admits a request forwarded by another replica. A rejection is not
 // reported back: the forwarder does not wait for an answer.
-func (s *networkNodeServer) Transaction(req *grpcTransactionRequest) {
-	_ = s.node.handleRequest(req.From, req.Payload)
+func (s *networkNodeServer) Transaction(from uint64, req *grpcTransactionRequest) {
+	_ = s.node.handleRequest(from, req.Payload)
 }
 
 func (s *networkNodeServer) acceptBroadcastSubmit(decoded request, req *grpcSubmitRequest) error {
@@ -726,21 +712,21 @@ func (s *networkNodeServer) acceptBroadcastSubmit(decoded request, req *grpcSubm
 	return s.node.submitRequest(decoded.ClientID, decoded.ID, req.Payload)
 }
 
-func (s *networkNodeServer) Status(context.Context, *grpcStatusRequest) (*grpcStatusResponse, error) {
+func (s *networkNodeServer) Status() *grpcStatusResponse {
 	return &grpcStatusResponse{
 		Leader:  s.node.consensus.GetLeaderID(),
 		Running: s.node.consensus.GetLeaderID() != 0,
-	}, nil
+	}
 }
 
-func (s *networkNodeServer) Checksum(context.Context, *grpcChecksumRequest) (*grpcChecksumResponse, error) {
+func (s *networkNodeServer) Checksum() *grpcChecksumResponse {
 	s.node.stateLock.Lock()
 	raw := mustJSON(s.node.state.deterministicStateSnapshot())
 	s.node.stateLock.Unlock()
-	return &grpcChecksumResponse{Checksum: hashBytes(raw)}, nil
+	return &grpcChecksumResponse{Checksum: hashBytes(raw)}
 }
 
-func (s *networkNodeServer) StateSnapshot(_ context.Context, req *grpcStateSnapshotRequest) (*stateSyncSnapshot, error) {
+func (s *networkNodeServer) StateSnapshot(req *grpcStateSnapshotRequest) (*stateSyncSnapshot, error) {
 	snapshot, err := s.node.serveSyncSnapshot(*req)
 	if err != nil {
 		return nil, grpcstatus.Errorf(codes.FailedPrecondition, "serve state snapshot: %v", err)

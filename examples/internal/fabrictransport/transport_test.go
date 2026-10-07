@@ -18,6 +18,13 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// HandlerFunc adapts a function to Handler.
+type HandlerFunc func(context.Context, uint64, string, []byte) ([]byte, error)
+
+func (f HandlerFunc) Handle(ctx context.Context, from uint64, operation string, payload []byte) ([]byte, error) {
+	return f(ctx, from, operation, payload)
+}
+
 func TestCallReusesOperationStreamAndRecreatesCanceledStream(t *testing.T) {
 	listener := newPipeListener()
 	server := grpc.NewServer()
