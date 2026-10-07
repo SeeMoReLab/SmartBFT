@@ -74,22 +74,27 @@ func TestAccountCreationWorkersDefaultsToFirstPhaseTerminals(t *testing.T) {
 	}
 }
 
-func TestPendingTrackerReplaysCompletedResponse(t *testing.T) {
+func TestPendingTrackerForgetsDecidedAndCompletedRequests(t *testing.T) {
 	pending := newPendingTracker()
-	req := request{ClientID: "client", ID: "1", Type: txBalance}
-	want := response{ClientID: "client", ID: "1", Status: statusSuccess}
+	decided := request{ClientID: "client", ID: "1", Type: txBalance}
+	duplicate := request{ClientID: "client", ID: "2", Type: txBalance}
 
-	pending.complete(want)
-	respCh, cancel := pending.register(req)
-	defer cancel()
+	pending.markSubmitted(decided)
+	pending.markSubmitted(duplicate)
 
-	select {
-	case got := <-respCh:
-		if got != want {
-			t.Fatalf("response = %#v, want %#v", got, want)
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("timed out waiting for cached response")
+	if _, ok := pending.latencyFor(decided, time.Now()); !ok {
+		t.Fatalf("latency for a submitted request was not found")
+	}
+	if _, ok := pending.latencyFor(decided, time.Now()); ok {
+		t.Fatalf("latency entry was kept after the request was decided")
+	}
+
+	pending.complete(response{ClientID: duplicate.ClientID, ID: duplicate.ID, Status: statusDuplicate})
+	if _, ok := pending.latencyFor(duplicate, time.Now()); ok {
+		t.Fatalf("latency entry was kept after the request completed")
+	}
+	if n := len(pending.submitted); n != 0 {
+		t.Fatalf("submitted entries = %d, want 0", n)
 	}
 }
 

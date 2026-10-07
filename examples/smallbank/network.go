@@ -459,10 +459,9 @@ func (t *networkTransport) fetchStateSnapshot(ctx context.Context, targetID uint
 }
 
 type replyTracker struct {
-	lock      sync.Mutex
-	quorum    int
-	waiters   map[string]*replyWaiter
-	completed map[string]response
+	lock    sync.Mutex
+	quorum  int
+	waiters map[string]*replyWaiter
 }
 
 type replyWaiter struct {
@@ -473,9 +472,8 @@ type replyWaiter struct {
 
 func newReplyTracker(quorum int) *replyTracker {
 	return &replyTracker{
-		quorum:    quorum,
-		waiters:   make(map[string]*replyWaiter),
-		completed: make(map[string]response),
+		quorum:  quorum,
+		waiters: make(map[string]*replyWaiter),
 	}
 }
 
@@ -484,12 +482,6 @@ func (t *replyTracker) register(req request) (<-chan response, func()) {
 	ch := make(chan response, 1)
 
 	t.lock.Lock()
-	if resp, exists := t.completed[key]; exists {
-		ch <- resp
-		close(ch)
-		t.lock.Unlock()
-		return ch, func() {}
-	}
 	t.waiters[key] = &replyWaiter{
 		ch:       ch,
 		matches:  make(map[response]int),
@@ -526,7 +518,6 @@ func (t *replyTracker) observe(from uint64, resp response) {
 		return
 	}
 	delete(t.waiters, key)
-	t.completed[key] = resp
 	t.lock.Unlock()
 
 	waiter.ch <- resp

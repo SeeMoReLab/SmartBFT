@@ -11,18 +11,18 @@ import (
 	"time"
 )
 
+// pendingTracker holds per-request state only until the request is decided or
+// completed, so its size is bounded by the requests in flight.
 type pendingTracker struct {
 	lock      sync.Mutex
 	waiters   map[string]chan response
 	submitted map[string]time.Time
-	completed map[string]response
 }
 
 func newPendingTracker() *pendingTracker {
 	return &pendingTracker{
 		waiters:   make(map[string]chan response),
 		submitted: make(map[string]time.Time),
-		completed: make(map[string]response),
 	}
 }
 
@@ -31,12 +31,6 @@ func (p *pendingTracker) register(req request) (<-chan response, func()) {
 	ch := make(chan response, 1)
 
 	p.lock.Lock()
-	if resp, exists := p.completed[key]; exists {
-		ch <- resp
-		close(ch)
-		p.lock.Unlock()
-		return ch, func() {}
-	}
 	p.waiters[key] = ch
 	p.submitted[key] = time.Now()
 	p.lock.Unlock()
@@ -61,10 +55,6 @@ func (p *pendingTracker) markSubmitted(req request) {
 }
 
 func (p *pendingTracker) complete(resp response) {
-	p.completeInternal(resp, true)
-}
-
-func (p *pendingTracker) completeInternal(resp response, cache bool) {
 	key := requestKey(resp.ClientID, resp.ID)
 
 	p.lock.Lock()
@@ -72,9 +62,7 @@ func (p *pendingTracker) completeInternal(resp response, cache bool) {
 	if exists {
 		delete(p.waiters, key)
 	}
-	if cache {
-		p.completed[key] = resp
-	}
+	delete(p.submitted, key)
 	p.lock.Unlock()
 
 	if exists {
@@ -84,14 +72,16 @@ func (p *pendingTracker) completeInternal(resp response, cache bool) {
 }
 
 func (p *pendingTracker) fail(req request, err error) {
-	p.completeInternal(response{
+	p.complete(response{
 		ClientID: req.ClientID,
 		ID:       req.ID,
 		Status:   statusSystemError,
 		Error:    fmt.Sprintf("submit failed: %v", err),
-	}, false)
+	})
 }
 
+// latencyFor returns the time since req was first seen and forgets the entry;
+// a request is decided at most once.
 func (p *pendingTracker) latencyFor(req request, now time.Time) (time.Duration, bool) {
 	key := requestKey(req.ClientID, req.ID)
 
@@ -102,5 +92,6 @@ func (p *pendingTracker) latencyFor(req request, now time.Time) (time.Duration, 
 	if !exists {
 		return 0, false
 	}
+	delete(p.submitted, key)
 	return now.Sub(submitted), true
 }
