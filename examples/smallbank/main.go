@@ -39,26 +39,17 @@ func main() {
 		learningNodeID  = flag.Uint64("learning-node-id", 1, "SmartBFT node ID that sends learning reports")
 		agentTarget     = flag.String("agent-target", "", "learning agent gRPC target, for example 127.0.0.1:50051")
 		initialTimeout  = flag.Duration("learning-initial-election-timeout", 5*time.Second, "initial SmartBFT timeout value reported to the learning agent")
-		windowModeFlag  = flag.String("learning-window-mode", string(learningWindowModeConsensus), "learning episode boundaries: consensus or wall-clock")
-		reportTicks     = flag.Uint64("learning-report-tick-interval", defaultLearningReportTickInterval, "consensus ticks between learning report checks")
-		reportTrigger   = flag.Duration("learning-report-trigger", defaultLearningReportTrigger, "minimum elapsed time before the first learning report")
-		maxReportLen    = flag.Uint64("learning-max-report-length", defaultLearningMaxReportLength, "maximum consensus ticks in one learning report window")
 		pollInterval    = flag.Duration("learning-poll-interval", defaultLearningPollInterval, "interval for polling the learning agent for timeout recommendations")
 		rpcTimeout      = flag.Duration("learning-rpc-timeout", defaultLearningRPCTimeout, "timeout for learning agent RPCs")
-		featureDuration = flag.Duration("learning-feature-duration", defaultLearningFeatureDuration, "feature collection duration in wall-clock mode")
-		replyWait       = flag.Duration("learning-reply-wait", defaultLearningReplyWait, "time to wait before applying a recommendation in wall-clock mode")
-		warmupDuration  = flag.Duration("learning-warmup-duration", defaultLearningWarmupDuration, "post-apply warm-up duration in wall-clock mode")
-		rewardDuration  = flag.Duration("learning-reward-duration", defaultLearningRewardDuration, "reward collection duration in wall-clock mode")
+		featureDuration = flag.Duration("learning-feature-duration", defaultLearningFeatureDuration, "feature collection duration")
+		replyWait       = flag.Duration("learning-reply-wait", defaultLearningReplyWait, "time to wait before applying a recommendation")
+		warmupDuration  = flag.Duration("learning-warmup-duration", defaultLearningWarmupDuration, "post-apply warm-up duration")
+		rewardDuration  = flag.Duration("learning-reward-duration", defaultLearningRewardDuration, "reward collection duration")
 		dataDir         = flag.String("data-dir", "", "directory for SmartBFT WAL data; defaults to a temporary directory")
 		keepData        = flag.Bool("keep-data", false, "keep generated WAL data when using a temporary data directory")
 		verbose         = flag.Bool("verbose", false, "enable SmartBFT debug logs")
 	)
 	flag.Parse()
-
-	windowMode, err := parseLearningWindowMode(*windowModeFlag)
-	if err != nil {
-		fatalf("%v", err)
-	}
 
 	if *role == "inprocess" && !*create && !*execute {
 		*create = true
@@ -66,20 +57,16 @@ func main() {
 	}
 
 	learningOptions := learningOptions{
-		Enabled:            *learning,
-		NodeID:             *learningNodeID,
-		AgentTarget:        *agentTarget,
-		InitialTimeout:     *initialTimeout,
-		WindowMode:         windowMode,
-		ReportTickInterval: *reportTicks,
-		ReportTrigger:      *reportTrigger,
-		MaxReportLength:    *maxReportLen,
-		PollInterval:       *pollInterval,
-		RPCTimeout:         *rpcTimeout,
-		FeatureDuration:    *featureDuration,
-		ReplyWait:          *replyWait,
-		WarmupDuration:     *warmupDuration,
-		RewardDuration:     *rewardDuration,
+		Enabled:         *learning,
+		NodeID:          *learningNodeID,
+		AgentTarget:     *agentTarget,
+		InitialTimeout:  *initialTimeout,
+		PollInterval:    *pollInterval,
+		RPCTimeout:      *rpcTimeout,
+		FeatureDuration: *featureDuration,
+		ReplyWait:       *replyWait,
+		WarmupDuration:  *warmupDuration,
+		RewardDuration:  *rewardDuration,
 	}
 	logMode := smallBankLogModeQuiet
 	if *verbose {

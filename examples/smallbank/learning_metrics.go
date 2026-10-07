@@ -109,15 +109,8 @@ func (m *learningWindowMetrics) recordNoProgressViewChange() {
 	m.noProgressViewChange++
 }
 
-func (m *learningWindowMetrics) buildReport() *adaptivetimers.SmartbftReport {
-	return m.buildReportUntil(time.Time{}, false)
-}
-
-func (m *learningWindowMetrics) buildReportUntil(end time.Time, allowEmpty bool) *adaptivetimers.SmartbftReport {
-	if !allowEmpty && len(m.latencies) == 0 {
-		return nil
-	}
-
+// buildReportUntil builds the window report; a zero end uses the last decision.
+func (m *learningWindowMetrics) buildReportUntil(end time.Time) *adaptivetimers.SmartbftReport {
 	throughput := m.calculateThroughputUntil(end)
 
 	avgBatchSize := float32(0)
@@ -143,10 +136,6 @@ func (m *learningWindowMetrics) buildReportUntil(end time.Time, allowEmpty bool)
 		ViewChangeCount:           saturatingUint32(m.viewChangeCount),
 		NoProgressViewChangeCount: saturatingUint32(m.noProgressViewChange),
 	}
-}
-
-func (m *learningWindowMetrics) calculateThroughput() throughputCalculation {
-	return m.calculateThroughputUntil(time.Time{})
 }
 
 func (m *learningWindowMetrics) calculateThroughputUntil(end time.Time) throughputCalculation {
