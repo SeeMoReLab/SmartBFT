@@ -398,6 +398,13 @@ func (c *Consensus) ApplyViewChangeResendInterval(interval time.Duration) error 
 		return errors.New("consensus is not started")
 	}
 
+	next := c.Config
+	next.ViewChangeResendInterval = interval
+	if err := next.Validate(); err != nil {
+		return fmt.Errorf("recommended view change resend interval creates invalid configuration: %w", err)
+	}
+
+	c.Config = next
 	c.viewChanger.ResendTimeout = interval
 	return nil
 }

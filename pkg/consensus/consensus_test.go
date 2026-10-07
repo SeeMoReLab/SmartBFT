@@ -8,6 +8,9 @@ package consensus
 import (
 	"testing"
 	"time"
+
+	algorithm "github.com/hyperledger-labs/SmartBFT/internal/bft"
+	"github.com/hyperledger-labs/SmartBFT/pkg/types"
 )
 
 func TestSplitRequestTimeout(t *testing.T) {
@@ -52,5 +55,28 @@ func TestSplitRequestTimeout(t *testing.T) {
 				t.Fatalf("total = %s, want %s", forward+complain, testCase.wantTotalTime)
 			}
 		})
+	}
+}
+
+func TestApplyViewChangeResendIntervalUpdatesConfig(t *testing.T) {
+	config := types.DefaultConfig
+	config.SelfID = 1
+	config.ViewChangeTimeout = 2 * time.Second
+	config.ViewChangeResendInterval = time.Second
+	c := &Consensus{Config: config, viewChanger: &algorithm.ViewChanger{}}
+
+	if err := c.ApplyViewChangeResendInterval(2 * time.Second); err != nil {
+		t.Fatalf("apply resend interval: %v", err)
+	}
+	if c.Config.ViewChangeResendInterval != 2*time.Second || c.viewChanger.ResendTimeout != 2*time.Second {
+		t.Fatalf("config resend = %s, view changer resend = %s, want 2s for both",
+			c.Config.ViewChangeResendInterval, c.viewChanger.ResendTimeout)
+	}
+
+	if err := c.ApplyViewChangeResendInterval(3 * time.Second); err == nil {
+		t.Fatal("a resend interval above the view change timeout was accepted")
+	}
+	if c.Config.ViewChangeResendInterval != 2*time.Second || c.viewChanger.ResendTimeout != 2*time.Second {
+		t.Fatal("a rejected resend interval changed the configuration")
 	}
 }
