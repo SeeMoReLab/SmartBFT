@@ -157,21 +157,67 @@ type networkTransport struct {
 	selfID    uint64
 	hosts     map[uint64]hostEntry
 	clients   map[uint64]*fabrictransport.Client
+	failures  *transportFailureLog
 	closeOnce sync.Once
+}
+
+// transportFailureLog prints failures on the replica-to-replica transport at
+// most once per second per peer and operation, with the number of failures
+// suppressed since the previous line. Peer 0 means the peer is unknown, as for
+// a failed inbound stream.
+type transportFailureLog struct {
+	selfID     uint64
+	lock       sync.Mutex
+	lastPrint  map[transportFailureKey]time.Time
+	suppressed map[transportFailureKey]int
+}
+
+type transportFailureKey struct {
+	peer      uint64
+	operation string
+}
+
+func newTransportFailureLog(selfID uint64) *transportFailureLog {
+	return &transportFailureLog{
+		selfID:     selfID,
+		lastPrint:  make(map[transportFailureKey]time.Time),
+		suppressed: make(map[transportFailureKey]int),
+	}
+}
+
+func (l *transportFailureLog) report(peer uint64, operation string, err error) {
+	key := transportFailureKey{peer: peer, operation: operation}
+	now := time.Now()
+	l.lock.Lock()
+	if last, printed := l.lastPrint[key]; printed && now.Sub(last) < time.Second {
+		l.suppressed[key]++
+		l.lock.Unlock()
+		return
+	}
+	suppressed := l.suppressed[key]
+	l.suppressed[key] = 0
+	l.lastPrint[key] = now
+	l.lock.Unlock()
+	fmt.Printf("%s transport failure: node=%d peer=%d operation=%s suppressed=%d err=%v\n",
+		timestampedLogTag("transport"), l.selfID, peer, operation, suppressed, err)
 }
 
 func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, error) {
 	t := &networkTransport{
-		selfID:  selfID,
-		hosts:   make(map[uint64]hostEntry, len(hosts)),
-		clients: make(map[uint64]*fabrictransport.Client),
+		selfID:   selfID,
+		hosts:    make(map[uint64]hostEntry, len(hosts)),
+		clients:  make(map[uint64]*fabrictransport.Client),
+		failures: newTransportFailureLog(selfID),
 	}
 	for _, host := range hosts {
 		t.hosts[host.ID] = host
 		if host.ID == selfID {
 			continue
 		}
-		client, err := newSmallBankFabricClient(selfID, host.address(), consensusQueueSize, consensusFlowControl, nil)
+		peerID := host.ID
+		client, err := newSmallBankFabricClient(selfID, host.address(), consensusQueueSize, consensusFlowControl, func(operation string, err error) {
+			t.failures.report(peerID, operation, err)
+		})
 		if err != nil {
 			t.close()
 			return nil, fmt.Errorf("create transport to node %d at %s: %w", host.ID, host.address(), err)
@@ -221,8 +267,10 @@ func (t *networkTransport) close() {
 		return
 	}
 	t.closeOnce.Do(func() {
-		for _, client := range t.clients {
-			_ = client.Close()
+		for id, client := range t.clients {
+			if err := client.Close(); err != nil {
+				fmt.Printf("%s transport close failed: node=%d peer=%d err=%v\n", timestampedLogTag("transport"), t.selfID, id, err)
+			}
 		}
 	})
 }
@@ -239,29 +287,38 @@ func (t *networkTransport) nodeIDs() []uint64 {
 func (t *networkTransport) sendConsensus(targetID uint64, message *smartbftprotos.Message) {
 	client := t.clients[targetID]
 	if client == nil {
+		t.failures.report(targetID, operationConsensus, errors.New("no route to peer"))
 		return
 	}
 	messageRaw, err := proto.Marshal(message)
 	if err != nil {
+		t.failures.report(targetID, operationConsensus, fmt.Errorf("marshal message: %w", err))
 		return
 	}
 	payload, err := fabrictransport.Marshal(&grpcConsensusRequest{Message: messageRaw})
 	if err != nil {
+		t.failures.report(targetID, operationConsensus, fmt.Errorf("marshal envelope: %w", err))
 		return
 	}
-	_ = client.Send(operationConsensus, payload, true)
+	if err := client.Send(operationConsensus, payload, true); err != nil {
+		t.failures.report(targetID, operationConsensus, err)
+	}
 }
 
 func (t *networkTransport) sendTransaction(targetID uint64, raw []byte) {
 	client := t.clients[targetID]
 	if client == nil {
+		t.failures.report(targetID, operationTransaction, errors.New("no route to peer"))
 		return
 	}
 	payload, err := fabrictransport.Marshal(&grpcTransactionRequest{Payload: append([]byte(nil), raw...)})
 	if err != nil {
+		t.failures.report(targetID, operationTransaction, fmt.Errorf("marshal envelope: %w", err))
 		return
 	}
-	_ = client.Send(operationTransaction, payload, false)
+	if err := client.Send(operationTransaction, payload, false); err != nil {
+		t.failures.report(targetID, operationTransaction, err)
+	}
 }
 
 func (t *networkTransport) fetchStateSnapshot(ctx context.Context, targetID uint64, req grpcStateSnapshotRequest, timeout time.Duration) (stateSyncSnapshot, error) {
@@ -591,6 +648,9 @@ func newNetworkNodeServer(
 	}
 	if err := fabrictransport.RegisterServer(s.grpcServer, s, fabrictransport.ServerConfig{
 		SendTimeout: defaultNetworkSendTimeout,
+		OnError: func(operation string, err error) {
+			transport.failures.report(0, operation, err)
+		},
 	}); err != nil {
 		_ = listener.Close()
 		n.stop()

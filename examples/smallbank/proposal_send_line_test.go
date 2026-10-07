@@ -6,6 +6,7 @@
 package main
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -129,5 +130,21 @@ func TestProposalSendLineStopReleasesWaiter(t *testing.T) {
 	}
 	if got := rec.snapshot(); len(got) != 0 {
 		t.Fatalf("held message must not be sent after stop, got %v", got)
+	}
+}
+
+func TestTransportFailureLogSuppressesRepeats(t *testing.T) {
+	log := newTransportFailureLog(1)
+	for i := 0; i < 3; i++ {
+		log.report(2, operationConsensus, errors.New("queue full"))
+	}
+	log.report(3, operationConsensus, errors.New("queue full"))
+
+	key := transportFailureKey{peer: 2, operation: operationConsensus}
+	if got := log.suppressed[key]; got != 2 {
+		t.Fatalf("suppressed = %d, want 2 repeats within one second", got)
+	}
+	if _, printed := log.lastPrint[transportFailureKey{peer: 3, operation: operationConsensus}]; !printed {
+		t.Fatal("a different peer was suppressed")
 	}
 }
