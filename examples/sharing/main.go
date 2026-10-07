@@ -21,7 +21,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 
 	smart "github.com/hyperledger-labs/SmartBFT/pkg/api"
@@ -32,13 +31,10 @@ import (
 
 func main() {
 	var (
-		role        = flag.String("role", "server", "run role: server or inprocess")
-		nodeID      = flag.Uint64("node-id", 0, "sharing node id for --role server")
+		nodeID      = flag.Uint64("node-id", 0, "sharing node id")
 		hostsConfig = flag.String("hosts-config", "", "sharing hosts config: node_id host report_port agent_port consensus_port")
 		protocolRaw = flag.String("protocol", "pbft", "consensus protocol being learned: pbft, smartbft, sbft, tendermint, hotstuff, or autobahn")
-		dataDir     = flag.String("data-dir", "", "directory for report chain WAL data; defaults to a temporary directory")
-		keepData    = flag.Bool("keep-data", false, "keep generated WAL data when using a temporary data directory")
-		verbose     = flag.Bool("verbose", false, "enable SmartBFT debug logs for the report chain")
+		dataDir     = flag.String("data-dir", "", "directory for report chain WAL data (required)")
 	)
 	flag.Parse()
 
@@ -54,30 +50,13 @@ func main() {
 		fatalf("load sharing hosts config: %v", err)
 	}
 
-	dir := *dataDir
-	if dir == "" {
-		dir, err = os.MkdirTemp("", "smartbft-sharing-")
-		if err != nil {
-			fatalf("create temp dir: %v", err)
-		}
-		if !*keepData {
-			defer os.RemoveAll(dir)
-		}
+	if *nodeID == 0 {
+		fatalf("--node-id is required")
 	}
-
-	logger := newSharingLogger(*verbose)
-
-	switch *role {
-	case "server":
-		if *nodeID == 0 {
-			fatalf("--role server requires --node-id")
-		}
-		runServer(*nodeID, hosts, protocol, dir, logger)
-	case "inprocess":
-		runInProcess(hosts, protocol, dir, logger)
-	default:
-		fatalf("unknown --role %q; expected server or inprocess", *role)
+	if *dataDir == "" {
+		fatalf("--data-dir is required")
 	}
+	runServer(*nodeID, hosts, protocol, *dataDir, newSharingLogger())
 }
 
 func runServer(nodeID uint64, hosts []hostEntry, protocol adaptivetimers.Protocol, dataDir string, logger smart.Logger) {
@@ -101,48 +80,6 @@ func runServer(nodeID uint64, hosts []hostEntry, protocol adaptivetimers.Protoco
 	if err := server.serve(); err != nil {
 		fatalf("serve: %v", err)
 	}
-}
-
-// runInProcess starts every node from the hosts config in a single process.
-// This is the local testing path: one process plus one learning agent per node
-// is enough to exercise the whole sharing loop without a cluster.
-func runInProcess(hosts []hostEntry, protocol adaptivetimers.Protocol, dataDir string, logger smart.Logger) {
-	servers := make([]*sharingServer, 0, len(hosts))
-	for _, host := range hosts {
-		server, err := newSharingServer(sharingOptions{
-			ID:       host.ID,
-			Hosts:    hosts,
-			Protocol: protocol,
-			DataDir:  dataDir,
-			Logger:   logger,
-		})
-		if err != nil {
-			for _, started := range servers {
-				started.close()
-			}
-			fatalf("start sharing node %d: %v", host.ID, err)
-		}
-		servers = append(servers, server)
-	}
-
-	var wg sync.WaitGroup
-	for _, server := range servers {
-		wg.Add(1)
-		go func(server *sharingServer) {
-			defer wg.Done()
-			if err := server.serve(); err != nil {
-				fmt.Fprintf(os.Stderr, "sharing node %d serve: %v\n", server.host.ID, err)
-			}
-		}(server)
-	}
-
-	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
-	defer stop()
-	<-stopCtx.Done()
-	for _, server := range servers {
-		server.close()
-	}
-	wg.Wait()
 }
 
 func parseProtocol(raw string) (adaptivetimers.Protocol, error) {
@@ -171,11 +108,9 @@ func (discardWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func newSharingLogger(verbose bool) smart.Logger {
-	if verbose {
-		zapLogger, _ := zap.NewDevelopment()
-		return zapLogger.Sugar()
-	}
+// newSharingLogger discards SmartBFT's own logging; the report chain prints its
+// progress lines directly.
+func newSharingLogger() smart.Logger {
 	level := zap.NewAtomicLevelAt(zapcore.PanicLevel)
 	writer := zapcore.AddSync(discardWriter{})
 	zapLogger := zap.New(zapcore.NewCore(

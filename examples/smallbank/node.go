@@ -20,19 +20,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-type wireMessage struct {
-	from uint64
-	msg  any
-}
-
-type forwardedRequest struct {
-	payload []byte
-}
-
 type node struct {
 	id             uint64
-	in             <-chan wireMessage
-	out            map[uint64]chan<- wireMessage
 	consensus      *smartbft.Consensus
 	pending        *pendingTracker
 	state          *smallBankState
@@ -47,22 +36,18 @@ type node struct {
 	lastView       uint64
 	lastIndex      uint64
 	lastLeaderID   uint64
-	lastDecision   bft.Decision
 	shutdownLogged bool
 	stopChan       chan struct{}
 	doneWG         sync.WaitGroup
 	clock          *time.Ticker
 	viewClock      *time.Ticker
-	logger         smart.Logger
-	configuration  bft.Configuration
 	failures       *proposalDelayController
 	learning       *learningManager
 	network        *networkTransport
 	replies        *clientReplyDispatcher
 
 	// sendLines hold outgoing consensus messages per peer while an injected
-	// proposal delay is active. They are created on first use so that both
-	// the gRPC and the in-memory transports go through the same path.
+	// proposal delay is active. They are created on first use.
 	sendLinesLock sync.Mutex
 	sendLines     map[uint64]*proposalSendLine
 	// lastDelayedProposal de-duplicates the proposal delay log line across
@@ -86,7 +71,6 @@ type node struct {
 }
 
 type nodeOptions struct {
-	NumNodes        int
 	BatchSize       uint64
 	BatchTimeout    time.Duration
 	Failures        *proposalDelayController
@@ -98,8 +82,6 @@ type nodeOptions struct {
 
 func newNode(
 	id uint64,
-	in <-chan wireMessage,
-	out map[uint64]chan<- wireMessage,
 	pending *pendingTracker,
 	logger smart.Logger,
 	walmet *wal.Metrics,
@@ -115,14 +97,11 @@ func newNode(
 
 	n := &node{
 		id:        id,
-		in:        in,
-		out:       out,
 		pending:   pending,
 		state:     newSmallBankState(),
 		stopChan:  make(chan struct{}),
 		clock:     time.NewTicker(10 * time.Millisecond),
 		viewClock: time.NewTicker(100 * time.Millisecond),
-		logger:    logger,
 		failures:  opts.Failures,
 		learning:  opts.Learning,
 		network:   opts.Network,
@@ -147,7 +126,6 @@ func newNode(
 	config.LeaderRotation = false
 	config.SpeedUpViewChange = false
 	config.DecisionsPerLeader = 0
-	n.configuration = config
 
 	n.consensus = &smartbft.Consensus{
 		Config:             config,
@@ -185,35 +163,9 @@ func newNode(
 		learningPrintf("applied timeouts: request_timeout_ms=%d\n",
 			(config.RequestForwardTimeout + config.RequestComplainTimeout).Milliseconds())
 	}
-	n.start()
+	n.startFailureObserver()
 
 	return n, nil
-}
-
-func (n *node) start() {
-	n.doneWG.Add(1)
-	go func() {
-		defer n.doneWG.Done()
-		for {
-			select {
-			case <-n.stopChan:
-				return
-			case wm := <-n.in:
-				switch msg := wm.msg.(type) {
-				case *smartbftprotos.Message:
-					start := time.Now()
-					smallbankTracePrintf("%s event=local_consensus_start node=%d from=%d %s\n",
-						timestampedLogTag("trace"), n.id, wm.from, smartBFTTraceMessageSummary(msg))
-					n.consensus.HandleMessage(wm.from, msg)
-					smallbankTracePrintf("%s event=local_consensus_done node=%d from=%d elapsed_ms=%d %s\n",
-						timestampedLogTag("trace"), n.id, wm.from, time.Since(start).Milliseconds(), smartBFTTraceMessageSummary(msg))
-				case forwardedRequest:
-					_ = n.handleRequest(wm.from, msg.payload)
-				}
-			}
-		}
-	}()
-	n.startFailureObserver()
 }
 
 func (n *node) startFailureObserver() {
@@ -308,25 +260,13 @@ func (n *node) printDedupState(duplicatesSkipped uint64, clientsTracked int) {
 }
 
 func (n *node) Nodes() []uint64 {
-	if n.network != nil {
-		return n.network.nodeIDs()
-	}
-	nodes := make([]uint64, 0, len(n.out)+1)
-	nodes = append(nodes, n.id)
-	for id := range n.out {
-		nodes = append(nodes, id)
-	}
-	return nodes
+	return n.network.nodeIDs()
 }
 
 func (n *node) SendConsensus(targetID uint64, message *smartbftprotos.Message) {
 	clone := proto.Clone(message).(*smartbftprotos.Message)
 	deliver := func() {
-		if n.network != nil {
-			n.network.sendConsensus(targetID, clone)
-			return
-		}
-		n.out[targetID] <- wireMessage{from: n.id, msg: clone}
+		n.network.sendConsensus(targetID, clone)
 	}
 	view, ordered := consensusMessageView(message)
 	if !ordered {
@@ -343,7 +283,7 @@ func (n *node) SendConsensus(targetID uint64, message *smartbftprotos.Message) {
 // proposalSendDelay returns the injected delay for one of this replica's own
 // proposals and logs it once per proposal.
 func (n *node) proposalSendDelay(pp *smartbftprotos.PrePrepare) time.Duration {
-	delay := n.failures.delayForProposal(n.id, n.consensus.GetLeaderID(), n.Nodes())
+	delay := n.failures.delayForProposal(n.id)
 	if delay <= 0 {
 		return 0
 	}
@@ -367,10 +307,7 @@ func (n *node) sendLine(targetID uint64) *proposalSendLine {
 	if n.sendLines == nil {
 		n.sendLines = make(map[uint64]*proposalSendLine)
 	}
-	line := newProposalSendLine(func(view uint64) {
-		smallbankTracePrintf("%s event=proposal_delay_dropped_stale node=%d to=%d view=%d\n",
-			timestampedLogTag("trace"), n.id, targetID, view)
-	})
+	line := newProposalSendLine()
 	n.sendLines[targetID] = line
 	return line
 }
@@ -386,13 +323,7 @@ func (n *node) stopSendLines() {
 }
 
 func (n *node) SendTransaction(targetID uint64, request []byte) {
-	reqCopy := append([]byte(nil), request...)
-	if n.network != nil {
-		n.network.sendTransaction(targetID, reqCopy)
-		return
-	}
-	out := n.out[targetID]
-	out <- wireMessage{from: n.id, msg: forwardedRequest{payload: reqCopy}}
+	n.network.sendTransaction(targetID, append([]byte(nil), request...))
 }
 
 func (n *node) RequestID(raw []byte) bft.RequestInfo {
@@ -718,7 +649,6 @@ func (n *node) commitDecision(md *smartbftprotos.ViewMetadata, decision bft.Deci
 	n.lastView = md.GetViewId()
 	n.lastIndex = sequence
 	n.lastLeaderID = leaderID
-	n.lastDecision = decision
 
 	var image *stateSnapshot
 	if isCheckpointSequence(sequence) {
@@ -754,31 +684,29 @@ func (n *node) Deliver(proposal bft.Proposal, signatures []bft.Signature) bft.Re
 	return bft.Reconfig{InLatestDecision: false}
 }
 
-func (n *node) applyBaseRequestTimeout(timeout time.Duration, source string) (bft.Configuration, error) {
+func (n *node) applyBaseRequestTimeout(timeout time.Duration, source string) error {
 	// Keep the view-change timers tied to the learned request timeout.
 	// ApplyViewChangeTimeout must run first: it clamps the resend interval down
 	// to the new timeout, and the explicit resend call after it raises the
 	// interval again when the timeout grows.
-	config, err := n.consensus.ApplyViewChangeTimeout(timeout)
-	if err != nil {
-		return config, err
+	if _, err := n.consensus.ApplyViewChangeTimeout(timeout); err != nil {
+		return err
 	}
 	if err := n.consensus.ApplyViewChangeResendInterval(timeout); err != nil {
-		return config, err
+		return err
 	}
-	config, err = n.consensus.ApplyRequestTimeout(timeout)
+	config, err := n.consensus.ApplyRequestTimeout(timeout)
 	if err != nil {
-		return config, err
+		return err
 	}
-	n.configuration = config
 	learningPrintf("applied SmartBFT request timeout: node=%d source=%s total_timeout_ms=%d forward_timeout_ms=%d complain_timeout_ms=%d view_change_timeout_ms=%d view_change_resend_ms=%d\n",
 		n.id, source, timeout.Milliseconds(), config.RequestForwardTimeout.Milliseconds(), config.RequestComplainTimeout.Milliseconds(),
 		config.ViewChangeTimeout.Milliseconds(), timeout.Milliseconds())
 	learningPrintf("applied timeouts: request_timeout_ms=%d\n", timeout.Milliseconds())
-	return config, nil
+	return nil
 }
 
-func (n *node) onViewEvent(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string) {
+func (n *node) onViewEvent(event string, currentView uint64, nextView uint64, proposalSeq uint64) {
 	n.recordObservedView(currentView, nextView, proposalSeq)
 	if event == "start_view_change" {
 		n.learning.recordViewChange()
@@ -787,10 +715,6 @@ func (n *node) onViewEvent(event string, nodeID uint64, currentView uint64, next
 
 func timestampedLogTag(component string) string {
 	return fmt.Sprintf("[%s %s]", component, time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
-}
-
-func smallbankTracePrintf(format string, args ...any) {
-	// fmt.Printf(format, args...)
 }
 
 func (n *node) stateAccountCount() int {

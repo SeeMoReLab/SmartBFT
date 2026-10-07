@@ -50,7 +50,7 @@ type xmlWork struct {
 
 func loadWorkloadConfig(path string) (*workloadConfig, error) {
 	if path == "" {
-		path = filepath.Join("config", workloadFileName)
+		return nil, fmt.Errorf("workload config path is empty")
 	}
 	info, err := os.Stat(path)
 	if err != nil {

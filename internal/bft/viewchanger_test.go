@@ -148,7 +148,7 @@ func TestStartViewChangeIgnoresStaleComplaint(t *testing.T) {
 		Logger:        log,
 		Controller:    controller,
 		InMsqQSize:    100,
-		ViewEvent: func(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string) {
+		ViewEvent: func(event string, currentView uint64, nextView uint64, proposalSeq uint64) {
 			if event == "inform_new_view_clear" {
 				informed <- struct{}{}
 			}
@@ -1272,7 +1272,7 @@ func TestViewChangeTimeoutStartsAfterAbortCompletes(t *testing.T) {
 		Synchronizer:      synchronizer,
 		Controller:        controller,
 		InMsqQSize:        100,
-		ViewEvent: func(event string, _ uint64, _ uint64, _ uint64, _ uint64, _ uint64, _ string) {
+		ViewEvent: func(event string, _ uint64, _ uint64, _ uint64) {
 			if event == "view_change_timeout_started" {
 				timeoutStarted <- struct{}{}
 			}

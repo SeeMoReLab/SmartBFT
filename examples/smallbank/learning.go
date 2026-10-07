@@ -28,8 +28,6 @@ type learningOptions struct {
 	NodeID          uint64
 	AgentTarget     string
 	InitialTimeout  time.Duration
-	PollInterval    time.Duration
-	RPCTimeout      time.Duration
 	FeatureDuration time.Duration
 	ReplyWait       time.Duration
 	WarmupDuration  time.Duration
@@ -112,12 +110,6 @@ func newLearningManager(opts learningOptions) (*learningManager, error) {
 	if opts.InitialTimeout <= 0 {
 		opts.InitialTimeout = 5 * time.Second
 	}
-	if opts.PollInterval <= 0 {
-		opts.PollInterval = defaultLearningPollInterval
-	}
-	if opts.RPCTimeout <= 0 {
-		opts.RPCTimeout = defaultLearningRPCTimeout
-	}
 	if opts.FeatureDuration <= 0 {
 		opts.FeatureDuration = defaultLearningFeatureDuration
 	}
@@ -131,7 +123,7 @@ func newLearningManager(opts learningOptions) (*learningManager, error) {
 		opts.RewardDuration = defaultLearningRewardDuration
 	}
 
-	client, err := newLearningAgentClient(opts.AgentTarget, opts.RPCTimeout)
+	client, err := newLearningAgentClient(opts.AgentTarget, defaultLearningRPCTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -142,8 +134,8 @@ func newLearningManager(opts learningOptions) (*learningManager, error) {
 		client:          client,
 		metrics:         newLearningWindowMetrics(),
 		currentEpisode:  1,
-		pollInterval:    opts.PollInterval,
-		rpcTimeout:      opts.RPCTimeout,
+		pollInterval:    defaultLearningPollInterval,
+		rpcTimeout:      defaultLearningRPCTimeout,
 		featureDuration: opts.FeatureDuration,
 		replyWait:       opts.ReplyWait,
 		warmupDuration:  opts.WarmupDuration,
@@ -227,20 +219,6 @@ func (m *learningManager) recordViewChange() {
 		return
 	}
 	m.metrics.recordViewChange()
-}
-
-func (m *learningManager) recordNoProgressViewChange() {
-	if m == nil || !m.enabled {
-		return
-	}
-
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	if m.wallClockStage != wallClockLearningFeature && m.wallClockStage != wallClockLearningReward {
-		return
-	}
-	m.metrics.recordNoProgressViewChange()
 }
 
 func (m *learningManager) startWallClockLearningLocked(startTick uint64, start time.Time) {

@@ -127,8 +127,7 @@ func newSharingServer(opts sharingOptions) (*sharingServer, error) {
 }
 
 // Handle dispatches every non-agent request received on the shared
-// Fabric-style Step service. The envelope's sender ID replaces the redundant
-// sender field that the old unary RPC transport trusted.
+// Fabric-style Step service. The sender is the envelope's sender ID.
 func (s *sharingServer) Handle(ctx context.Context, from uint64, operation string, payload []byte) ([]byte, error) {
 	switch operation {
 	case operationReportConsensus:
@@ -136,35 +135,25 @@ func (s *sharingServer) Handle(ctx context.Context, from uint64, operation strin
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
 			return nil, fmt.Errorf("decode report consensus request: %w", err)
 		}
-		request.From = from
-		_, err := s.Consensus(ctx, request)
-		return nil, err
+		return nil, s.Consensus(from, request)
 	case operationReportTransaction:
 		request := new(reportTransactionRequest)
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
 			return nil, fmt.Errorf("decode report transaction request: %w", err)
 		}
-		request.From = from
-		_, err := s.Transaction(ctx, request)
-		return nil, err
+		return nil, s.Transaction(from, request)
 	case operationReportSubmit:
 		request := new(reportSubmitRequest)
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
 			return nil, fmt.Errorf("decode report submission: %w", err)
 		}
-		request.From = from
-		_, err := s.Submit(ctx, request)
-		return nil, err
+		return nil, s.Submit(from, request)
 	case operationReportStateTransfer:
 		request := new(latestDecisionRequest)
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
 			return nil, fmt.Errorf("decode report state-transfer request: %w", err)
 		}
-		response, err := s.Latest(ctx, request)
-		if err != nil {
-			return nil, err
-		}
-		return fabrictransport.Marshal(response)
+		return fabrictransport.Marshal(s.Latest())
 	default:
 		return nil, fmt.Errorf("unknown sharing transport operation %q", operation)
 	}
@@ -244,46 +233,45 @@ func (s *sharingServer) submitLocal(raw []byte, episode uint32, source string) b
 
 // --- ReportChain service, called by peer sharing servers ---
 
-func (s *sharingServer) Consensus(_ context.Context, req *reportConsensusRequest) (*reportAck, error) {
-	if err := s.node.handleConsensusMessage(req.From, req.Message); err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "%v", err)
+func (s *sharingServer) Consensus(from uint64, req *reportConsensusRequest) error {
+	if err := s.node.handleConsensusMessage(from, req.Message); err != nil {
+		return grpcstatus.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	return &reportAck{}, nil
+	return nil
 }
 
-func (s *sharingServer) Transaction(_ context.Context, req *reportTransactionRequest) (*reportAck, error) {
-	if err := s.node.handleForwardedRequest(req.From, req.Payload); err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "%v", err)
+func (s *sharingServer) Transaction(from uint64, req *reportTransactionRequest) error {
+	if err := s.node.handleForwardedRequest(from, req.Payload); err != nil {
+		return grpcstatus.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	return &reportAck{}, nil
+	return nil
 }
 
-func (s *sharingServer) Submit(_ context.Context, req *reportSubmitRequest) (*reportAck, error) {
+func (s *sharingServer) Submit(from uint64, req *reportSubmitRequest) error {
 	batch, err := decodeReportBatch(req.Payload)
 	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "%v", err)
+		return grpcstatus.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if _, err := s.node.VerifyRequest(req.Payload); err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "%v", err)
+		return grpcstatus.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	s.submitLocal(req.Payload, batch.Episode, fmt.Sprintf("node-%d", req.From))
-	return &reportAck{}, nil
+	s.submitLocal(req.Payload, batch.Episode, fmt.Sprintf("node-%d", from))
+	return nil
 }
 
-func (s *sharingServer) Latest(_ context.Context, _ *latestDecisionRequest) (*latestDecisionResponse, error) {
+func (s *sharingServer) Latest() *latestDecisionResponse {
 	decision, ok := s.node.latestDecision()
 	if !ok {
-		return &latestDecisionResponse{NodeID: s.host.ID}, nil
+		return &latestDecisionResponse{}
 	}
 	view, sequence, valid := decisionViewSequence(decision)
 	if !valid {
-		return &latestDecisionResponse{NodeID: s.host.ID}, nil
+		return &latestDecisionResponse{}
 	}
 	return &latestDecisionResponse{
-		NodeID:   s.host.ID,
 		HaveTip:  true,
 		View:     view,
 		Sequence: sequence,
 		Decision: decision,
-	}, nil
+	}
 }

@@ -39,7 +39,6 @@ const (
 	operationStatus           = "smallbank-status"
 	operationChecksum         = "smallbank-checksum"
 	operationStateTransfer    = "smallbank-state-transfer"
-	operationApplyTimeout     = "smallbank-apply-timeout"
 	operationClientReply      = "smallbank-client-reply"
 )
 
@@ -112,8 +111,6 @@ func hostByID(hosts []hostEntry, id uint64) (hostEntry, bool) {
 	return hostEntry{}, false
 }
 
-type grpcAck struct{}
-
 type grpcConsensusRequest struct {
 	From    uint64
 	Message []byte
@@ -132,7 +129,6 @@ type grpcSubmitRequest struct {
 type grpcStatusRequest struct{}
 
 type grpcStatusResponse struct {
-	NodeID  uint64
 	Leader  uint64
 	Running bool
 }
@@ -140,7 +136,6 @@ type grpcStatusResponse struct {
 type grpcChecksumRequest struct{}
 
 type grpcChecksumResponse struct {
-	NodeID   uint64
 	Checksum string
 }
 
@@ -156,10 +151,6 @@ type grpcStateSnapshotRequest struct {
 	ThroughSequence    uint64
 }
 
-type grpcApplyTimeoutRequest struct {
-	TimeoutMS int64
-}
-
 type grpcReplyRequest struct {
 	From     uint64
 	Response response
@@ -170,101 +161,6 @@ type networkTransport struct {
 	hosts     map[uint64]hostEntry
 	clients   map[uint64]*fabrictransport.Client
 	closeOnce sync.Once
-}
-
-func smallBankRequestTrace(raw []byte) string {
-	req, err := decodeRequest(raw)
-	if err != nil {
-		return fmt.Sprintf("request_decode_error=%q request_bytes=%d", err.Error(), len(raw))
-	}
-	return fmt.Sprintf("request={%s %s}", req.ClientID, req.ID)
-}
-
-func smartBFTTraceMessageSummary(message *smartbftprotos.Message) string {
-	if message == nil {
-		return "type=nil view=na seq=na"
-	}
-	switch msg := message.GetContent().(type) {
-	case *smartbftprotos.Message_PrePrepare:
-		pp := msg.PrePrepare
-		if pp == nil {
-			return "type=pre_prepare view=na seq=na"
-		}
-		batchBytes := 0
-		if pp.Proposal != nil {
-			batchBytes = len(pp.Proposal.Payload)
-		}
-		return fmt.Sprintf("type=pre_prepare view=%d seq=%d proposal_bytes=%d", pp.GetView(), pp.GetSeq(), batchBytes)
-	case *smartbftprotos.Message_Prepare:
-		prepare := msg.Prepare
-		if prepare == nil {
-			return "type=prepare view=na seq=na"
-		}
-		return fmt.Sprintf("type=prepare view=%d seq=%d", prepare.GetView(), prepare.GetSeq())
-	case *smartbftprotos.Message_Commit:
-		commit := msg.Commit
-		if commit == nil {
-			return "type=commit view=na seq=na"
-		}
-		signer := uint64(0)
-		if commit.GetSignature() != nil {
-			signer = commit.GetSignature().GetSigner()
-		}
-		return fmt.Sprintf("type=commit view=%d seq=%d signer=%d", commit.GetView(), commit.GetSeq(), signer)
-	case *smartbftprotos.Message_ViewChange:
-		vc := msg.ViewChange
-		if vc == nil {
-			return "type=view_change next_view=na"
-		}
-		return fmt.Sprintf("type=view_change next_view=%d", vc.GetNextView())
-	case *smartbftprotos.Message_ViewData:
-		nextView := uint64(0)
-		signer := uint64(0)
-		if msg.ViewData != nil {
-			signer = msg.ViewData.GetSigner()
-			vd := &smartbftprotos.ViewData{}
-			if err := proto.Unmarshal(msg.ViewData.GetRawViewData(), vd); err == nil {
-				nextView = vd.GetNextView()
-			}
-		}
-		return fmt.Sprintf("type=view_data next_view=%d signer=%d", nextView, signer)
-	case *smartbftprotos.Message_NewView:
-		count := 0
-		nextView := uint64(0)
-		if msg.NewView != nil {
-			count = len(msg.NewView.GetSignedViewData())
-			for _, svd := range msg.NewView.GetSignedViewData() {
-				vd := &smartbftprotos.ViewData{}
-				if err := proto.Unmarshal(svd.GetRawViewData(), vd); err == nil {
-					nextView = vd.GetNextView()
-					break
-				}
-			}
-		}
-		return fmt.Sprintf("type=new_view next_view=%d view_data_count=%d", nextView, count)
-	case *smartbftprotos.Message_HeartBeat:
-		hb := msg.HeartBeat
-		if hb == nil {
-			return "type=heartbeat view=na seq=na"
-		}
-		return fmt.Sprintf("type=heartbeat view=%d seq=%d", hb.GetView(), hb.GetSeq())
-	case *smartbftprotos.Message_HeartBeatResponse:
-		hbr := msg.HeartBeatResponse
-		if hbr == nil {
-			return "type=heartbeat_response view=na"
-		}
-		return fmt.Sprintf("type=heartbeat_response view=%d", hbr.GetView())
-	case *smartbftprotos.Message_StateTransferRequest:
-		return "type=state_transfer_request"
-	case *smartbftprotos.Message_StateTransferResponse:
-		st := msg.StateTransferResponse
-		if st == nil {
-			return "type=state_transfer_response view=na seq=na"
-		}
-		return fmt.Sprintf("type=state_transfer_response view=%d seq=%d", st.GetViewNum(), st.GetSequence())
-	default:
-		return fmt.Sprintf("type=%T", msg)
-	}
 }
 
 func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, error) {
@@ -278,11 +174,7 @@ func newNetworkTransport(selfID uint64, hosts []hostEntry) (*networkTransport, e
 		if host.ID == selfID {
 			continue
 		}
-		peerID := host.ID
-		client, err := newSmallBankFabricClient(selfID, host.address(), consensusQueueSize, consensusFlowControl, func(operation string, err error) {
-			smallbankTracePrintf("%s event=stream_failed node=%d to=%d operation=%s err=%q\n",
-				timestampedLogTag("trace"), selfID, peerID, operation, err.Error())
-		})
+		client, err := newSmallBankFabricClient(selfID, host.address(), consensusQueueSize, consensusFlowControl, nil)
 		if err != nil {
 			t.close()
 			return nil, fmt.Errorf("create transport to node %d at %s: %w", host.ID, host.address(), err)
@@ -332,11 +224,8 @@ func (t *networkTransport) close() {
 		return
 	}
 	t.closeOnce.Do(func() {
-		for id, client := range t.clients {
-			if err := client.Close(); err != nil {
-				smallbankTracePrintf("%s event=transport_close_failed node=%d to=%d err=%q\n",
-					timestampedLogTag("trace"), t.selfID, id, err.Error())
-			}
+		for _, client := range t.clients {
+			_ = client.Close()
 		}
 	})
 }
@@ -353,69 +242,29 @@ func (t *networkTransport) nodeIDs() []uint64 {
 func (t *networkTransport) sendConsensus(targetID uint64, message *smartbftprotos.Message) {
 	client := t.clients[targetID]
 	if client == nil {
-		smallbankTracePrintf("%s event=send_consensus_drop node=%d to=%d reason=no_route %s\n",
-			timestampedLogTag("trace"), t.selfID, targetID, smartBFTTraceMessageSummary(message))
 		return
 	}
 	messageRaw, err := proto.Marshal(message)
 	if err != nil {
-		smallbankTracePrintf("%s event=send_consensus_drop node=%d to=%d reason=marshal_message err=%q\n",
-			timestampedLogTag("trace"), t.selfID, targetID, err.Error())
 		return
 	}
 	payload, err := fabrictransport.Marshal(&grpcConsensusRequest{Message: messageRaw})
 	if err != nil {
-		smallbankTracePrintf("%s event=send_consensus_drop node=%d to=%d reason=marshal_envelope err=%q\n",
-			timestampedLogTag("trace"), t.selfID, targetID, err.Error())
 		return
 	}
-	trace := smartBFTTraceMessageSummary(message)
-	smallbankTracePrintf("%s event=send_consensus_enqueue node=%d to=%d %s\n",
-		timestampedLogTag("trace"), t.selfID, targetID, trace)
-	err = client.Send(operationConsensus, payload, true, func(sendErr error) {
-		if sendErr != nil {
-			smallbankTracePrintf("%s event=send_consensus_failed node=%d to=%d err=%q %s\n",
-				timestampedLogTag("trace"), t.selfID, targetID, sendErr.Error(), trace)
-			return
-		}
-		smallbankTracePrintf("%s event=send_consensus_sent node=%d to=%d %s\n",
-			timestampedLogTag("trace"), t.selfID, targetID, trace)
-	})
-	if err != nil {
-		smallbankTracePrintf("%s event=send_consensus_drop node=%d to=%d reason=enqueue err=%q %s\n",
-			timestampedLogTag("trace"), t.selfID, targetID, err.Error(), trace)
-	}
+	_ = client.Send(operationConsensus, payload, true)
 }
 
 func (t *networkTransport) sendTransaction(targetID uint64, raw []byte) {
 	client := t.clients[targetID]
-	trace := smallBankRequestTrace(raw)
 	if client == nil {
-		smallbankTracePrintf("%s event=forward_failed node=%d to=%d reason=no_route %s\n",
-			timestampedLogTag("trace"), t.selfID, targetID, trace)
 		return
 	}
 	payload, err := fabrictransport.Marshal(&grpcTransactionRequest{Payload: append([]byte(nil), raw...)})
 	if err != nil {
-		smallbankTracePrintf("%s event=forward_failed node=%d to=%d reason=marshal err=%q %s\n",
-			timestampedLogTag("trace"), t.selfID, targetID, err.Error(), trace)
 		return
 	}
-	smallbankTracePrintf("%s event=forward_enqueue node=%d to=%d %s\n",
-		timestampedLogTag("trace"), t.selfID, targetID, trace)
-	err = client.Send(operationTransaction, payload, false, func(sendErr error) {
-		if sendErr != nil {
-			smallbankTracePrintf("%s event=forward_send_failed node=%d to=%d err=%q %s\n",
-				timestampedLogTag("trace"), t.selfID, targetID, sendErr.Error(), trace)
-			return
-		}
-		smallbankTracePrintf("%s event=forward_sent node=%d to=%d %s\n",
-			timestampedLogTag("trace"), t.selfID, targetID, trace)
-	})
-	if err != nil {
-		smallbankTracePrintf("%s event=forward_failed node=%d to=%d reason=enqueue err=%q %s\n",
-			timestampedLogTag("trace"), t.selfID, targetID, err.Error(), trace)
-	}
+	_ = client.Send(operationTransaction, payload, false)
 }
 
 func (t *networkTransport) fetchStateSnapshot(ctx context.Context, targetID uint64, req grpcStateSnapshotRequest, timeout time.Duration) (stateSyncSnapshot, error) {
@@ -436,13 +285,8 @@ func (t *networkTransport) fetchStateSnapshot(ctx context.Context, targetID uint
 	rpcCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	start := time.Now()
-	smallbankTracePrintf("%s event=sync_stream_start node=%d to=%d operation=%s\n",
-		timestampedLogTag("trace"), t.selfID, targetID, operationStateTransfer)
 	raw, err := client.Call(rpcCtx, operationStateTransfer, request)
 	if err != nil {
-		smallbankTracePrintf("%s event=sync_stream_done node=%d to=%d operation=%s elapsed_ms=%d err=%q\n",
-			timestampedLogTag("trace"), t.selfID, targetID, operationStateTransfer, time.Since(start).Milliseconds(), err.Error())
 		return stateSyncSnapshot{}, err
 	}
 	var snapshot stateSyncSnapshot
@@ -453,8 +297,6 @@ func (t *networkTransport) fetchStateSnapshot(ctx context.Context, targetID uint
 	if snapshot.NodeID != targetID {
 		return stateSyncSnapshot{}, fmt.Errorf("target node %d returned identity %d", targetID, snapshot.NodeID)
 	}
-	smallbankTracePrintf("%s event=sync_stream_done node=%d to=%d operation=%s elapsed_ms=%d err=\"\" view=%d seq=%d source=%d\n",
-		timestampedLogTag("trace"), t.selfID, targetID, operationStateTransfer, time.Since(start).Milliseconds(), snapshot.LatestView, snapshot.LatestSequence, snapshot.NodeID)
 	return snapshot, nil
 }
 
@@ -644,7 +486,7 @@ func (s *replySender) enqueue(resp response) {
 	}
 	// A disconnected benchmark client must not block replica delivery. This is
 	// equivalent to Fabric ending that client's Deliver stream.
-	if err := s.client.Send(operationClientReply, payload, true, nil); err != nil {
+	if err := s.client.Send(operationClientReply, payload, true); err != nil {
 		fmt.Printf("SmallBank reply enqueue for %s failed: %v\n", s.address, err)
 	}
 }
@@ -659,7 +501,7 @@ func newSubmitSender(host hostEntry, client *fabrictransport.Client, replyAddres
 	return &submitSender{host: host, client: client, replyAddress: replyAddress}
 }
 
-func (s *submitSender) enqueue(_ request, raw []byte) {
+func (s *submitSender) enqueue(raw []byte) {
 	payload, err := fabrictransport.Marshal(&grpcSubmitRequest{
 		Payload:      append([]byte(nil), raw...),
 		ReplyAddress: s.replyAddress,
@@ -668,12 +510,10 @@ func (s *submitSender) enqueue(_ request, raw []byte) {
 		fmt.Printf("SmallBank submit encoding for node %d failed: %v\n", s.host.ID, err)
 		return
 	}
-	if err := s.client.Send(operationSubmit, payload, false, nil); err != nil {
+	if err := s.client.Send(operationSubmit, payload, false); err != nil {
 		fmt.Printf("SmallBank submit enqueue for node %d failed: %v\n", s.host.ID, err)
 	}
 }
-
-func (s *submitSender) close() {}
 
 type networkNodeServer struct {
 	node       *node
@@ -704,28 +544,19 @@ func newNetworkNodeServer(
 	walMet := wal.NewMetrics(met, "smallbank")
 	bftMet := smart.NewMetrics(met, "smallbank")
 
-	in := make(chan wireMessage)
 	pending := newPendingTracker()
 	nodeOpts := opts
-	nodeOpts.NumNodes = len(hosts)
 	nodeOpts.Network = transport
 	nodeOpts.Replies = newClientReplyDispatcher(id)
 	var localNode *node
 	learningOpts := opts.LearningOptions
 	if learningOpts.Enabled {
-		if learningOpts.NodeID == 0 {
-			learningOpts.NodeID = 1
-		}
-		if learningOpts.NodeID == id {
-			learningOpts.ApplyTimeout = func(timeout time.Duration) error {
-				if localNode == nil {
-					return fmt.Errorf("node %d not initialized", id)
-				}
-				_, err := localNode.applyBaseRequestTimeout(timeout, "learning-recommendation")
-				return err
+		learningOpts.NodeID = id
+		learningOpts.ApplyTimeout = func(timeout time.Duration) error {
+			if localNode == nil {
+				return fmt.Errorf("node %d not initialized", id)
 			}
-		} else {
-			learningOpts = learningOptions{}
+			return localNode.applyBaseRequestTimeout(timeout, "learning-recommendation")
 		}
 	}
 	learning, err := newLearningManager(learningOpts)
@@ -734,7 +565,7 @@ func newNetworkNodeServer(
 		return nil, err
 	}
 	nodeOpts.Learning = learning
-	n, err := newNode(id, in, nil, pending, logger, walMet, bftMet, nodeOpts, dataDir)
+	n, err := newNode(id, pending, logger, walMet, bftMet, nodeOpts, dataDir)
 	if err != nil {
 		learning.close()
 		transport.close()
@@ -764,10 +595,6 @@ func newNetworkNodeServer(
 	}
 	if err := fabrictransport.RegisterServer(s.grpcServer, s, fabrictransport.ServerConfig{
 		SendTimeout: defaultNetworkSendTimeout,
-		OnError: func(operation string, err error) {
-			smallbankTracePrintf("%s event=server_stream_failed node=%d operation=%s err=%q\n",
-				timestampedLogTag("trace"), id, operation, err.Error())
-		},
 	}); err != nil {
 		_ = listener.Close()
 		n.stop()
@@ -825,8 +652,8 @@ func (s *networkNodeServer) Handle(ctx context.Context, from uint64, operation s
 			return nil, fmt.Errorf("decode forwarded transaction: %w", err)
 		}
 		request.From = from
-		_, err := s.Transaction(ctx, request)
-		return nil, err
+		s.Transaction(request)
+		return nil, nil
 	case operationSubmit:
 		request := new(grpcSubmitRequest)
 		if err := fabrictransport.Unmarshal(payload, request); err != nil {
@@ -870,13 +697,6 @@ func (s *networkNodeServer) Handle(ctx context.Context, from uint64, operation s
 			return nil, err
 		}
 		return fabrictransport.Marshal(result)
-	case operationApplyTimeout:
-		request := new(grpcApplyTimeoutRequest)
-		if err := fabrictransport.Unmarshal(payload, request); err != nil {
-			return nil, fmt.Errorf("decode timeout request: %w", err)
-		}
-		_, err := s.ApplyTimeout(ctx, request)
-		return nil, err
 	default:
 		return nil, fmt.Errorf("unknown SmallBank transport operation %q", operation)
 	}
@@ -887,34 +707,14 @@ func (s *networkNodeServer) handleConsensusRequest(req *grpcConsensusRequest) er
 	if err := proto.Unmarshal(req.Message, msg); err != nil {
 		return grpcstatus.Errorf(codes.InvalidArgument, "decode consensus message: %v", err)
 	}
-	start := time.Now()
-	smallbankTracePrintf("%s event=recv_consensus_start node=%d from=%d %s\n",
-		timestampedLogTag("trace"), s.node.id, req.From, smartBFTTraceMessageSummary(msg))
-	defer func() {
-		smallbankTracePrintf("%s event=recv_consensus_done node=%d from=%d elapsed_ms=%d %s\n",
-			timestampedLogTag("trace"), s.node.id, req.From, time.Since(start).Milliseconds(), smartBFTTraceMessageSummary(msg))
-	}()
 	s.node.consensus.HandleMessage(req.From, msg)
 	return nil
 }
 
-func (s *networkNodeServer) Transaction(_ context.Context, req *grpcTransactionRequest) (*grpcAck, error) {
-	start := time.Now()
-	trace := smallBankRequestTrace(req.Payload)
-	smallbankTracePrintf("%s event=recv_forward_start node=%d from=%d %s\n",
-		timestampedLogTag("trace"), s.node.id, req.From, trace)
-	defer func() {
-		smallbankTracePrintf("%s event=recv_forward_done node=%d from=%d elapsed_ms=%d %s\n",
-			timestampedLogTag("trace"), s.node.id, req.From, time.Since(start).Milliseconds(), trace)
-	}()
-	if err := s.node.handleRequest(req.From, req.Payload); err != nil {
-		smallbankTracePrintf("%s event=recv_forward_submit_result node=%d from=%d result=rejected err=%q %s\n",
-			timestampedLogTag("trace"), s.node.id, req.From, err.Error(), trace)
-		return &grpcAck{}, nil
-	}
-	smallbankTracePrintf("%s event=recv_forward_submit_result node=%d from=%d result=accepted err=\"\" %s\n",
-		timestampedLogTag("trace"), s.node.id, req.From, trace)
-	return &grpcAck{}, nil
+// Transaction admits a request forwarded by another replica. A rejection is not
+// reported back: the forwarder does not wait for an answer.
+func (s *networkNodeServer) Transaction(req *grpcTransactionRequest) {
+	_ = s.node.handleRequest(req.From, req.Payload)
 }
 
 func (s *networkNodeServer) acceptBroadcastSubmit(decoded request, req *grpcSubmitRequest) error {
@@ -928,7 +728,6 @@ func (s *networkNodeServer) acceptBroadcastSubmit(decoded request, req *grpcSubm
 
 func (s *networkNodeServer) Status(context.Context, *grpcStatusRequest) (*grpcStatusResponse, error) {
 	return &grpcStatusResponse{
-		NodeID:  s.node.id,
 		Leader:  s.node.consensus.GetLeaderID(),
 		Running: s.node.consensus.GetLeaderID() != 0,
 	}, nil
@@ -938,38 +737,20 @@ func (s *networkNodeServer) Checksum(context.Context, *grpcChecksumRequest) (*gr
 	s.node.stateLock.Lock()
 	raw := mustJSON(s.node.state.deterministicStateSnapshot())
 	s.node.stateLock.Unlock()
-	return &grpcChecksumResponse{NodeID: s.node.id, Checksum: hashBytes(raw)}, nil
+	return &grpcChecksumResponse{Checksum: hashBytes(raw)}, nil
 }
 
 func (s *networkNodeServer) StateSnapshot(_ context.Context, req *grpcStateSnapshotRequest) (*stateSyncSnapshot, error) {
-	start := time.Now()
-	smallbankTracePrintf("%s event=recv_sync_start node=%d method=StateSnapshot header_only=%t want_checkpoint=%t checkpoint=%d from=%d through=%d\n",
-		timestampedLogTag("trace"), s.node.id, req.HeaderOnly, req.WantCheckpoint,
-		req.CheckpointSequence, req.FromSequence, req.ThroughSequence)
 	snapshot, err := s.node.serveSyncSnapshot(*req)
 	if err != nil {
 		return nil, grpcstatus.Errorf(codes.FailedPrecondition, "serve state snapshot: %v", err)
 	}
-	smallbankTracePrintf("%s event=recv_sync_done node=%d method=StateSnapshot elapsed_ms=%d checkpoint_seq=%d latest_seq=%d decisions=%d\n",
-		timestampedLogTag("trace"), s.node.id, time.Since(start).Milliseconds(), snapshot.Checkpoint.Sequence, snapshot.LatestSequence, len(snapshot.Decisions))
 	return &snapshot, nil
-}
-
-func (s *networkNodeServer) ApplyTimeout(_ context.Context, req *grpcApplyTimeoutRequest) (*grpcAck, error) {
-	if req.TimeoutMS <= 0 {
-		return nil, grpcstatus.Error(codes.InvalidArgument, "timeout_ms must be positive")
-	}
-	_, err := s.node.applyBaseRequestTimeout(time.Duration(req.TimeoutMS)*time.Millisecond, "learning-recommendation")
-	if err != nil {
-		return nil, grpcstatus.Errorf(codes.InvalidArgument, "apply timeout: %v", err)
-	}
-	return &grpcAck{}, nil
 }
 
 type networkSmallBankClient struct {
 	hosts          []hostEntry
 	clients        map[uint64]*fabrictransport.Client
-	requestTimeout time.Duration
 	replyListen    string
 	replyAdvertise string
 	replyTracker   *replyTracker
@@ -979,7 +760,7 @@ type networkSmallBankClient struct {
 	submitSenders  map[uint64]*submitSender
 }
 
-func newNetworkSmallBankClient(hosts []hostEntry, requestTimeout time.Duration, replyListen string, replyAdvertise string) (*networkSmallBankClient, error) {
+func newNetworkSmallBankClient(hosts []hostEntry, replyListen string, replyAdvertise string) (*networkSmallBankClient, error) {
 	clients := make(map[uint64]*fabrictransport.Client, len(hosts))
 	for _, host := range hosts {
 		hostID := host.ID
@@ -997,7 +778,6 @@ func newNetworkSmallBankClient(hosts []hostEntry, requestTimeout time.Duration, 
 	client := &networkSmallBankClient{
 		hosts:          hosts,
 		clients:        clients,
-		requestTimeout: requestTimeout,
 		replyListen:    replyListen,
 		replyAdvertise: replyAdvertise,
 	}
@@ -1010,9 +790,6 @@ func newNetworkSmallBankClient(hosts []hostEntry, requestTimeout time.Duration, 
 }
 
 func (c *networkSmallBankClient) close() {
-	for _, sender := range c.submitSenders {
-		sender.close()
-	}
 	if c.replyServer != nil {
 		c.replyServer.Stop()
 	}
@@ -1080,7 +857,7 @@ func (c *networkSmallBankClient) invoke(ctx context.Context, req request) (respo
 	defer cancelWait()
 
 	for _, host := range c.hosts {
-		c.submitSenders[host.ID].enqueue(req, raw)
+		c.submitSenders[host.ID].enqueue(raw)
 	}
 
 	select {

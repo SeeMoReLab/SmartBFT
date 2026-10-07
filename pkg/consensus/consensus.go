@@ -44,7 +44,7 @@ type Consensus struct {
 	LastSignatures     []types.Signature
 	Scheduler          <-chan time.Time
 	ViewChangerTicker  <-chan time.Time
-	ViewEvent          func(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string)
+	ViewEvent          func(event string, currentView uint64, nextView uint64, proposalSeq uint64)
 
 	submittedChan chan struct{}
 	inFlight      *algorithm.InFlightData

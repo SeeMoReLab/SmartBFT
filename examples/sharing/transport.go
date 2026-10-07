@@ -25,15 +25,11 @@ const (
 	reportSendTimeout = 2 * time.Second
 )
 
-type reportAck struct{}
-
 type reportConsensusRequest struct {
-	From    uint64
 	Message []byte
 }
 
 type reportTransactionRequest struct {
-	From    uint64
 	Payload []byte
 }
 
@@ -42,7 +38,6 @@ type reportTransactionRequest struct {
 // current leader learns about an episode without waiting for SmartBFT's
 // leader-forwarding timeout.
 type reportSubmitRequest struct {
-	From    uint64
 	Payload []byte
 }
 
@@ -54,7 +49,6 @@ type latestDecisionRequest struct{}
 // traffic waits for queue space, exactly like Fabric's submit streams.
 type reportTransport struct {
 	selfID   uint64
-	hosts    map[uint64]hostEntry
 	ids      []uint64
 	clients  map[uint64]*fabrictransport.Client
 	stopOnce sync.Once
@@ -63,12 +57,10 @@ type reportTransport struct {
 func newReportTransport(selfID uint64, hosts []hostEntry) (*reportTransport, error) {
 	t := &reportTransport{
 		selfID:  selfID,
-		hosts:   make(map[uint64]hostEntry, len(hosts)),
 		ids:     nodeIDs(hosts),
 		clients: make(map[uint64]*fabrictransport.Client),
 	}
 	for _, host := range hosts {
-		t.hosts[host.ID] = host
 		if host.ID == selfID {
 			continue
 		}
@@ -147,7 +139,7 @@ func (t *reportTransport) send(targetID uint64, operation string, request any, a
 			logTag("transport"), targetID, operation, err)
 		return
 	}
-	if err := client.Send(operation, payload, allowDrop, nil); err != nil {
+	if err := client.Send(operation, payload, allowDrop); err != nil {
 		fmt.Printf("%s enqueue message to sharing node %d failed: operation=%s err=%v\n",
 			logTag("transport"), targetID, operation, err)
 	}

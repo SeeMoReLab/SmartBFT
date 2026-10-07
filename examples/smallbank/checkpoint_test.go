@@ -18,22 +18,25 @@ import (
 
 func checkpointTestNode(t *testing.T, id uint64) *node {
 	t.Helper()
-	out := make(map[uint64]chan<- wireMessage)
-	for _, peer := range []uint64{1, 2, 3, 4} {
-		if peer != id {
-			out[peer] = nil
-		}
-	}
 	n := &node{
 		id:      id,
-		out:     out,
+		network: testNetwork(id, 1, 2, 3, 4),
 		state:   newSmallBankState(),
 		pending: newPendingTracker(),
-		logger:  &testLogger{t: t},
 	}
 	seedAccounts(t, n.state)
 	n.initializeSyncHistory()
 	return n
+}
+
+// testNetwork is a transport with a peer set and no connections; tests use it
+// only for Nodes().
+func testNetwork(self uint64, ids ...uint64) *networkTransport {
+	hosts := make(map[uint64]hostEntry, len(ids))
+	for _, id := range ids {
+		hosts[id] = hostEntry{ID: id}
+	}
+	return &networkTransport{selfID: self, hosts: hosts}
 }
 
 type testLogger struct{ t *testing.T }
@@ -93,7 +96,7 @@ func deliverSequence(t *testing.T, n *node, from, to uint64, signers []uint64) [
 }
 
 func TestGenesisCheckpointCoversEmptyState(t *testing.T) {
-	n := &node{id: 1, out: map[uint64]chan<- wireMessage{}, state: newSmallBankState(), pending: newPendingTracker(), logger: &testLogger{t: t}}
+	n := &node{id: 1, network: testNetwork(1, 1), state: newSmallBankState(), pending: newPendingTracker()}
 	n.initializeSyncHistory()
 
 	header := n.syncHeader()
@@ -473,9 +476,8 @@ func TestSuccessfulDecisionAdvancesApplicationAndHistoryTogether(t *testing.T) {
 		t.Fatalf("application/history mismatch: last=(%d,%d) history=(%d,%d)",
 			n.lastView, n.lastIndex, n.historyLatestView, n.historyLatestSequence)
 	}
-	if n.historyLatestDecision.Proposal.Digest() != decision.Proposal.Digest() ||
-		n.lastDecision.Proposal.Digest() != decision.Proposal.Digest() {
-		t.Fatal("last decision and history do not reference the applied proposal")
+	if n.historyLatestDecision.Proposal.Digest() != decision.Proposal.Digest() {
+		t.Fatal("history does not reference the applied proposal")
 	}
 }
 
@@ -489,7 +491,7 @@ func capturePanic(fn func()) (value any) {
 
 func TestMismatchedGenesisRequiresInstallation(t *testing.T) {
 	local := checkpointTestNode(t, 1)
-	remote := &node{id: 2, out: map[uint64]chan<- wireMessage{1: nil, 3: nil, 4: nil}, state: newSmallBankState(), pending: newPendingTracker(), logger: &testLogger{t: t}}
+	remote := &node{id: 2, network: testNetwork(2, 1, 2, 3, 4), state: newSmallBankState(), pending: newPendingTracker()}
 	remote.initializeSyncHistory()
 
 	localHeader := local.syncHeader()

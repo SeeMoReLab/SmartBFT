@@ -372,7 +372,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 // Send enqueues a one-way message. If allowDrop is true, a full queue cancels
 // the stream and returns ErrOverflow. If it is false, Send waits for queue space
 // or transport shutdown, matching Fabric's submit-stream behavior.
-func (c *Client) Send(operation string, payload []byte, allowDrop bool, report func(error)) error {
+func (c *Client) Send(operation string, payload []byte, allowDrop bool) error {
 	if operation == "" {
 		return errors.New("fabric transport send operation is empty")
 	}
@@ -385,7 +385,7 @@ func (c *Client) Send(operation string, payload []byte, allowDrop bool, report f
 		Operation: operation,
 		Payload:   append([]byte(nil), payload...),
 	}
-	if err := stream.send(outbound{envelope: envelope, report: report}, allowDrop, nil); err != nil {
+	if err := stream.send(outbound{envelope: envelope}, allowDrop, nil); err != nil {
 		c.removeStream(operation, stream)
 		return err
 	}
@@ -500,7 +500,6 @@ func (c *Client) report(operation string, err error) {
 
 type outbound struct {
 	envelope *Envelope
-	report   func(error)
 }
 
 type callResult struct {
@@ -562,11 +561,7 @@ func (s *operationStream) serviceSends() {
 	for {
 		select {
 		case message := <-s.sendBuff:
-			err := s.sendMessage(message.envelope)
-			if message.report != nil {
-				message.report(err)
-			}
-			if err != nil {
+			if err := s.sendMessage(message.envelope); err != nil {
 				if s.cancelWith(err) {
 					s.client.report(s.operation, err)
 				}
@@ -648,14 +643,11 @@ func (s *operationStream) failPending(err error) {
 	}
 }
 
+// failQueued discards messages still queued when the stream ends.
 func (s *operationStream) failQueued() {
-	err := s.reason()
 	for {
 		select {
-		case message := <-s.sendBuff:
-			if message.report != nil {
-				message.report(err)
-			}
+		case <-s.sendBuff:
 		default:
 			return
 		}

@@ -52,12 +52,8 @@ type failureSpecXML struct {
 }
 
 type failureXML struct {
-	StartAt   *float64    `xml:"startAt"`
-	StartAtMS *int64      `xml:"startAtMs"`
-	AtTime    *float64    `xml:"atTime"`
-	AtTimeMS  *int64      `xml:"atTimeMs"`
-	Time      *float64    `xml:"time"`
-	PBFT      failurePBFT `xml:"pbft"`
+	AtTime *float64    `xml:"atTime"`
+	PBFT   failurePBFT `xml:"pbft"`
 }
 
 type failurePBFT struct {
@@ -65,16 +61,12 @@ type failurePBFT struct {
 }
 
 type proposalDelayXML struct {
-	DelayMS    *int64      `xml:"delayMs"`
-	Interval   *float64    `xml:"interval"`
-	IntervalMS *int64      `xml:"intervalMs"`
-	Count      *int        `xml:"count"`
-	Replicas   replicasXML `xml:"replicas"`
+	Interval *float64    `xml:"interval"`
+	Replicas replicasXML `xml:"replicas"`
 }
 
 type replicasXML struct {
 	Replica []replicaXML `xml:"replica"`
-	ID      []string     `xml:"id"`
 }
 
 type replicaXML struct {
@@ -120,8 +112,11 @@ func loadProposalDelayController(specPath string, startUnixMS int64) (*proposalD
 
 	rawPhases := make([]failurePhaseXML, 0, len(spec.Phases))
 	for i, phase := range spec.Phases {
+		if phase.AtTime == nil {
+			return nil, fmt.Errorf("failure spec %s: phase %d has no <atTime>", specPath, i+1)
+		}
 		rawPhases = append(rawPhases, failurePhaseXML{
-			startOffset:   failurePhaseStart(phase),
+			startOffset:   nonNegativeDurationSeconds(*phase.AtTime),
 			order:         i,
 			proposalDelay: phase.PBFT.ProposalDelay,
 		})
@@ -167,7 +162,6 @@ func appendProposalDelayPhases(phases []failurePhase, phase failurePhaseXML, nex
 		})
 	}
 
-	count := proposalDelayCount(phase.proposalDelay)
 	maxStart := time.Duration(0)
 	hasMaxStart := false
 	if nextStart != nil && *nextStart > phase.startOffset {
@@ -180,9 +174,6 @@ func appendProposalDelayPhases(phases []failurePhase, phase failurePhaseXML, nex
 		if hasMaxStart && start >= maxStart {
 			break
 		}
-		if count > 0 && added >= count {
-			break
-		}
 		phases = append(phases, failurePhase{
 			startOffset: start,
 			interval:    interval,
@@ -190,7 +181,7 @@ func appendProposalDelayPhases(phases []failurePhase, phase failurePhaseXML, nex
 			rule:        rule,
 		})
 		added++
-		if !hasMaxStart && count <= 0 {
+		if !hasMaxStart {
 			break
 		}
 	}
@@ -206,20 +197,10 @@ func appendProposalDelayPhases(phases []failurePhase, phase failurePhaseXML, nex
 }
 
 func proposalDelayInterval(delay proposalDelayXML) time.Duration {
-	if delay.IntervalMS != nil {
-		return nonNegativeDurationMS(*delay.IntervalMS)
-	}
 	if delay.Interval != nil {
 		return nonNegativeDurationSeconds(*delay.Interval)
 	}
 	return 0
-}
-
-func proposalDelayCount(delay proposalDelayXML) int {
-	if delay.Count == nil || *delay.Count < 0 {
-		return 0
-	}
-	return *delay.Count
 }
 
 func failureWarmUp(spec failureSpecXML) time.Duration {
@@ -232,28 +213,8 @@ func failureWarmUp(spec failureSpecXML) time.Duration {
 	return 0
 }
 
-func failurePhaseStart(phase failureXML) time.Duration {
-	if phase.StartAtMS != nil {
-		return nonNegativeDurationMS(*phase.StartAtMS)
-	}
-	if phase.AtTimeMS != nil {
-		return nonNegativeDurationMS(*phase.AtTimeMS)
-	}
-	if phase.StartAt != nil {
-		return nonNegativeDurationSeconds(*phase.StartAt)
-	}
-	if phase.AtTime != nil {
-		return nonNegativeDurationSeconds(*phase.AtTime)
-	}
-	if phase.Time != nil {
-		return nonNegativeDurationSeconds(*phase.Time)
-	}
-	return 0
-}
-
 func parseProposalDelayRule(delay proposalDelayXML) proposalDelayRule {
 	rule := proposalDelayRule{replicaDelays: make(map[uint64]time.Duration)}
-	defaultDelay, hasDefault := optionalDelayMS(delay.DelayMS)
 
 	for _, replica := range delay.Replicas.Replica {
 		idText := strings.TrimSpace(replica.ID)
@@ -263,10 +224,7 @@ func parseProposalDelayRule(delay proposalDelayXML) proposalDelayRule {
 
 		replicaDelay, hasReplicaDelay := optionalDelayMS(replica.DelayMS)
 		if !hasReplicaDelay {
-			if !hasDefault {
-				continue
-			}
-			replicaDelay = defaultDelay
+			continue
 		}
 
 		if strings.EqualFold(idText, leaderReplicaToken) {
@@ -278,26 +236,6 @@ func parseProposalDelayRule(delay proposalDelayXML) proposalDelayRule {
 		replicaID, err := strconv.ParseUint(idText, 10, 64)
 		if err == nil {
 			rule.replicaDelays[replicaID] = replicaDelay
-		}
-	}
-
-	if len(delay.Replicas.Replica) > 0 || !hasDefault {
-		return rule
-	}
-
-	for _, rawID := range delay.Replicas.ID {
-		idText := strings.TrimSpace(rawID)
-		if idText == "" {
-			continue
-		}
-		if strings.EqualFold(idText, leaderReplicaToken) {
-			rule.leaderWindowDelay = defaultDelay
-			rule.hasLeaderWindowRule = true
-			continue
-		}
-		replicaID, err := strconv.ParseUint(idText, 10, 64)
-		if err == nil {
-			rule.replicaDelays[replicaID] = defaultDelay
 		}
 	}
 
@@ -342,7 +280,7 @@ func (c *proposalDelayController) observeLeader(leaderID uint64, nodeIDs []uint6
 	c.pinLeaderWindow(activePhase, pinKey, intervalTick, leaderID, nodeIDs)
 }
 
-func (c *proposalDelayController) delayForProposal(nodeID uint64, leaderID uint64, nodeIDs []uint64) time.Duration {
+func (c *proposalDelayController) delayForProposal(nodeID uint64) time.Duration {
 	if c == nil || !c.enabled {
 		return 0
 	}

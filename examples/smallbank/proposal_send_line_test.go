@@ -52,7 +52,7 @@ func waitForSends(t *testing.T, r *sendRecorder, want int, within time.Duration)
 }
 
 func TestProposalSendLineSendsInlineWhenIdle(t *testing.T) {
-	line := newProposalSendLine(nil)
+	line := newProposalSendLine()
 	defer line.stop()
 	rec := newSendRecorder()
 	line.submit(1, 0, rec.record("a"))
@@ -62,7 +62,7 @@ func TestProposalSendLineSendsInlineWhenIdle(t *testing.T) {
 }
 
 func TestProposalSendLineKeepsOrderBehindDelayedProposal(t *testing.T) {
-	line := newProposalSendLine(nil)
+	line := newProposalSendLine()
 	defer line.stop()
 	rec := newSendRecorder()
 	const delay = 150 * time.Millisecond
@@ -86,13 +86,7 @@ func TestProposalSendLineKeepsOrderBehindDelayedProposal(t *testing.T) {
 }
 
 func TestProposalSendLineDropsHeldMessagesOfOlderView(t *testing.T) {
-	var dropMu sync.Mutex
-	var dropped []uint64
-	line := newProposalSendLine(func(view uint64) {
-		dropMu.Lock()
-		defer dropMu.Unlock()
-		dropped = append(dropped, view)
-	})
+	line := newProposalSendLine()
 	defer line.stop()
 	rec := newSendRecorder()
 	line.submit(1, 5*time.Second, rec.record("stale_pre_prepare"))
@@ -104,15 +98,23 @@ func TestProposalSendLineDropsHeldMessagesOfOlderView(t *testing.T) {
 	if len(sent) != 1 || sent[0] != "prepare_view2" {
 		t.Fatalf("expected only the view-2 message to be sent, got %v", sent)
 	}
-	dropMu.Lock()
-	defer dropMu.Unlock()
-	if len(dropped) != 2 || dropped[0] != 1 || dropped[1] != 1 {
-		t.Fatalf("expected both view-1 messages dropped, got %v", dropped)
+	deadline := time.Now().Add(time.Second)
+	for {
+		line.mu.Lock()
+		drained := len(line.queue) == 0 && !line.busy
+		line.mu.Unlock()
+		if drained {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("held view-1 messages were not discarded")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
 func TestProposalSendLineStopReleasesWaiter(t *testing.T) {
-	line := newProposalSendLine(nil)
+	line := newProposalSendLine()
 	rec := newSendRecorder()
 	line.submit(1, time.Hour, rec.record("never"))
 	done := make(chan struct{})

@@ -16,7 +16,7 @@
             </pbft>
         </phase>
         <phase>
-            <atTimeMs>1000</atTimeMs>
+            <atTime>1</atTime>
             <pbft>
                 <proposalDelay>
                     <replicas>

@@ -36,7 +36,6 @@ type proposalSendLine struct {
 	stopChan   chan struct{}
 	done       chan struct{}
 	stopOnce   sync.Once
-	onDrop     func(view uint64)
 }
 
 type delayedConsensusSend struct {
@@ -45,12 +44,11 @@ type delayedConsensusSend struct {
 	send      func()
 }
 
-func newProposalSendLine(onDrop func(view uint64)) *proposalSendLine {
+func newProposalSendLine() *proposalSendLine {
 	l := &proposalSendLine{
 		notify:   make(chan struct{}, 1),
 		stopChan: make(chan struct{}),
 		done:     make(chan struct{}),
-		onDrop:   onDrop,
 	}
 	go l.run()
 	return l
@@ -122,9 +120,6 @@ func (l *proposalSendLine) run() {
 func (l *proposalSendLine) release(item delayedConsensusSend) bool {
 	for {
 		if l.isStale(item.view) {
-			if l.onDrop != nil {
-				l.onDrop(item.view)
-			}
 			return true
 		}
 		wait := time.Until(item.releaseAt)

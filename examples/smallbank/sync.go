@@ -293,14 +293,9 @@ func (n *node) serveSyncSnapshot(req grpcStateSnapshotRequest) (stateSyncSnapsho
 }
 
 func (n *node) Sync() bft.SyncResponse {
-	start := time.Now()
 	defer func() {
-		smallbankTracePrintf("%s app sync: node=%d event=done elapsed_ms=%d\n", timestampedLogTag("sync"), n.id, time.Since(start).Milliseconds())
 	}()
 
-	if n.network == nil {
-		return bft.SyncResponse{Latest: n.currentDecision()}
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), syncWallClockBudget)
 	defer cancel()
 	go func() {
@@ -318,8 +313,6 @@ func (n *node) Sync() bft.SyncResponse {
 		}
 		select {
 		case <-ctx.Done():
-			smallbankTracePrintf("%s app sync: node=%d event=budget_exhausted elapsed_ms=%d position=%d err=%v\n",
-				timestampedLogTag("sync"), n.id, time.Since(start).Milliseconds(), n.currentSequence(), ctx.Err())
 			return bft.SyncResponse{Latest: n.currentDecision()}
 		case <-time.After(syncRetryInterval):
 		}
@@ -331,23 +324,17 @@ func (n *node) Sync() bft.SyncResponse {
 // availability changed during the round.
 func (n *node) checkpointSync(ctx context.Context) (bft.SyncResponse, bool) {
 	local := n.syncHeader()
-	smallbankTracePrintf("%s app sync: node=%d event=start local_seq=%d local_view=%d checkpoints=%d network=%t\n",
-		timestampedLogTag("sync"), n.id, local.LatestSequence, local.LatestView, len(local.Checkpoints), n.network != nil)
 
-	quorum, _ := decisionQuorum(len(n.Nodes()))
+	quorum := decisionQuorum(len(n.Nodes()))
 	peerHeaders := n.fetchSyncHeaders(ctx)
 	headers := append(peerHeaders, local)
 	if len(headers) < quorum {
-		smallbankTracePrintf("%s app sync: node=%d event=insufficient_headers received=%d required=%d\n",
-			timestampedLogTag("sync"), n.id, len(headers), quorum)
 		return bft.SyncResponse{Latest: n.currentDecision()}, false
 	}
 
 	requiredCheckpointVotes := stateSyncMatchCount(len(n.Nodes()))
 	candidate, hasCandidate := selectCheckpointCandidate(headers, requiredCheckpointVotes)
 	if local.LatestSequence == 0 && !hasCandidate {
-		smallbankTracePrintf("%s app sync: node=%d event=genesis_agreement_missing headers=%d required=%d\n",
-			timestampedLogTag("sync"), n.id, len(headers), requiredCheckpointVotes)
 		return bft.SyncResponse{Latest: n.currentDecision()}, false
 	}
 	position := local.LatestSequence
@@ -366,19 +353,10 @@ func (n *node) checkpointSync(ctx context.Context) (bft.SyncResponse, bool) {
 		// the stale local position synchronized.
 		return bft.SyncResponse{Latest: n.currentDecision()}, false
 	}
-	checkpointSequence := uint64(0)
-	if hasCandidate {
-		checkpointSequence = candidate.descriptor.Sequence
-	}
-	smallbankTracePrintf("%s app sync: node=%d event=target_selected checkpoint=%d target=%d donors=%v\n",
-		timestampedLogTag("sync"), n.id, checkpointSequence, target, donors)
-
 	actualPosition := local.LatestSequence
 	installCandidate := hasCandidate && checkpointNeedsInstall(local, candidate.descriptor)
 	if installCandidate {
 		if err := n.installAgreedCheckpoint(ctx, candidate); err != nil {
-			smallbankTracePrintf("%s app sync: node=%d event=checkpoint_failed seq=%d err=%v\n",
-				timestampedLogTag("sync"), n.id, candidate.descriptor.Sequence, err)
 			return bft.SyncResponse{Latest: n.currentDecision()}, false
 		}
 		actualPosition = candidate.descriptor.Sequence
@@ -386,21 +364,16 @@ func (n *node) checkpointSync(ctx context.Context) (bft.SyncResponse, bool) {
 
 	if actualPosition < target {
 		if err := n.catchUpTo(ctx, headers, donors, actualPosition, target); err != nil {
-			smallbankTracePrintf("%s app sync: node=%d event=replay_incomplete position=%d target=%d err=%v\n",
-				timestampedLogTag("sync"), n.id, n.currentSequence(), target, err)
 			return bft.SyncResponse{Latest: n.currentDecision()}, false
 		}
 	}
 	if n.currentSequence() != target {
-		smallbankTracePrintf("%s app sync: node=%d event=target_mismatch position=%d target=%d\n",
-			timestampedLogTag("sync"), n.id, n.currentSequence(), target)
 		return bft.SyncResponse{Latest: n.currentDecision()}, false
 	}
 
 	if target > local.LatestSequence {
 		n.pruneExecutedFromPool()
 	}
-	smallbankTracePrintf("%s app sync: node=%d event=target_reached seq=%d\n", timestampedLogTag("sync"), n.id, target)
 	return bft.SyncResponse{Latest: n.currentDecision()}, true
 }
 
@@ -436,15 +409,12 @@ func (n *node) fetchSyncHeaders(ctx context.Context) []stateSyncSnapshot {
 		case result := <-results:
 			received++
 			if result.err != nil {
-				smallbankTracePrintf("%s app sync: node=%d event=header_failed peer=%d err=%v\n", timestampedLogTag("sync"), n.id, result.nodeID, result.err)
 				continue
 			}
 			if result.snapshot.NodeID != result.nodeID {
-				smallbankTracePrintf("%s app sync: node=%d event=header_identity_mismatch peer=%d claimed=%d\n", timestampedLogTag("sync"), n.id, result.nodeID, result.snapshot.NodeID)
 				continue
 			}
 			if err := n.validateSyncHeader(result.snapshot); err != nil {
-				smallbankTracePrintf("%s app sync: node=%d event=header_invalid peer=%d err=%v\n", timestampedLogTag("sync"), n.id, result.nodeID, err)
 				continue
 			}
 			headers = append(headers, result.snapshot)
@@ -648,8 +618,6 @@ func (n *node) installAgreedCheckpoint(ctx context.Context, candidate checkpoint
 			lastErr = err
 			continue
 		}
-		smallbankTracePrintf("%s app sync: node=%d event=checkpoint_installed source=%d seq=%d checksum=%s\n",
-			timestampedLogTag("sync"), n.id, source, payload.Checkpoint.Sequence, payload.Checkpoint.Checksum)
 		return nil
 	}
 	if lastErr == nil {
@@ -772,7 +740,7 @@ func (n *node) verifyDecisionCertificate(decision bft.Decision) error {
 		return err
 	}
 
-	quorum, _ := decisionQuorum(len(n.Nodes()))
+	quorum := decisionQuorum(len(n.Nodes()))
 	signers := make(map[uint64]struct{}, len(decision.Signatures))
 	for _, signature := range decision.Signatures {
 		if !n.isMember(signature.ID) {
@@ -851,13 +819,11 @@ func (n *node) installStateCheckpoint(checkpoint stateCheckpoint) error {
 		n.lastDelivered = false
 		n.lastView = 0
 		n.lastIndex = 0
-		n.lastDecision = bft.Decision{}
 	} else {
 		n.prevHash = installed.Decision.Proposal.Digest()
 		n.lastDelivered = true
 		n.lastView = installed.View
 		n.lastIndex = installed.Sequence
-		n.lastDecision = installed.Decision
 	}
 	n.lastLeaderID = n.leaderID()
 
@@ -921,13 +887,12 @@ func stateSyncMatchCount(nodeCount int) int {
 	return f + 1
 }
 
-func decisionQuorum(nodeCount int) (int, int) {
+func decisionQuorum(nodeCount int) int {
 	if nodeCount <= 1 {
-		return 1, 0
+		return 1
 	}
 	f := (nodeCount - 1) / 3
-	q := (nodeCount + f + 2) / 2
-	return q, f
+	return (nodeCount + f + 2) / 2
 }
 
 func decisionViewSequence(decision bft.Decision) (uint64, uint64, bool, error) {

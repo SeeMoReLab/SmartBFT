@@ -20,7 +20,6 @@ import (
 // chain. Missing intermediate decisions are not fetched: a skipped episode only
 // costs one learning update, so catching up to the tip is enough.
 type latestDecisionResponse struct {
-	NodeID   uint64
 	HaveTip  bool
 	View     uint64
 	Sequence uint64

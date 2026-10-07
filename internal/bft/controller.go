@@ -115,7 +115,7 @@ type Controller struct {
 	State              State
 	InFlight           *InFlightData
 	MetricsView        *api.MetricsView
-	ViewEvent          func(event string, nodeID uint64, currentView uint64, nextView uint64, proposalSeq uint64, backoffFactor uint64, detail string)
+	ViewEvent          func(event string, currentView uint64, nextView uint64, proposalSeq uint64)
 	quorum             int
 
 	currView Proposer
@@ -216,9 +216,9 @@ func (c *Controller) setCurrentDecisionsInView(decisions uint64) {
 	c.currDecisionsInView = decisions
 }
 
-func (c *Controller) emitViewEvent(event string, currentView uint64, nextView uint64, proposalSeq uint64, detail string) {
+func (c *Controller) emitViewEvent(event string, currentView uint64, nextView uint64, proposalSeq uint64) {
 	if c.ViewEvent != nil {
-		c.ViewEvent(event, c.ID, currentView, nextView, proposalSeq, 0, detail)
+		c.ViewEvent(event, currentView, nextView, proposalSeq)
 	}
 }
 
@@ -297,7 +297,7 @@ func (c *Controller) OnLeaderFwdRequestTimeout(request []byte, info types.Reques
 
 	c.Logger.Warnf("Request %s leader-forwarding timeout expired, complaining about leader: %d", info, leaderID)
 	view := c.getCurrentViewNumber()
-	c.emitViewEvent("request_complain", view, view+1, 0, fmt.Sprintf("leader=%d", leaderID))
+	c.emitViewEvent("request_complain", view, view+1, 0)
 	c.FailureDetector.Complain(c.getCurrentViewNumber(), true)
 }
 
@@ -403,7 +403,7 @@ func (c *Controller) startView(proposalSequence uint64) {
 		role = Leader
 	}
 	c.LeaderMonitor.ChangeRole(role, c.currViewNumber, c.leaderID())
-	c.emitViewEvent("start_view", c.currViewNumber, c.currViewNumber, proposalSequence, fmt.Sprintf("leader=%d decisions_in_view=%d", c.leaderID(), c.currDecisionsInView))
+	c.emitViewEvent("start_view", c.currViewNumber, c.currViewNumber, proposalSequence)
 	c.Logger.Infof("Starting view with number %d, sequence %d, and decisions %d", c.currViewNumber, proposalSequence, c.currDecisionsInView)
 }
 
@@ -479,7 +479,7 @@ func (c *Controller) AbortView(view uint64) {
 // ViewChanged makes the controller abort the current view and start a new one with the given numbers
 func (c *Controller) ViewChanged(newViewNumber uint64, newProposalSequence uint64) {
 	c.Logger.Debugf("ViewChanged, the new view is %d", newViewNumber)
-	c.emitViewEvent("controller_view_changed", c.getCurrentViewNumber(), newViewNumber, newProposalSequence, "")
+	c.emitViewEvent("controller_view_changed", c.getCurrentViewNumber(), newViewNumber, newProposalSequence)
 	amILeader, _ := c.iAmTheLeader()
 	if amILeader {
 		c.Batcher.Close()
@@ -620,13 +620,7 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 	defer c.syncLock.Unlock()
 	controllerViewNum := c.currViewNumber
 	controllerSequence := c.latestSeq()
-	c.emitViewEvent(
-		"sync_start",
-		controllerViewNum,
-		controllerViewNum,
-		controllerSequence,
-		fmt.Sprintf("decisions_in_view=%d", c.getCurrentDecisionsInView()),
-	)
+	c.emitViewEvent("sync_start", controllerViewNum, controllerViewNum, controllerSequence)
 
 	syncResponse := c.Synchronizer.Sync()
 	if syncResponse.Reconfig.InReplicatedDecisions {
@@ -650,13 +644,7 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 	if len(latestDecision.Proposal.Metadata) == 0 {
 		c.Logger.Infof("Synchronizer returned with an empty proposal metadata")
 		latestDecisionMetadata = nil
-		c.emitViewEvent(
-			"sync_latest_decision",
-			controllerViewNum,
-			controllerViewNum,
-			controllerSequence,
-			"empty_metadata=true",
-		)
+		c.emitViewEvent("sync_latest_decision", controllerViewNum, controllerViewNum, controllerSequence)
 	} else {
 		md := &protos.ViewMetadata{}
 		if err := proto.Unmarshal(latestDecision.Proposal.Metadata, md); err != nil {
@@ -666,13 +654,7 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 		latestDecisionViewNum = md.ViewId
 		latestDecisionDecisions = md.DecisionsInView
 		latestDecisionMetadata = md
-		c.emitViewEvent(
-			"sync_latest_decision",
-			controllerViewNum,
-			latestDecisionViewNum,
-			latestDecisionSeq,
-			fmt.Sprintf("decisions_in_view=%d local_seq=%d", latestDecisionDecisions, controllerSequence),
-		)
+		c.emitViewEvent("sync_latest_decision", controllerViewNum, latestDecisionViewNum, latestDecisionSeq)
 	}
 
 	newProposalSequence = controllerSequence + 1
@@ -698,40 +680,16 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 	response := c.fetchState()
 	if response == nil {
 		c.Logger.Infof("Fetching state failed")
-		c.emitViewEvent(
-			"sync_fetch_state_failed",
-			controllerViewNum,
-			newViewNum,
-			newProposalSequence,
-			fmt.Sprintf("latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
-		)
+		c.emitViewEvent("sync_fetch_state_failed", controllerViewNum, newViewNum, newProposalSequence)
 		if latestDecisionMetadata == nil || latestDecisionViewNum < controllerViewNum {
 			// And the synchronizer did not return a new view
-			c.emitViewEvent(
-				"sync_no_progress",
-				controllerViewNum,
-				newViewNum,
-				newProposalSequence,
-				fmt.Sprintf("reason=fetch_failed_no_new_view latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
-			)
+			c.emitViewEvent("sync_no_progress", controllerViewNum, newViewNum, newProposalSequence)
 			return 0, 0, 0
 		}
 	} else {
-		c.emitViewEvent(
-			"sync_fetch_state_result",
-			controllerViewNum,
-			response.View,
-			response.Seq,
-			fmt.Sprintf("latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
-		)
+		c.emitViewEvent("sync_fetch_state_result", controllerViewNum, response.View, response.Seq)
 		if response.View <= controllerViewNum && latestDecisionViewNum < controllerViewNum {
-			c.emitViewEvent(
-				"sync_no_progress",
-				controllerViewNum,
-				response.View,
-				response.Seq,
-				fmt.Sprintf("reason=response_not_newer latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
-			)
+			c.emitViewEvent("sync_no_progress", controllerViewNum, response.View, response.Seq)
 			return 0, 0, 0 // no new view to report
 		}
 		if response.View > newViewNum && response.Seq == latestDecisionSeq+1 {
@@ -759,22 +717,10 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 
 	if newViewNum > controllerViewNum {
 		c.Logger.Debugf("Node %d is informing the view changer of view %d after sync of view %d and seq %d", c.ID, newViewNum, latestDecisionViewNum, latestDecisionSeq)
-		c.emitViewEvent(
-			"sync_inform_new_view",
-			controllerViewNum,
-			newViewNum,
-			newProposalSequence,
-			fmt.Sprintf("latest_decision_view=%d latest_decision_seq=%d decisions_in_view=%d", latestDecisionViewNum, latestDecisionSeq, newDecisionsInView),
-		)
+		c.emitViewEvent("sync_inform_new_view", controllerViewNum, newViewNum, newProposalSequence)
 		c.ViewChanger.InformNewView(newViewNum)
 	} else {
-		c.emitViewEvent(
-			"sync_no_progress",
-			controllerViewNum,
-			newViewNum,
-			newProposalSequence,
-			fmt.Sprintf("reason=no_newer_view latest_decision_view=%d latest_decision_seq=%d", latestDecisionViewNum, latestDecisionSeq),
-		)
+		c.emitViewEvent("sync_no_progress", controllerViewNum, newViewNum, newProposalSequence)
 	}
 
 	return newViewNum, newProposalSequence, newDecisionsInView

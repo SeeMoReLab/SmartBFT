@@ -31,7 +31,6 @@ type learningWindowMetrics struct {
 	interCommitGaps      []time.Duration
 	timeout              time.Duration
 	viewChangeCount      uint64
-	noProgressViewChange uint64
 }
 
 type learningSample struct {
@@ -105,10 +104,6 @@ func (m *learningWindowMetrics) recordViewChange() {
 	m.viewChangeCount++
 }
 
-func (m *learningWindowMetrics) recordNoProgressViewChange() {
-	m.noProgressViewChange++
-}
-
 // buildReportUntil builds the window report; a zero end uses the last decision.
 func (m *learningWindowMetrics) buildReportUntil(end time.Time) *adaptivetimers.SmartbftReport {
 	throughput := m.calculateThroughputUntil(end)
@@ -119,22 +114,21 @@ func (m *learningWindowMetrics) buildReportUntil(end time.Time) *adaptivetimers.
 	}
 
 	return &adaptivetimers.SmartbftReport{
-		TotalTransactions:         saturatingUint32(m.totalTransactions),
-		TotalConsensusInstances:   saturatingUint32(m.totalConsensus),
-		AvgConsensusLatencyMs:     avgDurationMS(m.latencies),
-		P50ConsensusLatencyMs:     percentileDurationMS(m.latencies, 0.50),
-		P95ConsensusLatencyMs:     percentileDurationMS(m.latencies, 0.95),
-		ThroughputTps:             throughput.throughput,
-		AvgBatchSize:              avgBatchSize,
-		P95BatchSize:              percentileInt(m.batchSizes, 0.95),
-		LeaderChangeCount:         saturatingUint32(m.leaderChangeCount),
-		RegencyChangeCount:        saturatingUint32(m.regencyChangeCount),
-		TimeoutMs:                 saturatingUint32(uint64(max(int64(0), m.timeout.Milliseconds()))),
-		AvgInterCommitGapMs:       avgDurationMS(m.interCommitGaps),
-		P50InterCommitGapMs:       percentileDurationMS(m.interCommitGaps, 0.50),
-		P95InterCommitGapMs:       percentileDurationMS(m.interCommitGaps, 0.95),
-		ViewChangeCount:           saturatingUint32(m.viewChangeCount),
-		NoProgressViewChangeCount: saturatingUint32(m.noProgressViewChange),
+		TotalTransactions:       saturatingUint32(m.totalTransactions),
+		TotalConsensusInstances: saturatingUint32(m.totalConsensus),
+		AvgConsensusLatencyMs:   avgDurationMS(m.latencies),
+		P50ConsensusLatencyMs:   percentileDurationMS(m.latencies, 0.50),
+		P95ConsensusLatencyMs:   percentileDurationMS(m.latencies, 0.95),
+		ThroughputTps:           throughput.throughput,
+		AvgBatchSize:            avgBatchSize,
+		P95BatchSize:            percentileInt(m.batchSizes, 0.95),
+		LeaderChangeCount:       saturatingUint32(m.leaderChangeCount),
+		RegencyChangeCount:      saturatingUint32(m.regencyChangeCount),
+		TimeoutMs:               saturatingUint32(uint64(max(int64(0), m.timeout.Milliseconds()))),
+		AvgInterCommitGapMs:     avgDurationMS(m.interCommitGaps),
+		P50InterCommitGapMs:     percentileDurationMS(m.interCommitGaps, 0.50),
+		P95InterCommitGapMs:     percentileDurationMS(m.interCommitGaps, 0.95),
+		ViewChangeCount:         saturatingUint32(m.viewChangeCount),
 	}
 }
 

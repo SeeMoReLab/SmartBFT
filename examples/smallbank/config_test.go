@@ -107,12 +107,12 @@ func TestProposalDelayController(t *testing.T) {
 	// Failure spec IDs are 0-based, while SmartBFT node IDs are 1-based.
 	// With leader node 1 and f=1 for a 4-node cluster, the leader token targets replica 0 / node 1.
 	ctrl.observeLeader(1, []uint64{1, 2, 3, 4})
-	delay := ctrl.delayForProposal(1, 1, []uint64{1, 2, 3, 4})
+	delay := ctrl.delayForProposal(1)
 	if delay != 25*time.Millisecond {
 		t.Fatalf("leader delay = %s, want 25ms", delay)
 	}
 
-	delay = ctrl.delayForProposal(2, 1, []uint64{1, 2, 3, 4})
+	delay = ctrl.delayForProposal(2)
 	if delay != 0 {
 		t.Fatalf("non-leader delay = %s, want 0", delay)
 	}
@@ -127,18 +127,18 @@ func TestProposalDelayControllerPinsLeaderWindowPerPhase(t *testing.T) {
 	nodes := []uint64{1, 2, 3, 4}
 	ctrl.observeLeader(2, nodes)
 
-	delay := ctrl.delayForProposal(2, 2, nodes)
+	delay := ctrl.delayForProposal(2)
 	if delay != 25*time.Millisecond {
 		t.Fatalf("pinned leader delay = %s, want 25ms", delay)
 	}
 
 	ctrl.observeLeader(3, nodes)
-	delay = ctrl.delayForProposal(3, 3, nodes)
+	delay = ctrl.delayForProposal(3)
 	if delay != 0 {
 		t.Fatalf("new leader delay = %s, want 0", delay)
 	}
 
-	delay = ctrl.delayForProposal(2, 3, nodes)
+	delay = ctrl.delayForProposal(2)
 	if delay != 25*time.Millisecond {
 		t.Fatalf("original pinned leader delay = %s, want 25ms", delay)
 	}
@@ -186,12 +186,12 @@ func TestProposalDelayControllerIntervalRepinsLeaderWindow(t *testing.T) {
 	nodes := []uint64{1, 2, 3, 4}
 	ctrl.observeLeader(2, nodes)
 
-	delay := ctrl.delayForProposal(2, 2, nodes)
+	delay := ctrl.delayForProposal(2)
 	if delay != 25*time.Millisecond {
 		t.Fatalf("interval leader delay = %s, want 25ms", delay)
 	}
 
-	delay = ctrl.delayForProposal(1, 2, nodes)
+	delay = ctrl.delayForProposal(1)
 	if delay != 0 {
 		t.Fatalf("previous interval leader delay = %s, want 0", delay)
 	}
@@ -231,7 +231,7 @@ func TestProposalDelayControllerOpenEndedIntervalRepinsLeaderWindow(t *testing.T
 	nodes := []uint64{1, 2, 3, 4}
 	ctrl.observeLeader(2, nodes)
 
-	delay := ctrl.delayForProposal(2, 2, nodes)
+	delay := ctrl.delayForProposal(2)
 	if delay != 25*time.Millisecond {
 		t.Fatalf("first interval leader delay = %s, want 25ms", delay)
 	}
@@ -239,11 +239,11 @@ func TestProposalDelayControllerOpenEndedIntervalRepinsLeaderWindow(t *testing.T
 	ctrl.startUnixMS = time.Now().Add(-1500 * time.Millisecond).UnixMilli()
 	ctrl.observeLeader(3, nodes)
 
-	delay = ctrl.delayForProposal(2, 3, nodes)
+	delay = ctrl.delayForProposal(2)
 	if delay != 0 {
 		t.Fatalf("previous interval leader delay = %s, want 0", delay)
 	}
-	delay = ctrl.delayForProposal(3, 3, nodes)
+	delay = ctrl.delayForProposal(3)
 	if delay != 25*time.Millisecond {
 		t.Fatalf("second interval leader delay = %s, want 25ms", delay)
 	}
@@ -256,7 +256,7 @@ func TestProposalDelayControllerExplicitReplica(t *testing.T) {
 	}
 
 	// Explicit replica 2 maps to SmartBFT node 3.
-	delay := ctrl.delayForProposal(3, 1, []uint64{1, 2, 3, 4})
+	delay := ctrl.delayForProposal(3)
 	if delay != 75*time.Millisecond {
 		t.Fatalf("explicit replica delay = %s, want 75ms", delay)
 	}
@@ -284,7 +284,6 @@ func TestLearningMetricsBuildPBFTReport(t *testing.T) {
 		Timeout:      15 * time.Millisecond,
 	})
 	metrics.recordViewChange()
-	metrics.recordNoProgressViewChange()
 
 	report := metrics.buildReportUntil(time.Time{})
 	if report == nil {
@@ -312,9 +311,6 @@ func TestLearningMetricsBuildPBFTReport(t *testing.T) {
 	if report.ViewChangeCount != 1 {
 		t.Fatalf("ViewChangeCount = %d, want 1", report.ViewChangeCount)
 	}
-	if report.NoProgressViewChangeCount != 1 {
-		t.Fatalf("NoProgressViewChangeCount = %d, want 1", report.NoProgressViewChangeCount)
-	}
 	encoded, err := proto.Marshal(report)
 	if err != nil {
 		t.Fatalf("marshal report: %v", err)
@@ -324,8 +320,7 @@ func TestLearningMetricsBuildPBFTReport(t *testing.T) {
 		t.Fatalf("unmarshal report: %v", err)
 	}
 	if roundTrip.P50ConsensusLatencyMs != report.P50ConsensusLatencyMs ||
-		roundTrip.P95InterCommitGapMs != report.P95InterCommitGapMs ||
-		roundTrip.NoProgressViewChangeCount != report.NoProgressViewChangeCount {
+		roundTrip.P95InterCommitGapMs != report.P95InterCommitGapMs {
 		t.Fatalf("round-trip report lost new fields: got %#v want %#v", roundTrip, report)
 	}
 }
@@ -386,7 +381,7 @@ func TestLearningWallClockMetricsUseFullWindow(t *testing.T) {
 		Timeout:      800 * time.Millisecond,
 	})
 
-	report := metrics.buildReportUntil(start.Add(5*time.Second))
+	report := metrics.buildReportUntil(start.Add(5 * time.Second))
 	if report == nil {
 		t.Fatalf("report is nil")
 	}
@@ -402,7 +397,7 @@ func TestLearningWallClockMetricsAllowZeroCommits(t *testing.T) {
 	metrics.timeout = 700 * time.Millisecond
 	metrics.recordViewChange()
 
-	report := metrics.buildReportUntil(start.Add(5*time.Second))
+	report := metrics.buildReportUntil(start.Add(5 * time.Second))
 	if report == nil {
 		t.Fatalf("report is nil")
 	}

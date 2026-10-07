@@ -257,10 +257,6 @@ func (n *reportNode) handleForwardedRequest(from uint64, raw []byte) error {
 	return n.consensus.HandleRequest(from, raw)
 }
 
-func (n *reportNode) leaderID() uint64 {
-	return n.consensus.GetLeaderID()
-}
-
 // --- bft.Comm ---
 
 func (n *reportNode) Nodes() []uint64 {
