@@ -36,7 +36,6 @@ type stateCheckpoint struct {
 	Sequence uint64
 	View     uint64
 	Checksum string
-	Accounts []accountSnapshot
 	Clients  []clientSnapshot
 	Decision bft.Decision
 }
@@ -98,8 +97,7 @@ func (n *node) initializeSyncHistory() {
 	genesis := stateCheckpoint{
 		Sequence: 0,
 		View:     0,
-		Checksum: hashBytes(mustJSON(stateSnapshotImage(image.Accounts, image.Clients))),
-		Accounts: cloneAccountSnapshots(image.Accounts),
+		Checksum: hashBytes(mustJSON(stateSnapshotImage(image.Clients))),
 		Clients:  cloneClientSnapshots(image.Clients),
 	}
 
@@ -130,8 +128,7 @@ func (n *node) appendHistoryLocked(md *smartbftprotos.ViewMetadata, decision bft
 	n.checkpoints = append(n.checkpoints, stateCheckpoint{
 		Sequence: sequence,
 		View:     md.GetViewId(),
-		Checksum: hashBytes(mustJSON(stateSnapshotImage(image.Accounts, image.Clients))),
-		Accounts: cloneAccountSnapshots(image.Accounts),
+		Checksum: hashBytes(mustJSON(stateSnapshotImage(image.Clients))),
 		Clients:  cloneClientSnapshots(image.Clients),
 		Decision: decision,
 	})
@@ -156,7 +153,6 @@ func cloneCheckpoint(checkpoint stateCheckpoint, withState bool) stateCheckpoint
 		Decision: cloneDecision(checkpoint.Decision),
 	}
 	if withState {
-		cloned.Accounts = cloneAccountSnapshots(checkpoint.Accounts)
 		cloned.Clients = cloneClientSnapshots(checkpoint.Clients)
 	}
 	return cloned
@@ -786,10 +782,10 @@ func (n *node) validateCheckpointState(checkpoint stateCheckpoint) error {
 	if err := n.validateCheckpointDescriptor(descriptor); err != nil {
 		return err
 	}
-	if checkpoint.Checksum != hashBytes(mustJSON(stateSnapshotImage(checkpoint.Accounts, checkpoint.Clients))) {
+	if checkpoint.Checksum != hashBytes(mustJSON(stateSnapshotImage(checkpoint.Clients))) {
 		return fmt.Errorf("checkpoint checksum mismatch")
 	}
-	if _, err := stateFromSnapshots(checkpoint.Accounts, checkpoint.Clients); err != nil {
+	if _, err := stateFromSnapshots(checkpoint.Clients); err != nil {
 		return err
 	}
 	return nil
@@ -799,7 +795,7 @@ func (n *node) installStateCheckpoint(checkpoint stateCheckpoint) error {
 	if err := n.validateCheckpointState(checkpoint); err != nil {
 		return err
 	}
-	state, err := stateFromSnapshots(checkpoint.Accounts, checkpoint.Clients)
+	state, err := stateFromSnapshots(checkpoint.Clients)
 	if err != nil {
 		return err
 	}
@@ -835,14 +831,11 @@ func (n *node) installStateCheckpoint(checkpoint stateCheckpoint) error {
 	return nil
 }
 
-func stateSnapshotImage(accounts []accountSnapshot, clients []clientSnapshot) stateSnapshot {
-	if accounts == nil {
-		accounts = []accountSnapshot{}
-	}
+func stateSnapshotImage(clients []clientSnapshot) stateSnapshot {
 	if clients == nil {
 		clients = []clientSnapshot{}
 	}
-	return stateSnapshot{Accounts: accounts, Clients: clients}
+	return stateSnapshot{Clients: clients}
 }
 
 func checkpointKey(checkpoint checkpointDescriptor) stateSyncVoteKey {
@@ -906,19 +899,8 @@ func decisionViewSequence(decision bft.Decision) (uint64, uint64, bool, error) {
 	return md.GetViewId(), md.GetLatestSequence(), true, nil
 }
 
-func stateFromSnapshots(accounts []accountSnapshot, clients []clientSnapshot) (*smallBankState, error) {
+func stateFromSnapshots(clients []clientSnapshot) (*smallBankState, error) {
 	state := newSmallBankState()
-	var previous uint64
-	for i, account := range accounts {
-		if i > 0 && account.CustomerID <= previous {
-			return nil, fmt.Errorf("account snapshot is not strictly sorted at index %d", i)
-		}
-		previous = account.CustomerID
-		state.accounts[account.CustomerID] = account.CustomerName
-		state.checking[account.CustomerID] = account.CheckingBalanceCents
-		state.savings[account.CustomerID] = account.SavingsBalanceCents
-	}
-
 	var previousClient string
 	for i, client := range clients {
 		if client.ClientID == "" {
@@ -934,15 +916,6 @@ func stateFromSnapshots(accounts []accountSnapshot, clients []clientSnapshot) (*
 		}
 	}
 	return state, nil
-}
-
-func cloneAccountSnapshots(accounts []accountSnapshot) []accountSnapshot {
-	if len(accounts) == 0 {
-		return nil
-	}
-	cloned := append([]accountSnapshot(nil), accounts...)
-	sort.Slice(cloned, func(i, j int) bool { return cloned[i].CustomerID < cloned[j].CustomerID })
-	return cloned
 }
 
 func cloneClientSnapshots(clients []clientSnapshot) []clientSnapshot {

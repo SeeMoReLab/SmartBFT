@@ -625,6 +625,7 @@ func newNetworkNodeServer(
 		return nil, err
 	}
 	localNode = n
+	learning.start()
 
 	// The node server accepts consensus and state-transfer streams from peers,
 	// so its receive windows must match the peers' consensusFlowControl.

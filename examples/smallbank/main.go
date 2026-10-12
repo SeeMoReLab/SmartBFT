@@ -28,9 +28,7 @@ func main() {
 		requestTimeout  = flag.Duration("request-timeout", 30*time.Second, "timeout waiting for a request to be delivered")
 		replyListen     = flag.String("client-reply-listen", "127.0.0.1:0", "client reply listener address for broadcast mode")
 		replyAdvertise  = flag.String("client-reply-advertise-host", "", "host/IP advertised to servers for client replies; empty uses listener address")
-		create          = flag.Bool("create", false, "create initial SmallBank accounts before executing")
 		execute         = flag.Bool("execute", false, "execute workload phases")
-		createWorkers   = flag.Int("create-workers", 0, "number of account creation workers; 0 uses the first workload phase terminals")
 		startUnixMS     = flag.Int64("start-unix-ms", 0, "absolute Unix epoch time in ms for benchmark start")
 		failureSpec     = flag.String("failure-spec", "", "failure_spec.xml path; only pbft/proposalDelay is applied")
 		failureStartMS  = flag.Int64("failure-start-unix-ms", -1, "absolute Unix epoch time in ms for failure schedule start")
@@ -41,6 +39,7 @@ func main() {
 		replyWait       = flag.Duration("learning-reply-wait", defaultLearningReplyWait, "time to wait before applying a recommendation")
 		warmupDuration  = flag.Duration("learning-warmup-duration", defaultLearningWarmupDuration, "post-apply warm-up duration")
 		rewardDuration  = flag.Duration("learning-reward-duration", defaultLearningRewardDuration, "reward collection duration")
+		learningAnchor  = flag.Int64("learning-anchor-unix-ms", -1, "absolute Unix epoch time in ms of episode 1's apply instant (benchmark start plus spec warm-up); required with --learning")
 		dataDir         = flag.String("data-dir", "", "directory for SmartBFT WAL data (required for --role server)")
 		verbose         = flag.Bool("verbose", false, "enable SmartBFT debug logs")
 	)
@@ -54,6 +53,7 @@ func main() {
 		ReplyWait:       *replyWait,
 		WarmupDuration:  *warmupDuration,
 		RewardDuration:  *rewardDuration,
+		AnchorUnixMS:    *learningAnchor,
 	}
 	logMode := smallBankLogModeQuiet
 	if *verbose {
@@ -64,11 +64,7 @@ func main() {
 	case "server":
 		runNetworkServer(*nodeID, *hostsConfig, *batchSize, *batchTimeout, *failureSpec, *failureStartMS, learningOptions, *dataDir, logMode)
 	case "client":
-		if !*create && !*execute {
-			*create = true
-			*execute = true
-		}
-		runNetworkClient(*configPath, *hostsConfig, *requestTimeout, *replyListen, *replyAdvertise, *create, *execute, *createWorkers, *startUnixMS)
+		runNetworkClient(*configPath, *hostsConfig, *requestTimeout, *replyListen, *replyAdvertise, *execute, *startUnixMS)
 	default:
 		fatalf("unknown --role %q; expected server or client", *role)
 	}
@@ -125,7 +121,7 @@ func runNetworkServer(nodeID uint64, hostsConfig string, batchSize uint64, batch
 	}
 }
 
-func runNetworkClient(configPath string, hostsConfig string, requestTimeout time.Duration, replyListen string, replyAdvertise string, create bool, execute bool, createWorkers int, startUnixMS int64) {
+func runNetworkClient(configPath string, hostsConfig string, requestTimeout time.Duration, replyListen string, replyAdvertise string, execute bool, startUnixMS int64) {
 	if hostsConfig == "" {
 		fatalf("--role client requires --hosts-config")
 	}
@@ -134,6 +130,11 @@ func runNetworkClient(configPath string, hostsConfig string, requestTimeout time
 		fatalf("load config: %v", err)
 	}
 	printConfig(cfg)
+	probe, err := encodeRequest(request{ClientID: "terminal-0", ID: "1"})
+	if err != nil {
+		fatalf("encode request: %v", err)
+	}
+	fmt.Printf("request_size=%d encoded=%d\n", requestSizeBytes, len(probe))
 	hosts, err := loadNetworkHosts(hostsConfig)
 	if err != nil {
 		fatalf("load hosts config: %v", err)
@@ -148,11 +149,6 @@ func runNetworkClient(configPath string, hostsConfig string, requestTimeout time
 	}
 
 	bench := newBenchmarker(client, cfg, requestTimeout)
-	if create {
-		if err := bench.createAccounts(accountCreationWorkers(createWorkers, cfg)); err != nil {
-			fatalf("create accounts: %v", err)
-		}
-	}
 	if execute {
 		bench.execute(startUnixMS)
 	}
@@ -170,7 +166,6 @@ func printFailureConfig(failures *proposalDelayController) {
 
 func printConfig(cfg *workloadConfig) {
 	fmt.Println("Configuration loaded:")
-	fmt.Printf("Accounts: %d\n", cfg.NumAccounts)
 	fmt.Printf("Random seed: %d\n", cfg.RandomSeed)
 	fmt.Printf("Monitor interval: %d seconds\n", cfg.MonitorIntervalSec)
 	for i, phase := range cfg.Phases {
@@ -182,15 +177,7 @@ func printConfig(cfg *workloadConfig) {
 		} else {
 			fmt.Printf("Rate: %.2f TPS/terminal\n", phase.Rate)
 		}
-		fmt.Printf("Weights: %v\n", phase.Weights)
 	}
-}
-
-func accountCreationWorkers(configuredWorkers int, cfg *workloadConfig) int {
-	if configuredWorkers > 0 {
-		return configuredWorkers
-	}
-	return cfg.Phases[0].Terminals
 }
 
 func printChecksums(checksums map[uint64]string) {

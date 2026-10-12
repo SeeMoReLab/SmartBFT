@@ -8,7 +8,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,56 +32,6 @@ func newBenchmarker(client smallBankInvoker, cfg *workloadConfig, requestTimeout
 		metrics:        newBenchmarkMetrics(requestTimeout),
 		requestTimeout: requestTimeout,
 	}
-}
-
-func (b *benchmarker) createAccounts(workers int) error {
-	if workers <= 0 {
-		workers = 1
-	}
-	fmt.Printf("Creating %d accounts with %d workers...\n", b.config.NumAccounts, workers)
-	start := time.Now()
-
-	jobs := make(chan uint64, workers)
-	var wg sync.WaitGroup
-	var firstErr atomic.Value
-
-	for workerID := 0; workerID < workers; workerID++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for accountID := range jobs {
-				req := request{
-					ClientID:             fmt.Sprintf("create-%d", workerID),
-					ID:                   fmt.Sprintf("%d", accountID),
-					Type:                 txCreateAccount,
-					CustomerID:           accountID,
-					CustomerName:         fmt.Sprintf("Customer%010d", accountID),
-					SavingsBalanceCents:  1_000_000,
-					CheckingBalanceCents: 1_000_000,
-				}
-				resp, err := b.invoke(req)
-				if err != nil {
-					firstErr.CompareAndSwap(nil, err)
-					continue
-				}
-				if resp.Status != statusSuccess {
-					firstErr.CompareAndSwap(nil, fmt.Errorf("create account %d failed: %s", accountID, resp.Error))
-				}
-			}
-		}(workerID)
-	}
-
-	for id := uint64(0); id < b.config.NumAccounts; id++ {
-		jobs <- id
-	}
-	close(jobs)
-	wg.Wait()
-
-	if val := firstErr.Load(); val != nil {
-		return val.(error)
-	}
-	fmt.Printf("Account creation finished in %.3fs\n", time.Since(start).Seconds())
-	return nil
 }
 
 func (b *benchmarker) execute(startUnixMS int64) {
@@ -115,7 +64,7 @@ func (b *benchmarker) execute(startUnixMS int64) {
 			<-startCh
 			for phaseIdx, window := range windows {
 				if terminalID < window.terminals {
-					b.runPhase(terminalID, phaseIdx, window)
+					b.runPhase(terminalID, window)
 				} else {
 					sleepUntil(window.end)
 				}
@@ -141,13 +90,8 @@ func (b *benchmarker) execute(startUnixMS int64) {
 	printResults("Total", time.Since(workloadStart), total)
 }
 
-func (b *benchmarker) runPhase(terminalID int, phaseIdx int, window phaseWindow) {
+func (b *benchmarker) runPhase(terminalID int, window phaseWindow) {
 	sleepUntil(window.start)
-
-	seed := b.terminalSeed(terminalID, phaseIdx)
-	rnd := rand.New(rand.NewSource(seed))
-	accountSeed := int64(uint64(seed) ^ uint64(0x9E3779B97F4A7C15))
-	accountRnd := rand.New(rand.NewSource(accountSeed))
 
 	saturate := window.rate == 0
 	interval := time.Duration(0)
@@ -164,7 +108,7 @@ func (b *benchmarker) runPhase(terminalID int, phaseIdx int, window phaseWindow)
 			sleepUntil(next)
 		}
 
-		req := b.nextRequest(terminalID, rnd, accountRnd, window.weights)
+		req := b.nextRequest(terminalID)
 		start := time.Now()
 		resp, err := b.invoke(req)
 		latency := time.Since(start)
@@ -179,23 +123,12 @@ func (b *benchmarker) runPhase(terminalID int, phaseIdx int, window phaseWindow)
 	}
 }
 
-func (b *benchmarker) nextRequest(terminalID int, rnd *rand.Rand, accountRnd *rand.Rand, weights [6]int) request {
-	customerID := uint64(accountRnd.Int63n(int64(b.config.NumAccounts)))
-	destID := uint64(accountRnd.Int63n(int64(b.config.NumAccounts)))
-	for destID == customerID {
-		destID = uint64(accountRnd.Int63n(int64(b.config.NumAccounts)))
-	}
-	amount := int64(100 + rnd.Intn(9901))
-	tx := selectTxType(rnd, weights)
+func (b *benchmarker) nextRequest(terminalID int) request {
 	seq := b.requestSeq.Add(1)
 
 	return request{
-		ClientID:       fmt.Sprintf("terminal-%d", terminalID),
-		ID:             fmt.Sprintf("%d", seq),
-		Type:           tx,
-		CustomerID:     customerID,
-		DestCustomerID: destID,
-		AmountCents:    amount,
+		ClientID: fmt.Sprintf("terminal-%d", terminalID),
+		ID:       fmt.Sprintf("%d", seq),
 	}
 }
 
@@ -232,10 +165,6 @@ func (b *benchmarker) startMonitor() chan struct{} {
 	return stop
 }
 
-func (b *benchmarker) terminalSeed(terminalID, phaseIdx int) int64 {
-	return (b.config.RandomSeed*31 + int64(terminalID)*17) ^ (int64(phaseIdx) * 1003)
-}
-
 func (b *benchmarker) buildPhaseSchedule() []phaseWindow {
 	windows := make([]phaseWindow, len(b.config.Phases))
 	start := time.Now()
@@ -246,7 +175,6 @@ func (b *benchmarker) buildPhaseSchedule() []phaseWindow {
 			end:       end,
 			rate:      phase.Rate,
 			terminals: phase.Terminals,
-			weights:   phase.Weights,
 		}
 		start = end
 	}
@@ -258,23 +186,10 @@ type phaseWindow struct {
 	end       time.Time
 	rate      float64
 	terminals int
-	weights   [6]int
 }
 
 func (p phaseWindow) duration() time.Duration {
 	return p.end.Sub(p.start)
-}
-
-func selectTxType(rnd *rand.Rand, weights [6]int) txType {
-	value := rnd.Intn(100)
-	cumulative := 0
-	for i, weight := range weights {
-		cumulative += weight
-		if value < cumulative {
-			return weightedTxTypes[i]
-		}
-	}
-	return txWriteCheck
 }
 
 func sleepUntil(t time.Time) {

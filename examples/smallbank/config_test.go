@@ -7,6 +7,7 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,65 +20,64 @@ func TestLoadWorkloadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.NumAccounts != 20 {
-		t.Fatalf("NumAccounts = %d, want 20", cfg.NumAccounts)
-	}
 	if cfg.MonitorIntervalSec != 1 {
 		t.Fatalf("MonitorIntervalSec = %d, want 1", cfg.MonitorIntervalSec)
 	}
 	if len(cfg.Phases) != 1 {
 		t.Fatalf("len(Phases) = %d, want 1", len(cfg.Phases))
 	}
-	if cfg.Phases[0].Weights != [6]int{15, 15, 25, 15, 15, 15} {
-		t.Fatalf("Weights = %v", cfg.Phases[0].Weights)
+	if cfg.Phases[0].Terminals != 4 || cfg.Phases[0].Rate != 5 {
+		t.Fatalf("Phases[0] = %+v", cfg.Phases[0])
 	}
 }
 
 func TestSmallBankStateApply(t *testing.T) {
 	state := newSmallBankState()
-	create := request{
-		ClientID:             "client",
-		ID:                   "1",
-		Type:                 txCreateAccount,
-		CustomerID:           1,
-		CustomerName:         "Alice",
-		SavingsBalanceCents:  1000,
-		CheckingBalanceCents: 2000,
+	for _, id := range []string{"1", "2", "3"} {
+		resp := state.apply(request{ClientID: "client", ID: id, Padding: "xxxx"})
+		if resp != (response{ClientID: "client", ID: id, Status: statusSuccess}) {
+			t.Fatalf("apply %s = %+v", id, resp)
+		}
 	}
-	if resp := state.apply(create); resp.Status != statusSuccess {
-		t.Fatalf("create status = %s", resp.Status)
-	}
-	if resp := state.apply(request{ClientID: "client", ID: "2", Type: txDepositChecking, CustomerID: 1, AmountCents: 500}); resp.Status != statusSuccess {
-		t.Fatalf("deposit status = %s", resp.Status)
-	}
-	balance := state.apply(request{ClientID: "client", ID: "3", Type: txBalance, CustomerID: 1})
-	if balance.CheckingBalanceCents != 2500 || balance.SavingsBalanceCents != 1000 {
-		t.Fatalf("balance = checking %d savings %d", balance.CheckingBalanceCents, balance.SavingsBalanceCents)
+	if state.lastExecuted["client"] != 3 {
+		t.Fatalf("watermark = %d, want 3", state.lastExecuted["client"])
 	}
 }
 
-func TestAccountCreationWorkersDefaultsToFirstPhaseTerminals(t *testing.T) {
-	cfg := &workloadConfig{
-		Phases: []phaseConfig{
-			{Terminals: 7},
-			{Terminals: 11},
-		},
+func TestEncodedRequestIsExactlyRequestSize(t *testing.T) {
+	for _, clientID := range []string{"terminal-0", "terminal-511", "create-0"} {
+		for _, id := range []string{"1", "9", "10", "99999", "1000000", "4294967296", "18446744073709551615"} {
+			raw, err := encodeRequest(request{ClientID: clientID, ID: id, Padding: "stale"})
+			if err != nil {
+				t.Fatalf("encode %s/%s: %v", clientID, id, err)
+			}
+			if len(raw) != requestSizeBytes {
+				t.Fatalf("encoded %s/%s is %d bytes, want %d", clientID, id, len(raw), requestSizeBytes)
+			}
+			decoded, err := decodeRequest(raw)
+			if err != nil {
+				t.Fatalf("decode %s/%s: %v", clientID, id, err)
+			}
+			if decoded.ClientID != clientID || decoded.ID != id {
+				t.Fatalf("round trip %s/%s = %+v", clientID, id, decoded)
+			}
+		}
 	}
-	if workers := accountCreationWorkers(0, cfg); workers != 7 {
-		t.Fatalf("workers = %d, want 7", workers)
+	if requestSizeBytes != 512 {
+		t.Fatalf("requestSizeBytes = %d, want 512", requestSizeBytes)
 	}
-	if workers := accountCreationWorkers(-1, cfg); workers != 7 {
-		t.Fatalf("workers = %d, want 7", workers)
-	}
-	if workers := accountCreationWorkers(3, cfg); workers != 3 {
-		t.Fatalf("workers = %d, want 3", workers)
+}
+
+func TestEncodeRequestRejectsOversizedRequest(t *testing.T) {
+	if _, err := encodeRequest(request{ClientID: strings.Repeat("c", requestSizeBytes), ID: "1"}); err == nil {
+		t.Fatal("expected a request larger than the request size to be rejected")
 	}
 }
 
 func TestPendingTrackerForgetsDecidedAndCompletedRequests(t *testing.T) {
 	pending := newPendingTracker()
-	decided := request{ClientID: "client", ID: "1", Type: txBalance}
-	duplicate := request{ClientID: "client", ID: "2", Type: txBalance}
+	decided := request{ClientID: "client", ID: "1"}
+	duplicate := request{ClientID: "client", ID: "2"}
 
 	pending.markSubmitted(decided)
 	pending.markSubmitted(duplicate)
@@ -301,12 +301,21 @@ func TestLearningMetricsBuildPBFTReport(t *testing.T) {
 	if report.P50ConsensusLatencyMs != 20 {
 		t.Fatalf("P50ConsensusLatencyMs = %f, want 20", report.P50ConsensusLatencyMs)
 	}
+	if report.P90ConsensusLatencyMs != 30 || report.P95ConsensusLatencyMs != 30 {
+		t.Fatalf("consensus latency p90 %f p95 %f, want 30/30",
+			report.P90ConsensusLatencyMs, report.P95ConsensusLatencyMs)
+	}
+	if report.P50BatchSize != 2 || report.P90BatchSize != 3 || report.P95BatchSize != 3 {
+		t.Fatalf("batch size p50 %f p90 %f p95 %f, want 2/3/3",
+			report.P50BatchSize, report.P90BatchSize, report.P95BatchSize)
+	}
 	if report.TimeoutMs != 15 {
 		t.Fatalf("TimeoutMs = %d, want 15", report.TimeoutMs)
 	}
-	if report.AvgInterCommitGapMs != 100 || report.P50InterCommitGapMs != 100 || report.P95InterCommitGapMs != 100 {
-		t.Fatalf("inter-commit gaps = avg %f p50 %f p95 %f, want 100/100/100",
-			report.AvgInterCommitGapMs, report.P50InterCommitGapMs, report.P95InterCommitGapMs)
+	if report.AvgInterCommitGapMs != 100 || report.P50InterCommitGapMs != 100 ||
+		report.P90InterCommitGapMs != 100 || report.P95InterCommitGapMs != 100 {
+		t.Fatalf("inter-commit gaps = avg %f p50 %f p90 %f p95 %f, want 100/100/100/100",
+			report.AvgInterCommitGapMs, report.P50InterCommitGapMs, report.P90InterCommitGapMs, report.P95InterCommitGapMs)
 	}
 	if report.ViewChangeCount != 1 {
 		t.Fatalf("ViewChangeCount = %d, want 1", report.ViewChangeCount)
@@ -320,7 +329,11 @@ func TestLearningMetricsBuildPBFTReport(t *testing.T) {
 		t.Fatalf("unmarshal report: %v", err)
 	}
 	if roundTrip.P50ConsensusLatencyMs != report.P50ConsensusLatencyMs ||
-		roundTrip.P95InterCommitGapMs != report.P95InterCommitGapMs {
+		roundTrip.P95InterCommitGapMs != report.P95InterCommitGapMs ||
+		roundTrip.P90ConsensusLatencyMs != report.P90ConsensusLatencyMs ||
+		roundTrip.P90InterCommitGapMs != report.P90InterCommitGapMs ||
+		roundTrip.P50BatchSize != report.P50BatchSize ||
+		roundTrip.P90BatchSize != report.P90BatchSize {
 		t.Fatalf("round-trip report lost new fields: got %#v want %#v", roundTrip, report)
 	}
 }
@@ -524,6 +537,131 @@ func TestLearningWallClockCompletesZeroCommitRewardWithoutDeliveryWakeup(t *test
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("wall-clock reward did not complete without another consensus delivery")
+}
+
+func TestLearningRequiresAnchor(t *testing.T) {
+	_, err := newLearningManager(learningOptions{Enabled: true, AgentTarget: "127.0.0.1:1"})
+	if err == nil || !strings.Contains(err.Error(), "--learning-anchor-unix-ms") {
+		t.Fatalf("err = %v, want missing --learning-anchor-unix-ms", err)
+	}
+}
+
+func TestLearningAnchoredGridEpisodes(t *testing.T) {
+	anchor := time.Now()
+	manager := &learningManager{
+		featureDuration: 10 * time.Second,
+		replyWait:       2 * time.Second,
+		warmupDuration:  3 * time.Second,
+		rewardDuration:  5 * time.Second,
+		episodeAnchor:   anchor,
+		anchorUnixMS:    1_000_000,
+	}
+
+	if got := manager.wallClockEpisodeStart(3); !got.Equal(anchor.Add(28 * time.Second)) {
+		t.Fatalf("episode 3 start = %s, want anchor+28s", got.Sub(anchor))
+	}
+	if got := manager.gridApplyUnixMS(3); got != 1_040_000 {
+		t.Fatalf("episode 3 grid apply = %d, want 1040000", got)
+	}
+	cases := []struct {
+		now  time.Time
+		want uint32
+	}{
+		{anchor.Add(-time.Minute), 1},
+		{anchor.Add(-12 * time.Second), 1},
+		{anchor.Add(-12*time.Second + time.Nanosecond), 2},
+		{anchor.Add(8 * time.Second), 2},
+		{anchor.Add(100 * time.Second), 7},
+	}
+	for _, tc := range cases {
+		if got := manager.firstWallClockEpisodeAfter(tc.now); got != tc.want {
+			t.Fatalf("first episode at anchor%+s = %d, want %d", tc.now.Sub(anchor), got, tc.want)
+		}
+	}
+}
+
+func TestLearningAnchoredOverrunSkipsToNextGridSlot(t *testing.T) {
+	now := time.Now()
+	manager := &learningManager{
+		enabled:         true,
+		metrics:         newLearningWindowMetrics(),
+		currentEpisode:  2,
+		featureDuration: 10 * time.Second,
+		replyWait:       2 * time.Second,
+		warmupDuration:  3 * time.Second,
+		rewardDuration:  5 * time.Second,
+		episodeAnchor:   now.Add(-25 * time.Second),
+		wallClockStage:  wallClockLearningFeature,
+	}
+
+	next, ok := manager.handleWallClockEpisodeStart(2, manager.wallClockEpisodeStart(2))
+	if !ok {
+		t.Fatalf("episode start was not handled")
+	}
+	if next != 3 || manager.currentEpisode != 3 {
+		t.Fatalf("next = %d current = %d, want 3", next, manager.currentEpisode)
+	}
+	if manager.wallClockStage != wallClockLearningIdle {
+		t.Fatalf("stage = %d, want idle", manager.wallClockStage)
+	}
+}
+
+func TestLearningAnchoredLoopStartsOnGridWithoutDelivery(t *testing.T) {
+	manager := &learningManager{
+		enabled:         true,
+		metrics:         newLearningWindowMetrics(),
+		featureDuration: 100 * time.Millisecond,
+		replyWait:       50 * time.Millisecond,
+		warmupDuration:  50 * time.Millisecond,
+		rewardDuration:  100 * time.Millisecond,
+		pollInterval:    time.Millisecond,
+		rpcTimeout:      time.Millisecond,
+		currentTimeout:  800 * time.Millisecond,
+		lastTimeout:     800 * time.Millisecond,
+		wallClockStage:  wallClockLearningIdle,
+	}
+	defer manager.close()
+
+	// Episode 1 started 400 ms ago and episode 2 100 ms ago, so the loop
+	// joins at episode 3, which starts in 200 ms.
+	now := time.Now()
+	manager.episodeAnchor = now.Add(manager.applyOffset() - 400*time.Millisecond)
+	first := manager.firstWallClockEpisodeAfter(now)
+	if first != 3 {
+		t.Fatalf("first episode = %d, want 3", first)
+	}
+	manager.start()
+	manager.lock.Lock()
+	started := manager.currentEpisode
+	manager.lock.Unlock()
+	if started != first {
+		t.Fatalf("started episode = %d, want %d", started, first)
+	}
+
+	// A delivery before the grid start must not start an episode.
+	manager.recordConsensus(learningSample{Sequence: 1, DecisionTime: time.Now(), Latencies: []time.Duration{time.Millisecond}})
+	manager.lock.Lock()
+	stage := manager.wallClockStage
+	manager.lock.Unlock()
+	if stage != wallClockLearningIdle {
+		t.Fatalf("stage after early delivery = %d, want idle", stage)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.lock.Lock()
+		pending := manager.pendingReward
+		episode := manager.currentEpisode
+		manager.lock.Unlock()
+		if pending != nil {
+			if pending.episode != first || episode != first+1 {
+				t.Fatalf("reward episode = %d current = %d, want %d and %d", pending.episode, episode, first, first+1)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("anchored loop did not complete an episode")
 }
 
 func TestLearningApplyRecommendedTimeoutCallsCallback(t *testing.T) {

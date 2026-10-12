@@ -108,8 +108,8 @@ func newNode(
 		replies:   opts.Replies,
 	}
 	// The genesis checkpoint must capture the complete deterministic initial
-	// application state. SmallBank starts empty and creates accounts through
-	// transactions, so initialization belongs here before consensus can deliver.
+	// application state. SmallBank starts with no client watermarks, so
+	// initialization belongs here before consensus can deliver.
 	n.initializeSyncHistory()
 
 	config := bft.DefaultConfig
@@ -472,9 +472,6 @@ func decodeValidRequest(raw []byte) (request, error) {
 	if err != nil {
 		return request{}, err
 	}
-	if !validTxType(req.Type) {
-		return request{}, fmt.Errorf("unknown transaction type: %s", req.Type)
-	}
 	if _, err := parseClientSeq(req.ID); err != nil {
 		return request{}, err
 	}
@@ -672,9 +669,9 @@ func (n *node) Deliver(proposal bft.Proposal, signatures []bft.Signature) bft.Re
 		Timeout:      n.learning.currentTimeoutValue(),
 	})
 	if md.GetLatestSequence() == 1 || md.GetLatestSequence()%500 == 0 || applied.elapsed > 100*time.Millisecond {
-		fmt.Printf("%s delivered: node=%d view=%d seq=%d batch=%d post_decision_ms=%d state_accounts=%d\n",
+		fmt.Printf("%s delivered: node=%d view=%d seq=%d batch=%d post_decision_ms=%d\n",
 			timestampedLogTag("sync"), n.id, md.GetViewId(), md.GetLatestSequence(), applied.batchSize,
-			applied.elapsed.Milliseconds(), n.stateAccountCount())
+			applied.elapsed.Milliseconds())
 	}
 
 	return bft.Reconfig{InLatestDecision: false}
@@ -707,12 +704,6 @@ func (n *node) onViewEvent(event string, currentView uint64, nextView uint64, pr
 
 func timestampedLogTag(component string) string {
 	return fmt.Sprintf("[%s %s]", component, time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
-}
-
-func (n *node) stateAccountCount() int {
-	n.stateLock.Lock()
-	defer n.stateLock.Unlock()
-	return len(n.state.accounts)
 }
 
 func (n *node) leaderID() uint64 {
@@ -772,13 +763,4 @@ func (n *node) VerificationSequence() uint64 {
 
 func (n *node) AuxiliaryData(msg []byte) []byte {
 	return msg
-}
-
-func validTxType(t txType) bool {
-	switch t {
-	case txDepositChecking, txTransactSavings, txWriteCheck, txSendPayment, txAmalgamate, txBalance, txCreateAccount:
-		return true
-	default:
-		return false
-	}
 }

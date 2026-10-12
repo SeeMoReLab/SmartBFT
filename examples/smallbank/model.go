@@ -12,48 +12,27 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 )
 
-type txType string
+// requestSizeBytes is the exact length of every encoded request. The padding
+// field absorbs the difference, so the payload size does not depend on the
+// digit counts of the client and request IDs.
+const requestSizeBytes = 512
 
-const (
-	txDepositChecking txType = "DEPOSIT_CHECKING"
-	txTransactSavings txType = "TRANSACT_SAVINGS"
-	txWriteCheck      txType = "WRITE_CHECK"
-	txSendPayment     txType = "SEND_PAYMENT"
-	txAmalgamate      txType = "AMALGAMATE"
-	txBalance         txType = "BALANCE"
-	txCreateAccount   txType = "CREATE_ACCOUNT"
-)
-
-var weightedTxTypes = [6]txType{
-	txDepositChecking,
-	txTransactSavings,
-	txWriteCheck,
-	txSendPayment,
-	txAmalgamate,
-	txBalance,
-}
-
+// request carries no operation: execution only advances the client's
+// watermark, so the workload exercises consensus with a fixed payload size.
 type request struct {
-	ClientID             string `json:"client_id"`
-	ID                   string `json:"id"`
-	Type                 txType `json:"type"`
-	CustomerID           uint64 `json:"customer_id,omitempty"`
-	CustomerName         string `json:"customer_name,omitempty"`
-	DestCustomerID       uint64 `json:"dest_customer_id,omitempty"`
-	AmountCents          int64  `json:"amount_cents,omitempty"`
-	SavingsBalanceCents  int64  `json:"savings_balance_cents,omitempty"`
-	CheckingBalanceCents int64  `json:"checking_balance_cents,omitempty"`
+	ClientID string `json:"client_id"`
+	ID       string `json:"id"`
+	Padding  string `json:"padding"`
 }
 
 type responseStatus string
 
 const (
-	statusSuccess           responseStatus = "SUCCESS"
-	statusInsufficientFunds responseStatus = "INSUFFICIENT_FUNDS"
-	statusBusinessError     responseStatus = "BUSINESS_ERROR"
-	statusSystemError       responseStatus = "SYSTEM_ERROR"
+	statusSuccess     responseStatus = "SUCCESS"
+	statusSystemError responseStatus = "SYSTEM_ERROR"
 	// statusDuplicate is returned for a request whose client sequence number was
 	// already executed. The original outcome is replayed when it is still
 	// cached; otherwise only the status is returned.
@@ -61,20 +40,37 @@ const (
 )
 
 type response struct {
-	ClientID             string         `json:"client_id"`
-	ID                   string         `json:"id"`
-	Status               responseStatus `json:"status"`
-	Error                string         `json:"error,omitempty"`
-	SavingsBalanceCents  int64          `json:"savings_balance_cents,omitempty"`
-	CheckingBalanceCents int64          `json:"checking_balance_cents,omitempty"`
+	ClientID string         `json:"client_id"`
+	ID       string         `json:"id"`
+	Status   responseStatus `json:"status"`
+	Error    string         `json:"error,omitempty"`
 }
 
 func (r response) benchmarkSuccess() bool {
-	return r.Status == statusSuccess || r.Status == statusInsufficientFunds || r.Status == statusDuplicate
+	return r.Status == statusSuccess || r.Status == statusDuplicate
 }
 
+// encodeRequest pads req so that its encoding is exactly requestSizeBytes. The
+// padding is sized on the unpadded encoding of each request, since the IDs
+// change length as the counters grow.
 func encodeRequest(req request) ([]byte, error) {
-	return json.Marshal(req)
+	req.Padding = ""
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > requestSizeBytes {
+		return nil, fmt.Errorf("unpadded request is %d bytes, exceeds the %d-byte request size", len(raw), requestSizeBytes)
+	}
+	req.Padding = strings.Repeat("x", requestSizeBytes-len(raw))
+	raw, err = json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) != requestSizeBytes {
+		return nil, fmt.Errorf("padded request is %d bytes, want %d", len(raw), requestSizeBytes)
+	}
+	return raw, nil
 }
 
 func decodeRequest(raw []byte) (request, error) {
@@ -128,19 +124,13 @@ func hashBytes(raw []byte) string {
 }
 
 type smallBankState struct {
-	accounts map[uint64]string
-	checking map[uint64]int64
-	savings  map[uint64]int64
-
 	// lastExecuted holds, per client, the highest client sequence number whose
 	// request has been executed, and lastResponse the outcome of that request.
 	// Consensus can deliver the same request more than once - a copy that
 	// arrives after the original was committed can be re-admitted to a request
 	// pool once the pool's short-lived processed-request cache has evicted it,
 	// and requests stranded in a pool by a state-transfer sync are forwarded
-	// and proposed again. Executing such a replay would corrupt balances
-	// identically on every replica, so it would not show up as a state
-	// mismatch. These two maps make execution at-most-once per client sequence
+	// and proposed again. These two maps make execution at-most-once per client sequence
 	// number, and are part of the replicated state: they are covered by the
 	// state checksum and travel in the sync snapshot, so every replica reaches
 	// the same decision for the same request.
@@ -153,13 +143,6 @@ type smallBankState struct {
 	duplicatesSkipped uint64
 }
 
-type accountSnapshot struct {
-	CustomerID           uint64 `json:"customer_id"`
-	CustomerName         string `json:"customer_name"`
-	CheckingBalanceCents int64  `json:"checking_balance_cents"`
-	SavingsBalanceCents  int64  `json:"savings_balance_cents"`
-}
-
 // clientSnapshot carries one client's execution watermark and last outcome.
 type clientSnapshot struct {
 	ClientID string   `json:"client_id"`
@@ -170,15 +153,11 @@ type clientSnapshot struct {
 // stateSnapshot is the deterministic, checksummed image of the whole
 // application state.
 type stateSnapshot struct {
-	Accounts []accountSnapshot `json:"accounts"`
-	Clients  []clientSnapshot  `json:"clients"`
+	Clients []clientSnapshot `json:"clients"`
 }
 
 func newSmallBankState() *smallBankState {
 	return &smallBankState{
-		accounts:     make(map[uint64]string),
-		checking:     make(map[uint64]int64),
-		savings:      make(map[uint64]int64),
 		lastExecuted: make(map[string]uint64),
 		lastResponse: make(map[string]response),
 	}
@@ -238,108 +217,14 @@ func (s *smallBankState) apply(req request) response {
 		}
 	}
 
-	resp := s.execute(req)
-	s.lastExecuted[req.ClientID] = seq
-	s.lastResponse[req.ClientID] = resp
-	return resp
-}
-
-func (s *smallBankState) execute(req request) response {
 	resp := response{
 		ClientID: req.ClientID,
 		ID:       req.ID,
 		Status:   statusSuccess,
 	}
-
-	switch req.Type {
-	case txCreateAccount:
-		if _, exists := s.accounts[req.CustomerID]; exists {
-			return resp.withError(statusBusinessError, "account already exists")
-		}
-		s.accounts[req.CustomerID] = req.CustomerName
-		s.checking[req.CustomerID] = req.CheckingBalanceCents
-		s.savings[req.CustomerID] = req.SavingsBalanceCents
-	case txDepositChecking:
-		if !s.accountExists(req.CustomerID) {
-			return resp.withError(statusBusinessError, "account not found")
-		}
-		s.checking[req.CustomerID] += req.AmountCents
-	case txTransactSavings:
-		if !s.accountExists(req.CustomerID) {
-			return resp.withError(statusBusinessError, "account not found")
-		}
-		next := s.savings[req.CustomerID] + req.AmountCents
-		if next < 0 {
-			return resp.withError(statusInsufficientFunds, "insufficient funds")
-		}
-		s.savings[req.CustomerID] = next
-	case txWriteCheck:
-		if !s.accountExists(req.CustomerID) {
-			return resp.withError(statusBusinessError, "account not found")
-		}
-		next := s.checking[req.CustomerID] - req.AmountCents
-		if next < 0 {
-			return resp.withError(statusInsufficientFunds, "insufficient funds")
-		}
-		s.checking[req.CustomerID] = next
-	case txSendPayment:
-		if !s.accountExists(req.CustomerID) {
-			return resp.withError(statusBusinessError, "source account not found")
-		}
-		if !s.accountExists(req.DestCustomerID) {
-			return resp.withError(statusBusinessError, "destination account not found")
-		}
-		next := s.checking[req.CustomerID] - req.AmountCents
-		if next < 0 {
-			return resp.withError(statusInsufficientFunds, "insufficient funds")
-		}
-		s.checking[req.CustomerID] = next
-		s.checking[req.DestCustomerID] += req.AmountCents
-	case txAmalgamate:
-		if !s.accountExists(req.CustomerID) {
-			return resp.withError(statusBusinessError, "account 1 not found")
-		}
-		if !s.accountExists(req.DestCustomerID) {
-			return resp.withError(statusBusinessError, "account 2 not found")
-		}
-		amount := s.checking[req.DestCustomerID]
-		s.checking[req.DestCustomerID] = 0
-		s.savings[req.CustomerID] += amount
-	case txBalance:
-		if !s.accountExists(req.CustomerID) {
-			return resp.withError(statusBusinessError, "account not found")
-		}
-		resp.CheckingBalanceCents = s.checking[req.CustomerID]
-		resp.SavingsBalanceCents = s.savings[req.CustomerID]
-	default:
-		return resp.withError(statusSystemError, "unknown transaction type")
-	}
-
+	s.lastExecuted[req.ClientID] = seq
+	s.lastResponse[req.ClientID] = resp
 	return resp
-}
-
-func (s *smallBankState) accountExists(id uint64) bool {
-	_, exists := s.accounts[id]
-	return exists
-}
-
-func (s *smallBankState) deterministicSnapshot() []accountSnapshot {
-	ids := make([]uint64, 0, len(s.accounts))
-	for id := range s.accounts {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-
-	snapshot := make([]accountSnapshot, 0, len(ids))
-	for _, id := range ids {
-		snapshot = append(snapshot, accountSnapshot{
-			CustomerID:           id,
-			CustomerName:         s.accounts[id],
-			CheckingBalanceCents: s.checking[id],
-			SavingsBalanceCents:  s.savings[id],
-		})
-	}
-	return snapshot
 }
 
 func (s *smallBankState) deterministicClientSnapshot() []clientSnapshot {
@@ -361,20 +246,13 @@ func (s *smallBankState) deterministicClientSnapshot() []clientSnapshot {
 }
 
 // deterministicStateSnapshot is the image the state checksum is computed over.
-// It must cover every field that execution depends on, including the client
-// watermarks: a replica that restored only balances would re-execute a replay
-// that the others skip, and the states would then genuinely diverge.
+// It must cover every field that execution depends on, which is the client
+// watermarks: a replica without them would re-execute a replay that the others
+// skip, and the states would then genuinely diverge.
 func (s *smallBankState) deterministicStateSnapshot() stateSnapshot {
 	return stateSnapshot{
-		Accounts: s.deterministicSnapshot(),
-		Clients:  s.deterministicClientSnapshot(),
+		Clients: s.deterministicClientSnapshot(),
 	}
-}
-
-func (r response) withError(status responseStatus, message string) response {
-	r.Status = status
-	r.Error = message
-	return r
 }
 
 func requestKey(clientID, requestID string) string {

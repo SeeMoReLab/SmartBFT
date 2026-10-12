@@ -21,6 +21,10 @@ const (
 	defaultLearningReplyWait       = 2 * time.Second
 	defaultLearningWarmupDuration  = 3 * time.Second
 	defaultLearningRewardDuration  = 5 * time.Second
+
+	// An episode whose start is later than this has lost part of its feature
+	// window, so the loop skips to the next grid slot still ahead.
+	wallClockEpisodeOverrunTolerance = time.Second
 )
 
 type learningOptions struct {
@@ -32,7 +36,10 @@ type learningOptions struct {
 	ReplyWait       time.Duration
 	WarmupDuration  time.Duration
 	RewardDuration  time.Duration
-	ApplyTimeout    func(time.Duration) error
+	// AnchorUnixMS is the apply instant of episode 1, shared by every replica
+	// (benchmark start plus the spec warm-up).
+	AnchorUnixMS int64
+	ApplyTimeout func(time.Duration) error
 }
 
 type learningDecision struct {
@@ -68,6 +75,11 @@ type learningManager struct {
 
 	currentEpisode   uint32
 	episodeStartTick uint64
+
+	// episodeAnchor is the apply instant of episode 1 with a monotonic
+	// reading; episode e applies at episodeAnchor + period*(e-1).
+	episodeAnchor time.Time
+	anchorUnixMS  int64
 
 	pollInterval    time.Duration
 	rpcTimeout      time.Duration
@@ -106,6 +118,9 @@ func newLearningManager(opts learningOptions) (*learningManager, error) {
 	}
 	if opts.AgentTarget == "" {
 		return nil, fmt.Errorf("--learning requires --agent-target")
+	}
+	if opts.AnchorUnixMS <= 0 {
+		return nil, fmt.Errorf("--learning requires --learning-anchor-unix-ms")
 	}
 	if opts.InitialTimeout <= 0 {
 		opts.InitialTimeout = 5 * time.Second
@@ -148,7 +163,56 @@ func newLearningManager(opts learningOptions) (*learningManager, error) {
 		opts.NodeID, opts.AgentTarget, opts.InitialTimeout.Milliseconds())
 	learningPrintf("wall-clock windows: feature=%s reply_wait=%s warmup=%s reward=%s\n",
 		opts.FeatureDuration, opts.ReplyWait, opts.WarmupDuration, opts.RewardDuration)
+
+	// The anchor moves to the monotonic clock once; every deadline derives from it.
+	now := time.Now()
+	m.episodeAnchor = now.Add(time.UnixMilli(opts.AnchorUnixMS).Sub(now))
+	m.anchorUnixMS = opts.AnchorUnixMS
 	return m, nil
+}
+
+// start launches the anchored episode loop. The caller invokes it once the
+// node that applyTimeout reaches is in place.
+func (m *learningManager) start() {
+	if m == nil || !m.enabled {
+		return
+	}
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.currentEpisode = m.firstWallClockEpisodeAfter(time.Now())
+	learningPrintf("episode anchor: anchor_unix_ms=%d period_ms=%d apply_offset_ms=%d first_episode=%d\n",
+		m.anchorUnixMS, m.episodePeriod().Milliseconds(), m.applyOffset().Milliseconds(), m.currentEpisode)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.wallClockCancel = cancel
+	go m.runWallClockLearning(ctx, m.currentEpisode)
+}
+
+func (m *learningManager) episodePeriod() time.Duration {
+	return m.featureDuration + m.replyWait + m.warmupDuration + m.rewardDuration
+}
+
+// applyOffset is the time from an episode's start to its apply instant.
+func (m *learningManager) applyOffset() time.Duration {
+	return m.featureDuration + m.replyWait
+}
+
+func (m *learningManager) wallClockEpisodeStart(episode uint32) time.Time {
+	return m.episodeAnchor.Add(time.Duration(episode-1)*m.episodePeriod() - m.applyOffset())
+}
+
+func (m *learningManager) gridApplyUnixMS(episode uint32) int64 {
+	return m.anchorUnixMS + int64(episode-1)*m.episodePeriod().Milliseconds()
+}
+
+// firstWallClockEpisodeAfter returns the smallest episode e >= 1 whose start
+// is not before now.
+func (m *learningManager) firstWallClockEpisodeAfter(now time.Time) uint32 {
+	sinceFirstStart := now.Sub(m.wallClockEpisodeStart(1))
+	if sinceFirstStart <= 0 {
+		return 1
+	}
+	period := m.episodePeriod()
+	return uint32((sinceFirstStart+period-1)/period) + 1
 }
 
 func disabledLearningManager() *learningManager {
@@ -194,7 +258,8 @@ func (m *learningManager) recordConsensus(sample learningSample) {
 		sample.DecisionTime = time.Now()
 	}
 
-	if m.wallClockStage == wallClockLearningIdle {
+	// Without an anchor (unit tests only) the first delivery starts episode 1.
+	if m.wallClockStage == wallClockLearningIdle && m.episodeAnchor.IsZero() {
 		startTick := sample.Sequence
 		if startTick > 0 {
 			startTick--
@@ -222,19 +287,31 @@ func (m *learningManager) recordViewChange() {
 }
 
 func (m *learningManager) startWallClockLearningLocked(startTick uint64, start time.Time) {
+	m.episodeAnchor = start.Add(m.applyOffset() - time.Duration(m.currentEpisode-1)*m.episodePeriod())
+	m.anchorUnixMS = m.episodeAnchor.UnixMilli()
+	m.startWallClockEpisodeLocked(m.currentEpisode, start)
 	m.episodeStartTick = startTick
-	m.wallClockStage = wallClockLearningFeature
-	m.wallClockDeadline = start.Add(m.featureDuration)
-	m.metrics.resetWithThroughputStart(start)
-	m.metrics.timeout = m.currentTimeout
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.wallClockCancel = cancel
-	go m.runWallClockLearning(ctx, m.currentEpisode, start)
+	go m.runWallClockLearning(ctx, m.currentEpisode)
 }
 
-func (m *learningManager) runWallClockLearning(ctx context.Context, episode uint32, episodeStart time.Time) {
+func (m *learningManager) runWallClockLearning(ctx context.Context, episode uint32) {
 	for {
+		episodeStart := m.wallClockEpisodeStart(episode)
+		if !waitUntil(ctx, episodeStart) {
+			return
+		}
+		next, ok := m.handleWallClockEpisodeStart(episode, episodeStart)
+		if !ok {
+			return
+		}
+		if next != episode {
+			episode = next
+			continue
+		}
+
 		featureEnd := episodeStart.Add(m.featureDuration)
 		if !waitUntil(ctx, featureEnd) || !m.handleWallClockFeatureDeadline(episode, featureEnd) {
 			return
@@ -256,7 +333,6 @@ func (m *learningManager) runWallClockLearning(ctx context.Context, episode uint
 		}
 
 		episode++
-		episodeStart = rewardEnd
 	}
 }
 
@@ -278,6 +354,33 @@ func waitUntil(ctx context.Context, deadline time.Time) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+// handleWallClockEpisodeStart starts the episode unless the previous reward
+// deadline already did. An episode whose start is past by more than the
+// tolerance is skipped; the returned episode is then the next one ahead.
+func (m *learningManager) handleWallClockEpisodeStart(episode uint32, start time.Time) (uint32, bool) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if m.currentEpisode != episode ||
+		(m.wallClockStage != wallClockLearningIdle && m.wallClockStage != wallClockLearningFeature) {
+		return 0, false
+	}
+
+	now := time.Now()
+	if late := now.Sub(start); late > wallClockEpisodeOverrunTolerance {
+		next := m.firstWallClockEpisodeAfter(now)
+		learningPrintf("WARNING: episode overrun: episode=%d started late by %s; skipping to episode=%d\n",
+			episode, late, next)
+		m.currentEpisode = next
+		m.wallClockStage = wallClockLearningIdle
+		m.wallClockDeadline = time.Time{}
+		return next, true
+	}
+	if m.wallClockStage == wallClockLearningIdle {
+		m.startWallClockEpisodeLocked(episode, start)
+	}
+	return episode, true
 }
 
 func (m *learningManager) handleWallClockFeatureDeadline(episode uint32, deadline time.Time) bool {
@@ -324,12 +427,14 @@ func (m *learningManager) handleWallClockApplyDeadline(episode uint32, deadline 
 	m.lastTimeout = m.currentTimeout
 	m.wallClockStage = wallClockLearningWarmup
 	m.wallClockDeadline = deadline.Add(m.warmupDuration)
+	gridApplyUnixMS := m.gridApplyUnixMS(episode)
+	lagMS := time.Since(deadline).Milliseconds()
 	if applied {
-		learningPrintf("applied wall-clock recommendation: episode=%d timeout_ms=%d\n",
-			episode, m.currentTimeout.Milliseconds())
+		learningPrintf("applied wall-clock recommendation: episode=%d timeout_ms=%d grid_apply_unix_ms=%d lag_ms=%d\n",
+			episode, m.currentTimeout.Milliseconds(), gridApplyUnixMS, lagMS)
 	} else {
-		learningPrintf("wall-clock reply deadline reached without recommendation update: episode=%d timeout_ms=%d\n",
-			episode, m.currentTimeout.Milliseconds())
+		learningPrintf("wall-clock reply deadline reached without recommendation update: episode=%d timeout_ms=%d grid_apply_unix_ms=%d lag_ms=%d\n",
+			episode, m.currentTimeout.Milliseconds(), gridApplyUnixMS, lagMS)
 	}
 	return true
 }
@@ -364,12 +469,12 @@ func (m *learningManager) handleWallClockRewardDeadline(episode uint32, end time
 	rewardTransactions := m.metrics.totalTransactions
 	learningPrintf("captured wall-clock reward: episode=%d duration=%s total_consensus=%d total_transactions=%d timeout_ms=%d\n",
 		episode, m.rewardDuration, rewardConsensus, rewardTransactions, m.lastTimeout.Milliseconds())
-	m.startNextWallClockEpisodeLocked(end)
+	m.startWallClockEpisodeLocked(episode+1, end)
 	return true
 }
 
-func (m *learningManager) startNextWallClockEpisodeLocked(start time.Time) {
-	m.currentEpisode++
+func (m *learningManager) startWallClockEpisodeLocked(episode uint32, start time.Time) {
+	m.currentEpisode = episode
 	m.episodeStartTick = m.lastSequence
 	m.pollerDecision = nil
 	m.pollerEpisode = 0

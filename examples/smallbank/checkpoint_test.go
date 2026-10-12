@@ -24,7 +24,6 @@ func checkpointTestNode(t *testing.T, id uint64) *node {
 		state:   newSmallBankState(),
 		pending: newPendingTracker(),
 	}
-	seedAccounts(t, n.state)
 	n.initializeSyncHistory()
 	return n
 }
@@ -86,7 +85,7 @@ func deliverSequence(t *testing.T, n *node, from, to uint64, signers []uint64) [
 		prev := n.prevHash
 		n.stateLock.Unlock()
 		decision := buildDecision(t, seq, 0, prev,
-			[]request{payment(fmt.Sprintf("terminal-%d", seq), fmt.Sprintf("%d", seq))}, signers)
+			[]request{noop(fmt.Sprintf("terminal-%d", seq), fmt.Sprintf("%d", seq))}, signers)
 		if _, err := n.applyDecision(decision.Proposal, decision.Signatures); err != nil {
 			t.Fatalf("apply decision %d: %v", seq, err)
 		}
@@ -113,8 +112,8 @@ func TestGenesisCheckpointCoversEmptyState(t *testing.T) {
 	if err := n.validateCheckpointState(genesis); err != nil {
 		t.Fatalf("validate genesis checkpoint: %v", err)
 	}
-	if hashBytes(mustJSON(stateSnapshotImage(nil, nil))) !=
-		hashBytes(mustJSON(stateSnapshotImage([]accountSnapshot{}, []clientSnapshot{}))) {
+	if hashBytes(mustJSON(stateSnapshotImage(nil))) !=
+		hashBytes(mustJSON(stateSnapshotImage([]clientSnapshot{}))) {
 		t.Fatal("nil and empty slices must have the same canonical checksum")
 	}
 }
@@ -319,7 +318,7 @@ func TestSequenceGapIsRejectedBeforeStateMutation(t *testing.T) {
 	n.stateLock.Unlock()
 
 	gap := buildDecision(t, 2, 0, beforeHash,
-		[]request{payment("gap-terminal", "1")}, []uint64{1, 2, 3})
+		[]request{noop("gap-terminal", "1")}, []uint64{1, 2, 3})
 	if _, err := n.applyDecision(gap.Proposal, gap.Signatures); err == nil {
 		t.Fatal("a sequence gap must be rejected")
 	}
@@ -335,11 +334,11 @@ func TestSequenceGapIsRejectedBeforeStateMutation(t *testing.T) {
 }
 
 func TestDecisionPreflightFailureDoesNotMutateStateOrHistory(t *testing.T) {
-	validRequest, err := encodeRequest(payment("valid-terminal", "1"))
+	validRequest, err := encodeRequest(noop("valid-terminal", "1"))
 	if err != nil {
 		t.Fatalf("encode valid request: %v", err)
 	}
-	invalidType, err := encodeRequest(request{ClientID: "invalid-terminal", ID: "1", Type: txType("UNKNOWN")})
+	invalidID, err := encodeRequest(request{ClientID: "invalid-terminal", ID: "01"})
 	if err != nil {
 		t.Fatalf("encode invalid request: %v", err)
 	}
@@ -375,7 +374,7 @@ func TestDecisionPreflightFailureDoesNotMutateStateOrHistory(t *testing.T) {
 		{
 			name: "invalid request after valid request",
 			mutate: func(decision *bft.Decision) {
-				decision.Proposal.Payload = encodeBlockData(blockData{Requests: [][]byte{validRequest, invalidType}})
+				decision.Proposal.Payload = encodeBlockData(blockData{Requests: [][]byte{validRequest, invalidID}})
 			},
 		},
 	}
@@ -425,7 +424,7 @@ func TestLiveDeliveryFailureDoesNotAdvanceLibraryCheckpoint(t *testing.T) {
 		Logger:      &testLogger{t: t},
 	}
 	deliver := &algorithm.MutuallyExclusiveDeliver{C: controller}
-	gap := buildDecision(t, 2, 0, "", []request{payment("gap-terminal", "1")}, []uint64{1, 2, 3})
+	gap := buildDecision(t, 2, 0, "", []request{noop("gap-terminal", "1")}, []uint64{1, 2, 3})
 
 	panicValue := capturePanic(func() {
 		deliver.Deliver(gap.Proposal, gap.Signatures)
@@ -449,7 +448,7 @@ func TestLiveDeliveryFailureDoesNotAdvanceLibraryCheckpoint(t *testing.T) {
 
 func TestSuccessfulDecisionAdvancesApplicationAndHistoryTogether(t *testing.T) {
 	n := checkpointTestNode(t, 1)
-	decision := buildDecision(t, 1, 3, "", []request{payment("terminal-1", "1")}, []uint64{1, 2, 3})
+	decision := buildDecision(t, 1, 3, "", []request{noop("terminal-1", "1")}, []uint64{1, 2, 3})
 	if _, err := n.applyDecision(decision.Proposal, decision.Signatures); err != nil {
 		t.Fatalf("apply decision: %v", err)
 	}
@@ -490,7 +489,11 @@ func capturePanic(fn func()) (value any) {
 }
 
 func TestMismatchedGenesisRequiresInstallation(t *testing.T) {
-	local := checkpointTestNode(t, 1)
+	// A watermark applied before initialization gives the local node a genesis
+	// state that differs from the remote's empty one.
+	local := &node{id: 1, network: testNetwork(1, 1, 2, 3, 4), state: newSmallBankState(), pending: newPendingTracker()}
+	local.state.apply(noop("genesis-terminal", "1"))
+	local.initializeSyncHistory()
 	remote := &node{id: 2, network: testNetwork(2, 1, 2, 3, 4), state: newSmallBankState(), pending: newPendingTracker()}
 	remote.initializeSyncHistory()
 
